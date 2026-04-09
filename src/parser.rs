@@ -9,21 +9,15 @@ use nom::{
     IResult, Parser,
 };
 
-/// Consume whitespace and optional comments.
+/// Simple whitespace wrapper
 fn ws<'a, F, O>(mut inner: F) -> impl FnMut(&'a str) -> IResult<&'a str, O>
 where
     F: Parser<&'a str, Output = O, Error = nom::error::Error<&'a str>>,
 {
     move |input: &'a str| {
-        let (input, _) = many0(alt((
-            multispace0,
-            recognize(pair(tag("//"), take_until("\n")))
-        ))).parse(input)?;
+        let (input, _) = multispace0(input)?;
         let (input, res) = inner.parse(input)?;
-        let (input, _) = many0(alt((
-            multispace0,
-            recognize(pair(tag("//"), take_until("\n")))
-        ))).parse(input)?;
+        let (input, _) = multispace0(input)?;
         Ok((input, res))
     }
 }

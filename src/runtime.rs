@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use tokio::time::{Duration, sleep};
 use async_recursion::async_recursion;
 use std::fs;
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{SigningKey, VerifyingKey, Signer, Verifier};
 use rand::RngCore;
 use bastion::prelude::*;
 use tokio::sync::{broadcast, mpsc};
@@ -316,19 +316,39 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             Ok(())
         }
         Statement::Reveal { .. } => Ok(()),
-        Statement::UseWasm { module_path, function_name, args: _, result_into } => {
-            println!("  [Runtime] USE_WASM: {}", module_path);
+        Statement::UseWasm { module_path, function_name, args, result_into } => {
+            println!("  [Runtime] USE_WASM: {} FUNCTION {}", module_path, function_name);
             let module = Module::from_file(&ctx.wasm_engine, module_path)?;
             let mut store = Store::new(&ctx.wasm_engine, ());
             let linker = Linker::new(&ctx.wasm_engine);
             let instance = linker.instantiate(&mut store, &module)?;
-            let func = instance.get_typed_func::<(), i32>(&mut store, function_name)?;
-            let res = func.call(&mut store, ())?;
-            let mock_result = AnnotatedValue::from(Value::Number(res as f64));
+            
+            // Extract numeric arguments for simple WASM functions
+            let mut wasm_args = Vec::new();
+            for (_, expr) in args {
+                let val = eval_expression(expr, &ctx)?;
+                if let Value::Number(n) = val.value {
+                    wasm_args.push(Val::I32(n as i32));
+                }
+            }
+
+            let func = instance.get_func(&mut store, function_name)
+                .ok_or_else(|| anyhow!("Function not found"))?;
+            
+            let mut results = vec![Val::I32(0)];
+            func.call(&mut store, &wasm_args, &mut results)?;
+            
+            let res_val = if let Some(Val::I32(i)) = results.get(0) {
+                *i as f64
+            } else {
+                0.0
+            };
+
+            let mock_result = AnnotatedValue::from(Value::Number(res_val));
             ctx.set_variable(result_into.clone(), mock_result, MemoryScope::Working)?;
             Ok(())
         }
-        Statement::Call { agent_id, goal_name, args: _, result_into } => {
+        Statement::Call { agent_id, goal_name, result_into, .. } => {
             println!("  [Runtime] CALL AGENT '{}': GOAL '{}'", agent_id, goal_name);
             let mock_result = AnnotatedValue::from(Value::Text("Remote success".to_string()));
             ctx.set_variable(result_into.clone(), mock_result, MemoryScope::Working)?;
@@ -341,6 +361,10 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn init_bastion() {
+        let _ = Bastion::init();
+    }
 
     #[test]
     fn test_audit_chain() {
@@ -486,5 +510,24 @@ mod tests {
         eval(&remember, ctx.clone()).await.unwrap();
         eval(&recall, ctx.clone()).await.unwrap();
         assert_eq!(ctx.get_variable("res", MemoryScope::Working).unwrap().value, Value::Text("blue".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_eval_wasm_math() {
+        let ctx = Context::new();
+        let wasm_path = "wasm_modules/math_tool.wasm";
+        let stmt = Statement::UseWasm {
+            module_path: wasm_path.to_string(),
+            function_name: "add".to_string(),
+            args: {
+                let mut map = HashMap::new();
+                map.insert("a".to_string(), Expression::Literal(AnnotatedValue::from(Value::Number(10.0))));
+                map.insert("b".to_string(), Expression::Literal(AnnotatedValue::from(Value::Number(20.0))));
+                map
+            },
+            result_into: "wasm_res".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+        assert_eq!(ctx.get_variable("wasm_res", MemoryScope::Working).unwrap().value, Value::Number(30.0));
     }
 }
