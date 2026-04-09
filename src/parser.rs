@@ -230,20 +230,64 @@ fn parse_memory_scope(input: &str) -> IResult<&str, MemoryScope> {
     .parse(input)
 }
 
-/// Parse REMEMBER
-fn parse_remember(input: &str) -> IResult<&str, Statement> {
-    map(
-        (tag("REMEMBER"), ws(parse_identifier), ws(tag("VALUE")), ws(parse_expression), opt(preceded(ws(tag("SCOPE")), ws(parse_memory_scope))), opt(preceded(ws(tag("EXPIRES")), ws(parse_duration))), tag("END")),
-        |(_, name, _, value, scope, expires, _)| Statement::Remember { name, value, scope: scope.unwrap_or(MemoryScope::LongTerm), expires },
-    ).parse(input)
+/// Parse a key (identifier or string)
+fn parse_key(input: &str) -> IResult<&str, String> {
+    alt((
+        parse_identifier,
+        map(parse_string, |v| if let Value::Text(s) = v { s } else { unreachable!() })
+    )).parse(input)
 }
 
-/// Parse RECALL
+/// Parse REMEMBER: REMEMBER name VALUE val [SCOPE scope] [EXPIRES duration] END
+fn parse_remember(input: &str) -> IResult<&str, Statement> {
+    map(
+        (
+            tag("REMEMBER"),
+            ws(parse_key),
+            ws(tag("VALUE")),
+            ws(parse_expression),
+            opt(preceded(ws(tag("SCOPE")), ws(parse_memory_scope))),
+            opt(preceded(ws(tag("EXPIRES")), ws(parse_duration))),
+            tag("END"),
+        ),
+        |(_, name, _, value, scope, expires, _)| Statement::Remember {
+            name,
+            value,
+            scope: scope.unwrap_or(MemoryScope::LongTerm),
+            expires,
+        },
+    )
+    .parse(input)
+}
+
+/// Parse RECALL: RECALL name INTO {var} [SCOPE scope] [ON_MISSING val] [FUZZY bool] [THRESHOLD val] END
 fn parse_recall(input: &str) -> IResult<&str, Statement> {
     map(
-        (tag("RECALL"), ws(parse_identifier), ws(tag("INTO")), ws(delimited(char('{'), parse_identifier, char('}'))), opt(preceded(ws(tag("SCOPE")), ws(parse_memory_scope))), opt(preceded(ws(tag("ON_MISSING")), ws(parse_expression))), tag("END")),
-        |(_, name, _, into_var, scope, on_missing, _)| Statement::Recall { name, into_var, scope: scope.unwrap_or(MemoryScope::LongTerm), on_missing },
-    ).parse(input)
+        (
+            tag("RECALL"),
+            ws(parse_key),
+            ws(tag("INTO")),
+            ws(delimited(char('{'), parse_identifier, char('}'))),
+            opt(preceded(ws(tag("SCOPE")), ws(parse_memory_scope))),
+            opt(preceded(ws(tag("ON_MISSING")), ws(parse_expression))),
+            opt(preceded(ws(tag("FUZZY")), ws(parse_boolean))),
+            opt(preceded(ws(tag("THRESHOLD")), ws(parse_number))),
+            tag("END"),
+        ),
+        |(_, name, _, into_var, scope, on_missing, fuzzy, threshold, _)| {
+            let fuzzy = if let Some(Value::Boolean(b)) = fuzzy { b } else { false };
+            let threshold = if let Some(Value::Number(n)) = threshold { Some(n) } else { None };
+            Statement::Recall {
+                name,
+                into_var,
+                scope: scope.unwrap_or(MemoryScope::LongTerm),
+                on_missing,
+                fuzzy,
+                threshold,
+            }
+        },
+    )
+    .parse(input)
 }
 
 /// Parse FORGET
@@ -348,12 +392,65 @@ fn parse_reveal(input: &str) -> IResult<&str, Statement> {
     ).parse(input)
 }
 
+/// Parse a USE_WASM statement: USE_WASM "path" FUNCTION "name" ... RESULT INTO {var} END
+fn parse_use_wasm(input: &str) -> IResult<&str, Statement> {
+    map(
+        (
+            tag("USE_WASM"),
+            ws(parse_string),
+            ws(tag("FUNCTION")),
+            ws(parse_string),
+            many0((ws(parse_identifier), ws(parse_expression))),
+            tag("RESULT INTO"),
+            ws(delimited(char('{'), parse_identifier, char('}'))),
+            tag("END"),
+        ),
+        |(_, module_path, _, function_name, args_vec, _, result_into, _)| {
+            let module_path = if let Value::Text(s) = module_path { s } else { "".to_string() };
+            let function_name = if let Value::Text(s) = function_name { s } else { "".to_string() };
+            let args = args_vec.into_iter().collect();
+            Statement::UseWasm { module_path, function_name, args, result_into }
+        }
+    ).parse(input)
+}
+
+/// Parse a CALL statement: CALL "agent" GOAL "name" ... RESULT INTO {var} END
+fn parse_call(input: &str) -> IResult<&str, Statement> {
+    map(
+        (
+            tag("CALL"),
+            ws(parse_string),
+            ws(tag("GOAL")),
+            ws(parse_string),
+            many0((ws(parse_identifier), ws(parse_expression))),
+            tag("RESULT INTO"),
+            ws(delimited(char('{'), parse_identifier, char('}'))),
+            tag("END"),
+        ),
+        |(_, agent_id, _, goal_name, args_vec, _, result_into, _)| {
+            let agent_id = if let Value::Text(s) = agent_id { s } else { "".to_string() };
+            let goal_name = if let Value::Text(s) = goal_name { s } else { "".to_string() };
+            let args = args_vec.into_iter().collect();
+            Statement::Call { agent_id, goal_name, args, result_into }
+        }
+    ).parse(input)
+}
+
+/// Parse an AWAIT statement: AWAIT {var}
+fn parse_await(input: &str) -> IResult<&str, Statement> {
+    map(
+        preceded(tag("AWAIT"), ws(delimited(char('{'), parse_identifier, char('}')))),
+        |call_id| Statement::Await { call_id }
+    ).parse(input)
+}
+
 /// Parse any statement.
 fn parse_statement(input: &str) -> IResult<&str, Statement> {
     ws(alt((
         parse_set, parse_if, parse_use, parse_goal, parse_parallel, parse_race,
         parse_wait, parse_remember, parse_recall, parse_forget, parse_agent, parse_contract,
-        parse_emit, parse_on, parse_prove, parse_reveal
+        parse_emit, parse_on, parse_prove, parse_reveal, parse_use_wasm,
+        parse_call, parse_await
     ))).parse(input)
 }
 
@@ -437,6 +534,28 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_recall() {
+        let input = "RECALL pref INTO {my_pref} SCOPE long_term END";
+        if let Ok(("", Statement::Recall { name, into_var, .. })) = parse_recall(input) {
+            assert_eq!(name, "pref");
+            assert_eq!(into_var, "my_pref");
+        } else {
+            panic!("Failed to parse RECALL");
+        }
+    }
+
+    #[test]
+    fn test_parse_recall_fuzzy() {
+        let input = "RECALL \"topic\" INTO {res} FUZZY true THRESHOLD 0.8 END";
+        if let Ok(("", Statement::Recall { fuzzy, threshold, .. })) = parse_recall(input) {
+            assert!(fuzzy);
+            assert_eq!(threshold, Some(0.8));
+        } else {
+            panic!("Failed to parse FUZZY RECALL");
+        }
+    }
+
+    #[test]
     fn test_parse_agent() {
         let input = "AGENT my_agent ID 0x123 REGISTRY acme.io SIGNED_BY acme.io TRUST_LEVEL verified END";
         if let Ok(("", Statement::Agent { name, trust_level, .. })) = parse_agent(input) {
@@ -486,5 +605,31 @@ mod tests {
             assert_eq!(proof_name, "my_proof");
             assert_eq!(to_agent, Some("other_agent".to_string()));
         } else { panic!("Failed to parse REVEAL"); }
+    }
+
+    #[test]
+    fn test_parse_use_wasm() {
+        let input = "USE_WASM \"tools/math.wasm\" FUNCTION \"add\" a 1 b 2 RESULT INTO {res} END";
+        if let Ok(("", Statement::UseWasm { module_path, function_name, .. })) = parse_use_wasm(input) {
+            assert_eq!(module_path, "tools/math.wasm");
+            assert_eq!(function_name, "add");
+        } else { panic!("Failed to parse USE_WASM"); }
+    }
+
+    #[test]
+    fn test_parse_call() {
+        let input = "CALL \"agent_b\" GOAL \"pay\" amt 100 RESULT INTO {res} END";
+        if let Ok(("", Statement::Call { agent_id, goal_name, .. })) = parse_call(input) {
+            assert_eq!(agent_id, "agent_b");
+            assert_eq!(goal_name, "pay");
+        } else { panic!("Failed to parse CALL"); }
+    }
+
+    #[test]
+    fn test_parse_await() {
+        let input = "AWAIT {res}";
+        if let Ok(("", Statement::Await { call_id })) = parse_await(input) {
+            assert_eq!(call_id, "res");
+        } else { panic!("Failed to parse AWAIT"); }
     }
 }

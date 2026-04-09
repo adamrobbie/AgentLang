@@ -1,0 +1,27 @@
+syntax = "proto3";
+package registry;
+
+service RegistryService {
+  rpc RegisterAgent (RegisterRequest) returns (RegisterResponse);
+  rpc LookupAgent (LookupRequest) returns (LookupResponse);
+}
+
+message RegisterRequest {
+  string agent_id = 1;
+  string endpoint = 2;
+  string public_key = 3;
+}
+
+message RegisterResponse {
+  bool success = 1;
+}
+
+message LookupRequest {
+  string agent_id = 1;
+}
+
+message LookupResponse {
+  string endpoint = 1;
+  string public_key = 2;
+  bool found = 3;
+}

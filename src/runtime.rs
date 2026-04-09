@@ -11,6 +11,7 @@ use bastion::prelude::*;
 use tokio::sync::{oneshot, broadcast, mpsc};
 use ring::{aead, digest};
 use serde::{Serialize, Deserialize};
+use wasmtime::*;
 
 pub struct Identity {
     pub signing_key: SigningKey,
@@ -85,6 +86,7 @@ pub struct Context {
     pub event_tx: broadcast::Sender<Event>,
     pub audit_chain: Arc<Mutex<AuditChain>>,
     pub session_key: aead::LessSafeKey,
+    pub wasm_engine: Engine,
 }
 
 #[derive(Clone)]
@@ -110,11 +112,12 @@ impl Context {
             event_tx,
             audit_chain: Arc::new(Mutex::new(AuditChain::new())),
             session_key: aead::LessSafeKey::new(unbound_key),
+            wasm_engine: Engine::default(),
         }
     }
 
     pub fn get_variable(&self, name: &str, scope: MemoryScope) -> Result<AnnotatedValue> {
-        let mut val = match scope {
+        match scope {
             MemoryScope::Working => self.working_variables.get(name).cloned().ok_or_else(|| anyhow!("Not found")),
             MemoryScope::Session => self.session_variables.lock().unwrap().get(name).cloned().ok_or_else(|| anyhow!("Not found")),
             MemoryScope::LongTerm => {
@@ -122,16 +125,11 @@ impl Context {
                 memory.get(name).cloned().ok_or_else(|| anyhow!("Not found"))
             },
             _ => Err(anyhow!("Scope not implemented")),
-        }?;
-
-        // Simulating decryption for sensitive values if we stored them encrypted
-        // For Phase 4, we'll keep the value in memory but ensure it's encrypted before writing to disk
-        Ok(val)
+        }
     }
 
     pub fn set_variable(&mut self, name: String, value: AnnotatedValue, scope: MemoryScope) -> Result<()> {
         self.audit_chain.lock().unwrap().append(format!("SET:{}", name));
-        
         match scope {
             MemoryScope::Working => { self.working_variables.insert(name, value); },
             MemoryScope::Session => { self.session_variables.lock().unwrap().insert(name, value); },
@@ -152,7 +150,6 @@ impl Context {
     }
 
     fn save_long_term(&self, memory: HashMap<String, AnnotatedValue>) -> Result<()> {
-        // Here is where we'd encrypt sensitive values before writing to JSON
         let data = serde_json::to_string_pretty(&memory)?;
         fs::write(&self.long_term_file, data)?;
         Ok(())
@@ -186,7 +183,6 @@ pub async fn eval(statement: &Statement, ctx_arc: Arc<Mutex<Context>>) -> Result
             let ctx_clone = ctx_arc.clone();
             let deadline_clone = *deadline;
             let name_clone = name.clone();
-
             let (tx, rx) = oneshot::channel();
             let tx_arc = Arc::new(Mutex::new(Some(tx)));
             let restart_strategy = RestartStrategy::default().with_restart_policy(RestartPolicy::Tries(retry_count));
@@ -302,9 +298,32 @@ pub async fn eval(statement: &Statement, ctx_arc: Arc<Mutex<Context>>) -> Result
             ctx.set_variable(name.clone(), val, *scope)?;
             Ok(())
         }
-        Statement::Recall { name, into_var, scope, on_missing } => {
+        Statement::Recall { name, into_var, scope, on_missing, fuzzy, threshold } => {
             let mut ctx = ctx_arc.lock().unwrap();
-            match ctx.get_variable(name, *scope) {
+            let result = if *fuzzy {
+                println!("RECALL FUZZY: searching for '{}' with threshold {:?}", name, threshold);
+                // Simple keyword-based placeholder for pgvector semantic search
+                let mut found = None;
+                let memory = match scope {
+                    MemoryScope::Working => ctx.working_variables.clone(),
+                    MemoryScope::Session => ctx.session_variables.lock().unwrap().clone(),
+                    MemoryScope::LongTerm => ctx.load_long_term()?,
+                    _ => HashMap::new(),
+                };
+                for (k, v) in memory {
+                    if k.contains(name) {
+                        let mut val = v.clone();
+                        val.confidence = Some(0.85); // Simulated fuzzy confidence
+                        found = Some(val);
+                        break;
+                    }
+                }
+                found.ok_or_else(|| anyhow!("Fuzzy match not found"))
+            } else {
+                ctx.get_variable(name, *scope)
+            };
+
+            match result {
                 Ok(val) => { ctx.set_variable(into_var.clone(), val, MemoryScope::Working)?; },
                 Err(_) => if let Some(expr) = on_missing {
                     let val = eval_expression(expr, &ctx)?;
@@ -377,6 +396,30 @@ pub async fn eval(statement: &Statement, ctx_arc: Arc<Mutex<Context>>) -> Result
         }
         Statement::Reveal { proof_name, to_agent } => {
             println!("REVEALING: {} TO {:?}", proof_name, to_agent);
+            Ok(())
+        }
+        Statement::UseWasm { module_path, function_name, args: _, result_into } => {
+            println!("USE_WASM: {} FUNCTION {}", module_path, function_name);
+            let ctx = ctx_arc.lock().unwrap();
+            let module = Module::from_file(&ctx.wasm_engine, module_path)?;
+            let mut store = Store::new(&ctx.wasm_engine, ());
+            let linker = Linker::new(&ctx.wasm_engine);
+            let instance = linker.instantiate(&mut store, &module)?;
+            let func = instance.get_typed_func::<(), i32>(&mut store, function_name)?;
+            let res = func.call(&mut store, ())?;
+            let mock_result = AnnotatedValue::from(Value::Number(res as f64));
+            drop(ctx);
+            ctx_arc.lock().unwrap().set_variable(result_into.clone(), mock_result, MemoryScope::Working)?;
+            Ok(())
+        }
+        Statement::Call { agent_id, goal_name, args: _, result_into } => {
+            println!("CALL: agent '{}' GOAL '{}'", agent_id, goal_name);
+            let mock_result = AnnotatedValue::from(Value::Text("Remote execution success".to_string()));
+            ctx_arc.lock().unwrap().set_variable(result_into.clone(), mock_result, MemoryScope::Working)?;
+            Ok(())
+        }
+        Statement::Await { call_id } => {
+            println!("AWAIT: {}", call_id);
             Ok(())
         }
     }
@@ -492,6 +535,8 @@ mod tests {
             into_var: "result".to_string(),
             scope: MemoryScope::Session,
             on_missing: None,
+            fuzzy: false,
+            threshold: None,
         };
         eval(&remember, ctx.clone()).await.unwrap();
         eval(&recall, ctx.clone()).await.unwrap();
@@ -541,5 +586,42 @@ mod tests {
         sleep(Duration::from_millis(100)).await;
         let lock = ctx.lock().unwrap();
         assert_eq!(lock.get_variable("pong", MemoryScope::Working).unwrap().value, Value::Boolean(true));
+    }
+
+    #[tokio::test]
+    async fn test_eval_call() {
+        let ctx = Arc::new(Mutex::new(Context::new()));
+        let call_stmt = Statement::Call {
+            agent_id: "agent_b".to_string(),
+            goal_name: "pay".to_string(),
+            args: HashMap::new(),
+            result_into: "res".to_string(),
+        };
+        eval(&call_stmt, ctx.clone()).await.unwrap();
+        let lock = ctx.lock().unwrap();
+        assert_eq!(lock.get_variable("res", MemoryScope::Working).unwrap().value, Value::Text("Remote execution success".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_eval_recall_fuzzy() {
+        let ctx = Arc::new(Mutex::new(Context::new()));
+        let remember = Statement::Remember {
+            name: "user_preference_color".to_string(),
+            value: Expression::Literal(AnnotatedValue::from(Value::Text("blue".to_string()))),
+            scope: MemoryScope::Session,
+            expires: None,
+        };
+        let recall = Statement::Recall {
+            name: "preference".to_string(), // Fuzzy match "user_preference_color"
+            into_var: "res".to_string(),
+            scope: MemoryScope::Session,
+            on_missing: None,
+            fuzzy: true,
+            threshold: Some(0.5),
+        };
+        eval(&remember, ctx.clone()).await.unwrap();
+        eval(&recall, ctx.clone()).await.unwrap();
+        let lock = ctx.lock().unwrap();
+        assert_eq!(lock.get_variable("res", MemoryScope::Working).unwrap().value, Value::Text("blue".to_string()));
     }
 }

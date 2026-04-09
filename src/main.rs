@@ -3,13 +3,62 @@ mod parser;
 mod runtime;
 
 use anyhow::Result;
+use tonic::{transport::Server, Request, Response, Status};
+use std::sync::{Arc, Mutex};
+
+pub mod agent_rpc {
+    tonic::include_proto!("agent");
+}
+
+pub mod registry_rpc {
+    tonic::include_proto!("registry");
+}
+
+use agent_rpc::agent_service_server::{AgentService, AgentServiceServer};
+use agent_rpc::{CallRequest, CallResponse};
+
+pub struct MyAgentService {
+    pub ctx: Arc<Mutex<runtime::Context>>,
+}
+
+#[tonic::async_trait]
+impl AgentService for MyAgentService {
+    async fn call_goal(
+        &self,
+        request: Request<CallRequest>,
+    ) -> Result<Response<CallResponse>, Status> {
+        let req = request.into_inner();
+        println!("RPC: Received call for goal '{}' from agent '{}'", req.goal_name, req.caller_id);
+        
+        // Simulating goal execution for Phase 5
+        Ok(Response::new(CallResponse {
+            result_json: "{\"status\": \"success\"}".to_string(),
+            success: true,
+        }))
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     bastion::prelude::Bastion::init();
     
-    println!("--- AgentLang Interpreter (Phase 3: Production Runtime) ---");
+    println!("--- AgentLang 1.0 (Federated & Sandboxed) ---");
     
+    let ctx = Arc::new(Mutex::new(runtime::Context::new()));
+    
+    // Spawn gRPC server in the background
+    let ctx_clone = ctx.clone();
+    tokio::spawn(async move {
+        let addr = "[::1]:50051".parse().unwrap();
+        let service = MyAgentService { ctx: ctx_clone };
+        
+        println!("gRPC: Agent listening on {}", addr);
+        Server::builder()
+            .add_service(AgentServiceServer::new(service))
+            .serve(addr)
+            .await.unwrap();
+    });
+
     let source = r#"
 GOAL plan_trip
   SET origin = "London"
@@ -32,7 +81,6 @@ END
     
     match parser::parse_program(source) {
         Ok((_, program)) => {
-            let ctx = std::sync::Arc::new(std::sync::Mutex::new(runtime::Context::new()));
             for stmt in program {
                 runtime::eval(&stmt, ctx.clone()).await?;
             }

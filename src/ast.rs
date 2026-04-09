@@ -44,6 +44,8 @@ pub enum Statement {
         into_var: String,
         scope: MemoryScope,
         on_missing: Option<Expression>,
+        fuzzy: bool,
+        threshold: Option<f64>,
     },
     Forget {
         name: String,
@@ -77,6 +79,21 @@ pub enum Statement {
     Reveal {
         proof_name: String,
         to_agent: Option<String>,
+    },
+    UseWasm {
+        module_path: String,
+        function_name: String,
+        args: HashMap<String, Expression>,
+        result_into: String,
+    },
+    Call {
+        agent_id: String,
+        goal_name: String,
+        args: HashMap<String, Expression>,
+        result_into: String,
+    },
+    Await {
+        call_id: String, // Simplified for now as result_into var
     },
 }
 
