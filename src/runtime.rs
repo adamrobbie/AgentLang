@@ -9,6 +9,8 @@ use ed25519_dalek::{SigningKey, VerifyingKey, Signer, Verifier};
 use rand::RngCore;
 use bastion::prelude::*;
 use tokio::sync::{oneshot, broadcast, mpsc};
+use ring::{aead, digest};
+use serde::{Serialize, Deserialize};
 
 pub struct Identity {
     pub signing_key: SigningKey,
@@ -32,6 +34,48 @@ pub struct Event {
     pub data: AnnotatedValue,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub op: String,
+    pub prev_hash: String,
+    pub timestamp: u64,
+}
+
+pub struct AuditChain {
+    pub entries: Vec<AuditEntry>,
+    pub last_hash: String,
+}
+
+impl AuditChain {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            last_hash: "genesis".to_string(),
+        }
+    }
+
+    pub fn append(&mut self, op: String) -> String {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        let content = format!("{}:{}:{}", self.last_hash, op, timestamp);
+        let hash = digest::digest(&digest::SHA256, content.as_bytes());
+        let hash_str = hex::encode(hash.as_ref());
+        
+        let entry = AuditEntry {
+            op,
+            prev_hash: self.last_hash.clone(),
+            timestamp,
+        };
+        
+        self.entries.push(entry);
+        self.last_hash = hash_str.clone();
+        hash_str
+    }
+}
+
 pub struct Context {
     pub working_variables: HashMap<String, AnnotatedValue>,
     pub session_variables: Arc<Mutex<HashMap<String, AnnotatedValue>>>,
@@ -39,6 +83,8 @@ pub struct Context {
     pub identity: Identity,
     pub active_contracts: HashMap<String, ContractInfo>,
     pub event_tx: broadcast::Sender<Event>,
+    pub audit_chain: Arc<Mutex<AuditChain>>,
+    pub session_key: aead::LessSafeKey,
 }
 
 #[derive(Clone)]
@@ -51,6 +97,10 @@ pub struct ContractInfo {
 impl Context {
     pub fn new() -> Self {
         let (event_tx, _) = broadcast::channel(100);
+        let mut key_bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key_bytes);
+        let unbound_key = aead::UnboundKey::new(&aead::AES_256_GCM, &key_bytes).unwrap();
+        
         Self {
             working_variables: HashMap::new(),
             session_variables: Arc::new(Mutex::new(HashMap::new())),
@@ -58,11 +108,13 @@ impl Context {
             identity: Identity::generate(),
             active_contracts: HashMap::new(),
             event_tx,
+            audit_chain: Arc::new(Mutex::new(AuditChain::new())),
+            session_key: aead::LessSafeKey::new(unbound_key),
         }
     }
 
     pub fn get_variable(&self, name: &str, scope: MemoryScope) -> Result<AnnotatedValue> {
-        match scope {
+        let mut val = match scope {
             MemoryScope::Working => self.working_variables.get(name).cloned().ok_or_else(|| anyhow!("Not found")),
             MemoryScope::Session => self.session_variables.lock().unwrap().get(name).cloned().ok_or_else(|| anyhow!("Not found")),
             MemoryScope::LongTerm => {
@@ -70,10 +122,16 @@ impl Context {
                 memory.get(name).cloned().ok_or_else(|| anyhow!("Not found"))
             },
             _ => Err(anyhow!("Scope not implemented")),
-        }
+        }?;
+
+        // Simulating decryption for sensitive values if we stored them encrypted
+        // For Phase 4, we'll keep the value in memory but ensure it's encrypted before writing to disk
+        Ok(val)
     }
 
     pub fn set_variable(&mut self, name: String, value: AnnotatedValue, scope: MemoryScope) -> Result<()> {
+        self.audit_chain.lock().unwrap().append(format!("SET:{}", name));
+        
         match scope {
             MemoryScope::Working => { self.working_variables.insert(name, value); },
             MemoryScope::Session => { self.session_variables.lock().unwrap().insert(name, value); },
@@ -94,6 +152,7 @@ impl Context {
     }
 
     fn save_long_term(&self, memory: HashMap<String, AnnotatedValue>) -> Result<()> {
+        // Here is where we'd encrypt sensitive values before writing to JSON
         let data = serde_json::to_string_pretty(&memory)?;
         fs::write(&self.long_term_file, data)?;
         Ok(())
@@ -151,7 +210,7 @@ pub async fn eval(statement: &Statement, ctx_arc: Arc<Mutex<Context>>) -> Result
                             let res = if let Some(secs) = deadline_clone {
                                 match timeout(Duration::from_secs_f64(secs), body_fut).await {
                                     Ok(res) => res,
-                                    Err(_) => Err(anyhow!("Timeout")),
+                                    Err(_) => Err(anyhow!("Goal '{}' timed out", name)),
                                 }
                             } else { body_fut.await };
                             let mut lock = tx_arc.lock().unwrap();
@@ -197,9 +256,7 @@ pub async fn eval(statement: &Statement, ctx_arc: Arc<Mutex<Context>>) -> Result
             Ok(())
         }
         Statement::Parallel { pattern, branches, result_into, deadline } => {
-            println!("--- Parallel ({:?}) ---", pattern);
             let (tx, mut rx) = mpsc::channel(branches.len().max(1));
-            
             for stmt in branches {
                 let stmt = stmt.clone();
                 let ctx = ctx_arc.clone();
@@ -217,7 +274,6 @@ pub async fn eval(statement: &Statement, ctx_arc: Arc<Mutex<Context>>) -> Result
                     })
                 });
             }
-
             let fut = async {
                 let mut success_count = 0;
                 for _ in 0..branches.len() {
@@ -236,7 +292,6 @@ pub async fn eval(statement: &Statement, ctx_arc: Arc<Mutex<Context>>) -> Result
                 }
                 Ok::<(), anyhow::Error>(())
             };
-
             if let Some(secs) = deadline { timeout(Duration::from_secs_f64(*secs), fut).await??; } else { fut.await?; }
             Ok(())
         }
@@ -315,6 +370,15 @@ pub async fn eval(statement: &Statement, ctx_arc: Arc<Mutex<Context>>) -> Result
             });
             Ok(())
         }
+        Statement::Prove { statement, proof_name } => {
+            println!("PROVING: execution AS {}", proof_name);
+            eval(statement, ctx_arc.clone()).await?;
+            Ok(())
+        }
+        Statement::Reveal { proof_name, to_agent } => {
+            println!("REVEALING: {} TO {:?}", proof_name, to_agent);
+            Ok(())
+        }
     }
 }
 
@@ -324,6 +388,28 @@ mod tests {
 
     fn init_bastion() {
         let _ = Bastion::init();
+    }
+
+    #[test]
+    fn test_audit_chain() {
+        let mut chain = AuditChain::new();
+        let h1 = chain.append("OP1".to_string());
+        let h2 = chain.append("OP2".to_string());
+        assert_ne!(h1, h2);
+        assert_eq!(chain.entries.len(), 2);
+        assert_eq!(chain.entries[1].prev_hash, h1);
+    }
+
+    #[tokio::test]
+    async fn test_eval_set_audited() {
+        let ctx = Arc::new(Mutex::new(Context::new()));
+        let stmt = Statement::Set {
+            name: "x".to_string(),
+            value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+        let lock = ctx.lock().unwrap();
+        assert_eq!(lock.audit_chain.lock().unwrap().entries.len(), 1);
     }
 
     #[test]

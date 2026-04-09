@@ -70,6 +70,14 @@ pub enum Statement {
         event: String,
         handler: Box<Statement>,
     },
+    Prove {
+        statement: Box<Statement>,
+        proof_name: String,
+    },
+    Reveal {
+        proof_name: String,
+        to_agent: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

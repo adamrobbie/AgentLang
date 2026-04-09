@@ -323,12 +323,37 @@ fn parse_on(input: &str) -> IResult<&str, Statement> {
     ).parse(input)
 }
 
+/// Parse a PROVE statement: PROVE { statement } AS proof_name
+fn parse_prove(input: &str) -> IResult<&str, Statement> {
+    map(
+        (
+            tag("PROVE"),
+            ws(delimited(char('{'), parse_statement, char('}'))),
+            ws(tag("AS")),
+            ws(parse_identifier),
+        ),
+        |(_, statement, _, proof_name)| Statement::Prove { statement: Box::new(statement), proof_name }
+    ).parse(input)
+}
+
+/// Parse a REVEAL statement: REVEAL proof_name [TO agent_id]
+fn parse_reveal(input: &str) -> IResult<&str, Statement> {
+    map(
+        (
+            tag("REVEAL"),
+            ws(parse_identifier),
+            opt(preceded(ws(tag("TO")), ws(parse_identifier))),
+        ),
+        |(_, proof_name, to_agent)| Statement::Reveal { proof_name, to_agent }
+    ).parse(input)
+}
+
 /// Parse any statement.
 fn parse_statement(input: &str) -> IResult<&str, Statement> {
     ws(alt((
         parse_set, parse_if, parse_use, parse_goal, parse_parallel, parse_race,
         parse_wait, parse_remember, parse_recall, parse_forget, parse_agent, parse_contract,
-        parse_emit, parse_on
+        parse_emit, parse_on, parse_prove, parse_reveal
     ))).parse(input)
 }
 
@@ -444,5 +469,22 @@ mod tests {
         if let Ok(("", Statement::On { event, .. })) = parse_on(input) {
             assert_eq!(event, "flight_found");
         } else { panic!("Failed to parse ON"); }
+    }
+
+    #[test]
+    fn test_parse_prove() {
+        let input = "PROVE { SET x = 1 } AS my_proof";
+        if let Ok(("", Statement::Prove { proof_name, .. })) = parse_prove(input) {
+            assert_eq!(proof_name, "my_proof");
+        } else { panic!("Failed to parse PROVE"); }
+    }
+
+    #[test]
+    fn test_parse_reveal() {
+        let input = "REVEAL my_proof TO other_agent";
+        if let Ok(("", Statement::Reveal { proof_name, to_agent })) = parse_reveal(input) {
+            assert_eq!(proof_name, "my_proof");
+            assert_eq!(to_agent, Some("other_agent".to_string()));
+        } else { panic!("Failed to parse REVEAL"); }
     }
 }
