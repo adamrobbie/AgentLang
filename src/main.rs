@@ -6,7 +6,9 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("--- AgentLang Interpreter (Phase 1) ---");
+    bastion::prelude::Bastion::init();
+    
+    println!("--- AgentLang Interpreter (Phase 3: Production Runtime) ---");
     
     let source = r#"
 GOAL plan_trip

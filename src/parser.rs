@@ -307,11 +307,28 @@ fn parse_contract(input: &str) -> IResult<&str, Statement> {
     ).parse(input)
 }
 
+/// Parse an EMIT statement: EMIT name DATA val
+fn parse_emit(input: &str) -> IResult<&str, Statement> {
+    map(
+        (tag("EMIT"), ws(parse_identifier), ws(tag("DATA")), ws(parse_expression)),
+        |(_, event, _, data)| Statement::Emit { event, data }
+    ).parse(input)
+}
+
+/// Parse an ON statement: ON name handler
+fn parse_on(input: &str) -> IResult<&str, Statement> {
+    map(
+        (tag("ON"), ws(parse_identifier), ws(parse_statement)),
+        |(_, event, handler)| Statement::On { event, handler: Box::new(handler) }
+    ).parse(input)
+}
+
 /// Parse any statement.
 fn parse_statement(input: &str) -> IResult<&str, Statement> {
     ws(alt((
         parse_set, parse_if, parse_use, parse_goal, parse_parallel, parse_race,
-        parse_wait, parse_remember, parse_recall, parse_forget, parse_agent, parse_contract
+        parse_wait, parse_remember, parse_recall, parse_forget, parse_agent, parse_contract,
+        parse_emit, parse_on
     ))).parse(input)
 }
 
@@ -411,5 +428,21 @@ mod tests {
             assert_eq!(capabilities.len(), 2);
             assert_eq!(capabilities[0], Permission::CanUse("search_flights".to_string()));
         } else { panic!("Failed to parse CONTRACT"); }
+    }
+
+    #[test]
+    fn test_parse_emit() {
+        let input = "EMIT flight_found DATA {flights}";
+        if let Ok(("", Statement::Emit { event, .. })) = parse_emit(input) {
+            assert_eq!(event, "flight_found");
+        } else { panic!("Failed to parse EMIT"); }
+    }
+
+    #[test]
+    fn test_parse_on() {
+        let input = "ON flight_found GOAL notify END";
+        if let Ok(("", Statement::On { event, .. })) = parse_on(input) {
+            assert_eq!(event, "flight_found");
+        } else { panic!("Failed to parse ON"); }
     }
 }

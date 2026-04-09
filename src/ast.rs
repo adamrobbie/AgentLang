@@ -62,6 +62,14 @@ pub enum Statement {
         capabilities: Vec<Permission>,
         expires: Option<f64>,
     },
+    Emit {
+        event: String,
+        data: Expression,
+    },
+    On {
+        event: String,
+        handler: Box<Statement>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

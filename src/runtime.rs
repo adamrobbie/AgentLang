@@ -2,12 +2,13 @@ use crate::ast::*;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration, sleep};
 use async_recursion::async_recursion;
 use std::fs;
 use ed25519_dalek::{SigningKey, VerifyingKey, Signer, Verifier};
 use rand::RngCore;
+use bastion::prelude::*;
+use tokio::sync::{oneshot, broadcast, mpsc};
 
 pub struct Identity {
     pub signing_key: SigningKey,
@@ -25,12 +26,19 @@ impl Identity {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct Event {
+    pub name: String,
+    pub data: AnnotatedValue,
+}
+
 pub struct Context {
     pub working_variables: HashMap<String, AnnotatedValue>,
     pub session_variables: Arc<Mutex<HashMap<String, AnnotatedValue>>>,
     pub long_term_file: String,
     pub identity: Identity,
     pub active_contracts: HashMap<String, ContractInfo>,
+    pub event_tx: broadcast::Sender<Event>,
 }
 
 #[derive(Clone)]
@@ -42,12 +50,14 @@ pub struct ContractInfo {
 
 impl Context {
     pub fn new() -> Self {
+        let (event_tx, _) = broadcast::channel(100);
         Self {
             working_variables: HashMap::new(),
             session_variables: Arc::new(Mutex::new(HashMap::new())),
             long_term_file: "memory.json".to_string(),
             identity: Identity::generate(),
             active_contracts: HashMap::new(),
+            event_tx,
         }
     }
 
@@ -107,31 +117,62 @@ pub fn eval_expression(expr: &Expression, ctx: &Context) -> Result<AnnotatedValu
     }
 }
 
-fn format_value(val: &AnnotatedValue) -> String {
-    if val.is_sensitive { "[REDACTED]".to_string() } else { format!("{:?}", val.value) }
-}
-
 #[async_recursion]
 pub async fn eval(statement: &Statement, ctx_arc: Arc<Mutex<Context>>) -> Result<()> {
     match statement {
-        Statement::Goal { name: _, body, retry, on_fail, deadline } => {
-            let max_attempts = retry.unwrap_or(0) + 1;
-            let mut last_error = None;
-            for _ in 1..=max_attempts {
-                let body_fut = async {
-                    for stmt in body { eval(stmt, ctx_arc.clone()).await?; }
-                    Ok::<(), anyhow::Error>(())
-                };
-                let result = if let Some(secs) = deadline {
-                    match timeout(Duration::from_secs_f64(*secs), body_fut).await {
-                        Ok(res) => res,
-                        Err(_) => Err(anyhow!("Timeout")),
-                    }
-                } else { body_fut.await };
-                match result { Ok(_) => return Ok(()), Err(e) => last_error = Some(e) }
+        Statement::Goal { name, body, retry, on_fail, deadline } => {
+            println!("--- Goal: {} (Supervised) ---", name);
+            let retry_count = retry.unwrap_or(0);
+            let body_clone = body.clone();
+            let ctx_clone = ctx_arc.clone();
+            let deadline_clone = *deadline;
+            let name_clone = name.clone();
+
+            let (tx, rx) = oneshot::channel();
+            let tx_arc = Arc::new(Mutex::new(Some(tx)));
+            let restart_strategy = RestartStrategy::default().with_restart_policy(RestartPolicy::Tries(retry_count));
+
+            let _ = Bastion::supervisor(move |sp| {
+                sp.with_restart_strategy(restart_strategy).children(|ch| {
+                    let body = body_clone.clone();
+                    let ctx = ctx_clone.clone();
+                    let name = name_clone.clone();
+                    let tx_arc = tx_arc.clone();
+                    ch.with_exec(move |_| {
+                        let body = body.clone();
+                        let ctx = ctx.clone();
+                        let name = name.clone();
+                        let tx_arc = tx_arc.clone();
+                        async move {
+                            let body_fut = async {
+                                for stmt in body { eval(&stmt, ctx.clone()).await?; }
+                                Ok::<(), anyhow::Error>(())
+                            };
+                            let res = if let Some(secs) = deadline_clone {
+                                match timeout(Duration::from_secs_f64(secs), body_fut).await {
+                                    Ok(res) => res,
+                                    Err(_) => Err(anyhow!("Timeout")),
+                                }
+                            } else { body_fut.await };
+                            let mut lock = tx_arc.lock().unwrap();
+                            if let Some(chan) = lock.take() { let _ = chan.send(res); }
+                            Ok::<(), ()>(())
+                        }
+                    })
+                })
+            });
+
+            match rx.await {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(e)) => {
+                    if let Some(fallback) = on_fail {
+                        println!("  Fallback for {}", name);
+                        eval(fallback, ctx_arc.clone()).await?;
+                        Ok(())
+                    } else { Err(e) }
+                }
+                Err(_) => Err(anyhow!("Aborted")),
             }
-            if let Some(fallback) = on_fail { eval(fallback, ctx_arc.clone()).await?; Ok(()) }
-            else { Err(last_error.unwrap_or_else(|| anyhow!("Failed"))) }
         }
         Statement::Set { name, value } => {
             let mut ctx = ctx_arc.lock().unwrap();
@@ -156,17 +197,38 @@ pub async fn eval(statement: &Statement, ctx_arc: Arc<Mutex<Context>>) -> Result
             Ok(())
         }
         Statement::Parallel { pattern, branches, result_into, deadline } => {
-            let fut = async {
-                match pattern {
-                    ParallelPattern::Gather | ParallelPattern::GatherAll | ParallelPattern::Race | ParallelPattern::GatherMin(_) => {
-                        let mut set = JoinSet::new();
-                        for stmt in branches {
-                            let ctx_clone = ctx_arc.clone();
-                            let stmt_clone = stmt.clone();
-                            set.spawn(async move { eval(&stmt_clone, ctx_clone).await });
+            println!("--- Parallel ({:?}) ---", pattern);
+            let (tx, mut rx) = mpsc::channel(branches.len().max(1));
+            
+            for stmt in branches {
+                let stmt = stmt.clone();
+                let ctx = ctx_arc.clone();
+                let tx = tx.clone();
+                let _ = Bastion::children(move |ch| {
+                    ch.with_exec(move |_| {
+                        let stmt = stmt.clone();
+                        let ctx = ctx.clone();
+                        let tx = tx.clone();
+                        async move {
+                            let res = eval(&stmt, ctx).await;
+                            let _ = tx.send(res.is_ok()).await;
+                            Ok::<(), ()>(())
                         }
-                        while let Some(res) = set.join_next().await { res??; if *pattern == ParallelPattern::Race { break; } }
-                        set.abort_all();
+                    })
+                });
+            }
+
+            let fut = async {
+                let mut success_count = 0;
+                for _ in 0..branches.len() {
+                    if let Some(success) = rx.recv().await {
+                        if success {
+                            success_count += 1;
+                            if *pattern == ParallelPattern::Race { break; }
+                            if let ParallelPattern::GatherMin(min) = pattern {
+                                if success_count >= *min { break; }
+                            }
+                        }
                     }
                 }
                 if let Some(var) = result_into {
@@ -174,6 +236,7 @@ pub async fn eval(statement: &Statement, ctx_arc: Arc<Mutex<Context>>) -> Result
                 }
                 Ok::<(), anyhow::Error>(())
             };
+
             if let Some(secs) = deadline { timeout(Duration::from_secs_f64(*secs), fut).await??; } else { fut.await?; }
             Ok(())
         }
@@ -223,12 +286,45 @@ pub async fn eval(statement: &Statement, ctx_arc: Arc<Mutex<Context>>) -> Result
             });
             Ok(())
         }
+        Statement::Emit { event, data } => {
+            let val = { let ctx = ctx_arc.lock().unwrap(); eval_expression(data, &ctx)? };
+            let ctx = ctx_arc.lock().unwrap();
+            let _ = ctx.event_tx.send(Event { name: event.clone(), data: val });
+            Ok(())
+        }
+        Statement::On { event, handler } => {
+            let event_name = event.clone();
+            let handler_clone = handler.clone();
+            let ctx_clone = ctx_arc.clone();
+            let mut rx = ctx_arc.lock().unwrap().event_tx.subscribe();
+            let _ = Bastion::children(move |ch| {
+                ch.with_exec(move |_| {
+                    let event_name = event_name.clone();
+                    let handler = handler_clone.clone();
+                    let ctx = ctx_clone.clone();
+                    let mut rx = rx.resubscribe();
+                    async move {
+                        while let Ok(ev) = rx.recv().await {
+                            if ev.name == event_name {
+                                let _ = eval(&handler, ctx.clone()).await;
+                            }
+                        }
+                        Ok::<(), ()>(())
+                    }
+                })
+            });
+            Ok(())
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn init_bastion() {
+        let _ = Bastion::init();
+    }
 
     #[test]
     fn test_eval_expression_literal() {
@@ -258,6 +354,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_eval_parallel_gather() {
+        init_bastion();
         let ctx = Arc::new(Mutex::new(Context::new()));
         let stmt = Statement::Parallel {
             pattern: ParallelPattern::Gather,
@@ -269,6 +366,7 @@ mod tests {
             deadline: None,
         };
         eval(&stmt, ctx.clone()).await.unwrap();
+        sleep(Duration::from_millis(200)).await;
         let lock = ctx.lock().unwrap();
         assert_eq!(lock.get_variable("a", MemoryScope::Working).unwrap().value, Value::Number(1.0));
         assert_eq!(lock.get_variable("b", MemoryScope::Working).unwrap().value, Value::Number(2.0));
@@ -277,6 +375,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_eval_retry() {
+        init_bastion();
         let ctx = Arc::new(Mutex::new(Context::new()));
         let stmt = Statement::Goal {
             name: "retry_goal".to_string(),
@@ -333,5 +432,28 @@ mod tests {
         };
         eval(&contract, ctx.clone()).await.unwrap();
         assert!(ctx.lock().unwrap().active_contracts.contains_key("test_contract"));
+    }
+
+    #[tokio::test]
+    async fn test_event_emit_on() {
+        init_bastion();
+        let ctx = Arc::new(Mutex::new(Context::new()));
+        let on_stmt = Statement::On {
+            event: "ping".to_string(),
+            handler: Box::new(Statement::Set {
+                name: "pong".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))),
+            }),
+        };
+        let emit_stmt = Statement::Emit {
+            event: "ping".to_string(),
+            data: Expression::Literal(AnnotatedValue::from(Value::Text("hello".to_string()))),
+        };
+        eval(&on_stmt, ctx.clone()).await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        eval(&emit_stmt, ctx.clone()).await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        let lock = ctx.lock().unwrap();
+        assert_eq!(lock.get_variable("pong", MemoryScope::Working).unwrap().value, Value::Boolean(true));
     }
 }
