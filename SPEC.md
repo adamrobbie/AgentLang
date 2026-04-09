@@ -864,81 +864,78 @@ END
 
 ## 13. Runtime Architecture
 
-### 13.1 Hybrid Runtime Model
+### 13.1 Pure Rust Runtime Model
 
-The AgentLang runtime uses a **hybrid architecture**: Elixir on the BEAM VM for agent orchestration and concurrency, and Rust with Tokio for performance-critical and security-critical primitives. The two layers communicate via **Erlang NIFs** (Native Implemented Functions).
+AgentLang 1.0 utilizes a **Pure Rust** architecture optimized for maximum throughput, memory safety, and deterministic execution. The runtime is built on the **Tokio** asynchronous executor and the **Bastion** highly-available supervisor framework, providing OTP-like resilience without the overhead of a virtual machine.
 
 ```
 AgentLang Source (.al)
          |
-   Rust Parser / Lexer
+   Rust Parser / Lexer (nom)
          |
    AST / Bytecode
          |
-   BEAM Orchestration Layer  (Elixir / OTP)
-   |-- Goal Actor Supervisor
-   |-- Parallel Task Scheduler
-   |-- Event Bus  (EMIT / ON)
-   |-- Agent Registry Client
-   |-- Session Store  (ETS)
-         |  Erlang NIFs
-   Rust Performance Layer
-   |-- ZK Proof Engine  (winterfell / zk-STARKs)
-   |-- Crypto Signing   (Ed25519)
+   Orchestration Layer (Tokio / Bastion)
+   |-- Goal Supervisor (Bastion)
+   |-- Parallel Task Scheduler (Tokio)
+   |-- Event Bus (Internal MPMC Channels)
+   |-- Agent Registry Client (Tonic / gRPC)
+   |-- Session Store (DashMap / In-memory)
+         |
+   Performance & Security Layer
+   |-- ZK Proof Engine (winterfell / zk-STARKs)
+   |-- Crypto Signing (Ed25519)
    |-- Memory Encryption (AES-256-GCM)
-   |-- Audit Hash Chain  (SHA-256)
+   |-- Audit Hash Chain (SHA-256)
    |-- Contract Validator
          |
    Memory Layer
-   |-- Working   (BEAM process heap)
-   |-- Session   (ETS table)
-   |-- Long-term (PostgreSQL + pgvector)
-   |-- Shared    (PostgreSQL + pgvector)
+   |-- Working   (Tokio Local Storage)
+   |-- Session   (DashMap)
+   |-- Long-term (PostgreSQL + pgvector via sqlx)
+   |-- Shared    (PostgreSQL + pgvector via sqlx)
          |
    Tool Executor
-   |-- Standard Library
+   |-- Standard Library (Rust Built-ins)
    |-- MCP Adapter
    |-- HTTP Client (reqwest)
          |
    External World
 ```
 
-### 13.2 BEAM Orchestration Layer
+### 13.2 Goal Orchestration via Bastion
 
-Every GOAL maps to a supervised BEAM GenServer process. OTP supervision trees map directly to AgentLang's error handling directives.
+Every `GOAL` maps to a supervised **Bastion Child**. This provides fault isolation and hierarchical recovery identical to the Erlang/OTP model.
 
-| AgentLang Concept | BEAM / OTP Equivalent |
+| AgentLang Concept | Rust / Bastion Equivalent |
 |---|---|
-| `GOAL` | GenServer process with supervised mailbox |
-| `PARALLEL` block | Supervisor with `one_for_one` strategy |
-| `RACE` block | `Task.async_stream` with first-wins cancellation |
-| `RETRY n` | `max_restarts: n` in supervisor spec |
-| `DEADLINE duration` | `timeout: ms` in GenServer call |
-| `EMIT / ON` | Phoenix PubSub topic publish / subscribe |
-| Hot update | BEAM hot code reloading via `code:load_file/1` |
+| `GOAL` | Bastion Child (Lightweight Task) |
+| `PARALLEL` block | Bastion Group with custom restart strategy |
+| `RACE` block | `tokio::select!` with early cancellation |
+| `RETRY n` | Bastion `restart_policy` with max_restarts |
+| `DEADLINE duration` | `tokio::time::timeout` |
+| `EMIT / ON` | Internal MPMC broadcast channels |
+| Hot update | WASM-based logic hot-swapping |
 
-### 13.3 Rust Performance Layer
+### 13.3 Performance Characteristics
 
 | Component | Technology | Reason |
 |---|---|---|
-| Parser / Lexer | Rust + nom | Zero-allocation, deterministic, compile-time safe |
-| ZK Proof Engine | winterfell (zk-STARKs) | No trusted setup, post-quantum secure |
-| Message Signing | Ed25519 (ring crate) | Industry standard, fast, memory safe |
-| Memory Encryption | AES-256-GCM (ring crate) | Authenticated encryption (AEAD) |
-| Audit Hash Chain | SHA-256 (ring crate) | Tamper-evident append-only log |
-| HTTP Client | reqwest + Tokio | Async, efficient, widely used |
-
-> **NOTE on Actix:** Actix Web (v4.12.1, November 2025) is mature and production-ready. It is the recommended choice for the **Agent Registry HTTP API** due to its exceptional throughput and well-documented production characteristics. However, Actix actors are **not** used in the AgentLang runtime core — agent orchestration is handled by Elixir/BEAM, which provides superior supervision trees, hot reloading, and distribution out of the box. Using Actix actors would duplicate BEAM's capabilities unnecessarily.
+| Async Runtime | Tokio | Industry standard for high-performance async I/O |
+| Supervision | Bastion | Fault-tolerant actor model with low overhead |
+| Persistence | sqlx | Compile-time verified SQL queries |
+| ZK Engine | winterfell | High-performance STARK generation in Rust |
+| Communication | Tonic | High-performance gRPC for inter-agent calls |
 
 ### 13.4 Implementation Roadmap
 
-| Phase | Stack | Deliverable |
-|---|---|---|
-| 1 — Proof of concept | TypeScript | Parser + basic GOAL execution + tool calls |
-| 2 — Language validation | TypeScript | Full spec — memory, parallelism, type system |
-| 3 — Production runtime | Elixir / BEAM | Actor model, supervision, event bus |
-| 4 — Performance layer | Rust + Tokio | Parser rewrite, ZK proofs, crypto, audit |
-| 5 — Hybrid integration | Elixir + Rust NIFs | Connect layers, benchmark, harden |
+| Phase | Deliverable |
+|---|---|
+| 1 — Foundation | Rust Parser (nom) + Tokio-based execution loop |
+| 2 — Orchestration | Integrate Bastion for GOAL supervision and retries |
+| 3 — Crypto | Integrate winterfell for ZK proofs and Ed25519 for identity |
+| 4 — Distribution | Implement Tonic (gRPC) for inter-agent communication |
+| 5 — Hardening | Security audits, performance benchmarking, and WASM integration |
 
 ---
 
@@ -1176,16 +1173,15 @@ Complete alphabetical listing of all AgentLang reserved keywords.
 
 | Influence | Concept Borrowed |
 |---|---|
-| Erlang / OTP | Actor model, supervision trees, hot code reloading, fault isolation |
-| Elixir / Phoenix | Modern BEAM idioms, PubSub for EMIT/ON, developer ergonomics |
+| Bastion / Tokio | Fault-tolerant actor model, supervision trees, high-performance async |
 | AgentSpeak / Jason | BDI agent architecture, goal-oriented control flow primitives |
-| QUASAR (Mell et al., 2025) | Uncertainty quantification, agent code actions — AgentLang takes a native rather than transpilation approach |
+| QUASAR (Mell et al., 2025) | Uncertainty quantification, agent code actions |
 | Rust | Memory safety, performance, ZK proof and cryptographic library ecosystem |
+| Tonic / gRPC | High-performance, typed inter-agent communication |
 | SQL | Declarative intent over imperative procedure — write *what*, not *how* |
 | GraphQL | Typed, inspectable, composable query structures — inspiration for OUTPUT blocks |
 | MCP | Tool and data access standard — AgentLang tools are MCP-compatible by design |
-| Zcash / bellman | ZK proof concepts — AgentLang chose winterfell (zk-STARKs) over bellman (zk-SNARKs) |
-| JWT / PKI | Signed, verifiable identity tokens — inspiration for agent CONTRACT signing |
+| Zcash / bellman | ZK proof concepts — AgentLang chose winterfell (zk-STARKs) |
 | ActivityPub / Email | Federated identity model — inspiration for the federated Agent Registry |
 | Go language spec | Spec structure — minimal, precise, example-driven |
 | Rust reference | Spec conventions — normative/informative distinction, grammar blocks |

@@ -54,14 +54,15 @@ END
 
 ## 🏗️ Architecture
 
-AgentLang uses a dual-layer architecture to ensure both resilience and speed:
+AgentLang uses a **Pure Rust** architecture designed for massive throughput and zero-cost safety:
 
-1.  **Orchestration Layer (Elixir/BEAM):** Every `GOAL` is a supervised actor. This provides "hot-reloading" for long-running agents and world-class fault isolation.
-2.  **Performance Layer (Rust):** Handles the "heavy lifting" including:
-    *   **winterfell:** zk-STARK proof generation.
-    *   **Ed25519:** Cryptographic signing.
-    *   **AES-256-GCM:** Memory encryption.
-    *   **nom:** Zero-copy parsing.
+1.  **Orchestration (Tokio + Bastion):** Every `GOAL` is a supervised task. We use the **Bastion** runtime to provide OTP-style supervision trees, ensuring that one failing agent cannot crash the system.
+2.  **Safety Layer:** Built-in support for **WebAssembly (WASM)** allows for sandboxed agent execution and hot-swappable logic without restarting the host.
+3.  **High-Performance Primitives:**
+    *   **winterfell:** Fast zk-STARK proof generation.
+    *   **Tonic:** gRPC-based inter-agent communication.
+    *   **sqlx:** Type-safe, asynchronous database access for memory scopes.
+    *   **nom:** High-speed, zero-copy parsing of `.al` source files.
 
 ## 🗺️ Roadmap
 
