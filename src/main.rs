@@ -13,6 +13,8 @@ GOAL plan_trip
   SET origin = "London"
   SET destination = "New York"
   
+  REMEMBER user_name VALUE "Alice" SCOPE session END
+
   IF true
     USE search_flights
       from {origin}
@@ -20,6 +22,7 @@ GOAL plan_trip
       RESULT INTO {flights}
     END
     
+    RECALL user_name INTO {name} SCOPE session END
     SET final_status = {flights}
   END
 END
@@ -27,13 +30,14 @@ END
     
     match parser::parse_program(source) {
         Ok((_, program)) => {
-            let mut ctx = runtime::Context::new();
+            let ctx = std::sync::Arc::new(std::sync::Mutex::new(runtime::Context::new()));
             for stmt in program {
-                runtime::eval(&stmt, &mut ctx).await?;
+                runtime::eval(&stmt, ctx.clone()).await?;
             }
             
             println!("\n--- Final State ---");
-            println!("final_status: {:?}", ctx.get_variable("final_status")?);
+            let lock = ctx.lock().unwrap();
+            println!("final_status: {:?}", lock.get_variable("final_status", ast::MemoryScope::Working)?);
         }
         Err(e) => {
             eprintln!("Parse error: {:?}", e);
