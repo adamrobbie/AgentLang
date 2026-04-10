@@ -5,7 +5,7 @@ use nom::{
     bytes::complete::{tag, take_while1},
     character::complete::{alpha1, alphanumeric1, char, digit1, multispace0, none_of},
     combinator::{map, map_res, opt, recognize},
-    multi::many0,
+    multi::{many_till, many0},
     sequence::{delimited, pair, preceded},
 };
 use std::collections::HashMap;
@@ -221,76 +221,148 @@ enum GoalOpt {
     Retry(usize),
     OnFail {
         failure_type: String,
-        handler: Statement,
+        handler: Box<Statement>,
     },
     Deadline(f64),
     Idempotent,
     Fallback(Expression),
 }
 
-/// Parse a GOAL block: GOAL name ... [RETRY n] [ON_FAIL[type] GOAL x] [DEADLINE d] [IDEMPOTENT] [FALLBACK val] END
+enum GoalItem {
+    Statement(Statement),
+    Outputs(Vec<GoalOutput>),
+    ResultInto(String),
+    Opt(GoalOpt),
+}
+
+fn parse_goal_output(input: &str) -> IResult<&str, GoalOutput> {
+    map(
+        (
+            parse_identifier,
+            ws(parse_identifier),
+            many0(preceded(ws(tag("AS")), parse_annotation)),
+        ),
+        |(name, type_name, annotations)| GoalOutput {
+            name,
+            type_name,
+            annotations,
+        },
+    )
+    .parse(input)
+}
+
+fn parse_goal_outputs(input: &str) -> IResult<&str, Vec<GoalOutput>> {
+    map(
+        preceded(
+            tag("OUTPUT"),
+            many_till(ws(parse_goal_output), ws(tag("END"))),
+        ),
+        |(outputs, _)| outputs,
+    )
+    .parse(input)
+}
+
+fn parse_goal_result_into(input: &str) -> IResult<&str, String> {
+    map(
+        (
+            tag("RESULT"),
+            ws(tag("INTO")),
+            ws(delimited(char('{'), parse_identifier, char('}'))),
+        ),
+        |(_, _, result_into)| result_into,
+    )
+    .parse(input)
+}
+
+fn parse_goal_opt(input: &str) -> IResult<&str, GoalOpt> {
+    alt((
+        map(preceded(ws(tag("RETRY")), ws(parse_number)), |v| {
+            if let Value::Number(n) = v {
+                GoalOpt::Retry(n as usize)
+            } else {
+                GoalOpt::Retry(0)
+            }
+        }),
+        map(
+            pair(
+                preceded(
+                    ws(tag("ON_FAIL")),
+                    opt(delimited(char('['), parse_identifier, char(']'))),
+                ),
+                ws(parse_statement),
+            ),
+            |(ft, handler)| GoalOpt::OnFail {
+                failure_type: ft.unwrap_or("*".to_string()),
+                handler: Box::new(handler),
+            },
+        ),
+        map(
+            preceded(ws(tag("DEADLINE")), ws(parse_duration)),
+            GoalOpt::Deadline,
+        ),
+        map(ws(tag("IDEMPOTENT")), |_| GoalOpt::Idempotent),
+        map(
+            preceded(ws(tag("FALLBACK")), ws(parse_expression)),
+            GoalOpt::Fallback,
+        ),
+    ))
+    .parse(input)
+}
+
+fn parse_goal_item(input: &str) -> IResult<&str, GoalItem> {
+    alt((
+        map(parse_goal_outputs, GoalItem::Outputs),
+        map(parse_goal_result_into, GoalItem::ResultInto),
+        map(parse_goal_opt, GoalItem::Opt),
+        map(parse_statement, GoalItem::Statement),
+    ))
+    .parse(input)
+}
+
+/// Parse a GOAL block: GOAL name ... [OUTPUT ... END] [RESULT INTO {var}] [RETRY n] [ON_FAIL[type] GOAL x] [DEADLINE d] [IDEMPOTENT] [FALLBACK val] END
 fn parse_goal(input: &str) -> IResult<&str, Statement> {
     map(
         (
             tag("GOAL"),
             ws(parse_identifier),
-            many0(parse_statement),
-            many0(alt((
-                map(preceded(ws(tag("RETRY")), ws(parse_number)), |v| {
-                    if let Value::Number(n) = v {
-                        GoalOpt::Retry(n as usize)
-                    } else {
-                        GoalOpt::Retry(0)
-                    }
-                }),
-                map(
-                    pair(
-                        preceded(
-                            ws(tag("ON_FAIL")),
-                            opt(delimited(char('['), parse_identifier, char(']'))),
-                        ),
-                        ws(parse_statement),
-                    ),
-                    |(ft, handler)| GoalOpt::OnFail {
-                        failure_type: ft.unwrap_or("*".to_string()),
-                        handler,
-                    },
-                ),
-                map(
-                    preceded(ws(tag("DEADLINE")), ws(parse_duration)),
-                    GoalOpt::Deadline,
-                ),
-                map(ws(tag("IDEMPOTENT")), |_| GoalOpt::Idempotent),
-                map(
-                    preceded(ws(tag("FALLBACK")), ws(parse_expression)),
-                    GoalOpt::Fallback,
-                ),
-            ))),
+            many0(ws(parse_goal_item)),
             tag("END"),
         ),
-        |(_, name, body, opts, _)| {
+        |(_, name, items, _)| {
+            let mut body = Vec::new();
+            let mut outputs = Vec::new();
+            let mut result_into = None;
             let mut retry = None;
             let mut on_fail = HashMap::new();
             let mut deadline = None;
             let mut idempotent = false;
             let mut fallback = None;
-            for opt in opts {
-                match opt {
-                    GoalOpt::Retry(r) => retry = Some(r),
-                    GoalOpt::OnFail {
-                        failure_type,
-                        handler,
-                    } => {
-                        on_fail.insert(failure_type, handler);
-                    }
-                    GoalOpt::Deadline(d) => deadline = Some(d),
-                    GoalOpt::Idempotent => idempotent = true,
-                    GoalOpt::Fallback(e) => fallback = Some(e),
+
+            for item in items {
+                match item {
+                    GoalItem::Statement(stmt) => body.push(stmt),
+                    GoalItem::Outputs(parsed_outputs) => outputs = parsed_outputs,
+                    GoalItem::ResultInto(target) => result_into = Some(target),
+                    GoalItem::Opt(opt) => match opt {
+                        GoalOpt::Retry(r) => retry = Some(r),
+                        GoalOpt::OnFail {
+                            failure_type,
+                            handler,
+                        } => {
+                            on_fail.insert(failure_type, *handler);
+                        }
+                        GoalOpt::Deadline(d) => deadline = Some(d),
+                        GoalOpt::Idempotent => idempotent = true,
+                        GoalOpt::Fallback(e) => fallback = Some(e),
+                    },
                 }
             }
+
             Statement::Goal {
                 name,
                 body,
+                outputs,
+                result_into,
                 retry,
                 on_fail,
                 deadline,
@@ -951,6 +1023,8 @@ mod tests {
                 name: "x".to_string(),
                 value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
             }],
+            outputs: vec![],
+            result_into: None,
             retry: None,
             on_fail: HashMap::new(),
             deadline: None,
@@ -959,6 +1033,39 @@ mod tests {
         };
         assert_eq!(parse_goal(input), Ok(("", expected)));
     }
+    #[test]
+    fn test_parse_goal_with_outputs_and_result_into() {
+        let input = "GOAL search_flights SET flights = [1] OUTPUT flights list confidence float AS confidence END RESULT INTO {summary} END";
+        let expected = Statement::Goal {
+            name: "search_flights".to_string(),
+            body: vec![Statement::Set {
+                name: "flights".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::List(vec![
+                    AnnotatedValue::from(Value::Number(1.0)),
+                ]))),
+            }],
+            outputs: vec![
+                GoalOutput {
+                    name: "flights".to_string(),
+                    type_name: "list".to_string(),
+                    annotations: vec![],
+                },
+                GoalOutput {
+                    name: "confidence".to_string(),
+                    type_name: "float".to_string(),
+                    annotations: vec![Annotation::Confidence],
+                },
+            ],
+            result_into: Some("summary".to_string()),
+            retry: None,
+            on_fail: HashMap::new(),
+            deadline: None,
+            idempotent: false,
+            fallback: None,
+        };
+        assert_eq!(parse_goal(input), Ok(("", expected)));
+    }
+
     #[test]
     fn test_parse_if() {
         let input = "IF true SET x = 1 ELSE SET x = 2 END";

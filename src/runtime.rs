@@ -23,10 +23,41 @@ use ring::{aead, digest};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::LazyLock;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Once};
 use tokio::sync::broadcast;
 use tokio::time::{Duration, sleep};
 use wasmtime::*;
+
+pub fn ensure_bastion_started() {
+    static BASTION_START: Once = Once::new();
+    BASTION_START.call_once(|| {
+        Bastion::init();
+        Bastion::start();
+    });
+}
+
+#[cfg(test)]
+static BASTION_TEST_MUTEX: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+#[cfg(test)]
+pub async fn bastion_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    BASTION_TEST_MUTEX.lock().await
+}
+
+#[cfg(test)]
+fn unique_test_path(prefix: &str) -> String {
+    static TEST_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let id = TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir()
+        .join(format!("agentlang-{}-{}", prefix, id))
+        .to_string_lossy()
+        .into_owned()
+}
 
 pub struct Identity {
     pub signing_key: SigningKey,
@@ -136,7 +167,7 @@ pub struct Context {
     pub session_key: Arc<aead::LessSafeKey>,
     pub wasm_engine: Engine,
     pub proofs: Arc<Mutex<HashMap<String, crypto::StarkProof>>>,
-    pub goals: Arc<Mutex<HashMap<String, Vec<Statement>>>>,
+    pub goals: Arc<Mutex<HashMap<String, GoalDefinition>>>,
     pub registries: Arc<Mutex<Vec<String>>>,
     pub pending_calls:
         Arc<Mutex<HashMap<String, tokio::sync::oneshot::Receiver<Result<AnnotatedValue>>>>>,
@@ -155,13 +186,16 @@ impl Context {
 
         // Phase 3.3: Mitigation for Plaintext Secrets
         // Use environment variable if present, otherwise fallback to agent.key file
-        let key_file = "agent.key";
+        #[cfg(test)]
+        let key_file = unique_test_path("agent-key");
+        #[cfg(not(test))]
+        let key_file = "agent.key".to_string();
         let mut key_bytes = [0u8; 32];
         if let Ok(env_key) = std::env::var("AGENTLANG_MASTER_KEY") {
             let hash = digest::digest(&digest::SHA256, env_key.as_bytes());
             key_bytes.copy_from_slice(hash.as_ref());
             println!("  [Security] Using AGENTLANG_MASTER_KEY from environment.");
-        } else if let Ok(existing_key) = fs::read(key_file) {
+        } else if let Ok(existing_key) = fs::read(&key_file) {
             let existing_key: Vec<u8> = existing_key;
             if existing_key.len() == 32 {
                 key_bytes.copy_from_slice(&existing_key);
@@ -176,9 +210,11 @@ impl Context {
         }
         let unbound_key = aead::UnboundKey::new(&aead::AES_256_GCM, &key_bytes).unwrap();
 
-        // Persist or load identity
-        let id_file = "agent.id";
-        let identity = if let Ok(existing_id) = fs::read(id_file) {
+        #[cfg(test)]
+        let id_file = unique_test_path("agent-id");
+        #[cfg(not(test))]
+        let id_file = "agent.id".to_string();
+        let identity = if let Ok(existing_id) = fs::read(&id_file) {
             let existing_id: Vec<u8> = existing_id;
             if existing_id.len() == 32 {
                 let bytes: [u8; 32] = existing_id.try_into().unwrap();
@@ -206,12 +242,39 @@ impl Context {
         Self {
             working_variables: Arc::new(Mutex::new(HashMap::new())),
             session_variables: Arc::new(Mutex::new(HashMap::new())),
-            long_term_file: "memory.json".to_string(),
-            shared_file: "shared_memory.json".to_string(),
+            long_term_file: {
+                #[cfg(test)]
+                {
+                    unique_test_path("memory")
+                }
+                #[cfg(not(test))]
+                {
+                    "memory.json".to_string()
+                }
+            },
+            shared_file: {
+                #[cfg(test)]
+                {
+                    unique_test_path("shared-memory")
+                }
+                #[cfg(not(test))]
+                {
+                    "shared_memory.json".to_string()
+                }
+            },
             identity: Arc::new(identity),
             active_contracts: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
-            audit_chain: Arc::new(Mutex::new(AuditChain::new("audit.json".to_string()))),
+            audit_chain: Arc::new(Mutex::new(AuditChain::new({
+                #[cfg(test)]
+                {
+                    unique_test_path("audit")
+                }
+                #[cfg(not(test))]
+                {
+                    "audit.json".to_string()
+                }
+            }))),
             session_key: Arc::new(aead::LessSafeKey::new(unbound_key)),
             wasm_engine,
             proofs: Arc::new(Mutex::new(HashMap::new())),
@@ -436,6 +499,95 @@ pub enum StoredValue {
     Encrypted { nonce: Vec<u8>, ciphertext: Vec<u8> },
 }
 
+fn apply_annotations(mut value: AnnotatedValue, annotations: &[Annotation]) -> AnnotatedValue {
+    for annotation in annotations {
+        match annotation {
+            Annotation::Confidence => value.confidence = value.confidence.or(Some(1.0)),
+            Annotation::Sensitive => value.is_sensitive = true,
+            Annotation::Uncertain => value.is_uncertain = true,
+            Annotation::Approximate => value.is_approximate = true,
+        }
+    }
+    value
+}
+
+fn collect_changed_working_values(
+    before: &HashMap<String, AnnotatedValue>,
+    after: &HashMap<String, AnnotatedValue>,
+    goal_name: &str,
+) -> HashMap<String, AnnotatedValue> {
+    after
+        .iter()
+        .filter_map(|(key, value)| {
+            if key == goal_name || key == &format!("{}.result", goal_name) {
+                return None;
+            }
+
+            match before.get(key) {
+                Some(previous) if previous == value => None,
+                _ => Some((key.clone(), value.clone())),
+            }
+        })
+        .collect()
+}
+
+async fn build_goal_result(
+    ctx: &Context,
+    goal_name: &str,
+    working_before: &HashMap<String, AnnotatedValue>,
+    outputs: &[GoalOutput],
+    result_into: &Option<String>,
+) -> Result<AnnotatedValue> {
+    let working_after = ctx.working_variables.lock().unwrap().clone();
+    let mut fields = HashMap::new();
+
+    if !outputs.is_empty() {
+        for output in outputs {
+            let value = working_after
+                .get(&output.name)
+                .cloned()
+                .unwrap_or_else(|| AnnotatedValue::from(Value::Null));
+            fields.insert(
+                output.name.clone(),
+                apply_annotations(value, &output.annotations),
+            );
+        }
+    } else if let Some(result_var) = result_into {
+        let value = working_after
+            .get(result_var)
+            .cloned()
+            .unwrap_or_else(|| AnnotatedValue::from(Value::Null));
+        fields.insert(result_var.clone(), value.clone());
+        fields.insert("result".to_string(), value);
+    } else {
+        fields.extend(collect_changed_working_values(
+            working_before,
+            &working_after,
+            goal_name,
+        ));
+    }
+
+    Ok(AnnotatedValue::from(Value::Object(fields)))
+}
+
+async fn store_goal_result(ctx: &Context, goal_name: &str, result: AnnotatedValue) -> Result<()> {
+    let flat_result = if let Value::Object(fields) = &result.value {
+        fields.get("result").cloned()
+    } else {
+        None
+    };
+
+    ctx.set_variable(goal_name.to_string(), result, MemoryScope::Working)
+        .await?;
+
+    if let Some(value) = flat_result {
+        ctx.set_variable(format!("{}.result", goal_name), value, MemoryScope::Working)
+            .await?;
+    }
+
+    Ok(())
+}
+
 fn resolve_path(value: &AnnotatedValue, path: &VariablePath) -> Result<AnnotatedValue> {
     let mut current = value.clone();
 
@@ -587,6 +739,8 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
         Statement::Goal {
             name,
             body,
+            outputs,
+            result_into,
             retry,
             on_fail,
             deadline,
@@ -594,7 +748,19 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             fallback,
         } => {
             println!("  [Runtime] Goal: {}", name);
-            ctx.goals.lock().unwrap().insert(name.clone(), body.clone());
+            ctx.goals.lock().unwrap().insert(
+                name.clone(),
+                GoalDefinition {
+                    body: body.clone(),
+                    outputs: outputs.clone(),
+                    result_into: result_into.clone(),
+                    retry: *retry,
+                    on_fail: on_fail.clone(),
+                    deadline: *deadline,
+                    idempotent: *idempotent,
+                    fallback: fallback.clone(),
+                },
+            );
 
             // 1. Idempotency check
             if *idempotent {
@@ -613,69 +779,81 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             }
 
             let max_retries = retry.unwrap_or(0);
-            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            use tokio::task::JoinSet;
 
+            let mut goal_tasks = JoinSet::new();
             let body_clone = body.clone();
             let ctx_clone = ctx.clone();
             let name_clone = name.clone();
+            let outputs_clone = outputs.clone();
+            let result_into_clone = result_into.clone();
+            let working_before = ctx.working_variables.lock().unwrap().clone();
 
-            // Create a dedicated supervisor for this goal (BEAM-style)
-            Bastion::supervisor(|sup| {
-                sup.children(|children| {
-                    children.with_exec(move |_ctx: BastionContext| {
-                        let body_inner = body_clone.clone();
-                        let ctx_inner = ctx_clone.clone();
-                        let tx_inner = tx.clone();
-                        let max_retries_inner = max_retries;
-                        let name_inner = name_clone.clone();
+            goal_tasks.spawn(async move {
+                let mut current_attempt = 0;
+                loop {
+                    current_attempt += 1;
+                    let mut res = Ok(());
+                    for stmt in &body_clone {
+                        if let Err(e) = eval(stmt, ctx_clone.clone()).await {
+                            res = Err(e);
+                            break;
+                        }
+                    }
 
-                        async move {
-                            let mut current_attempt = 0;
-                            loop {
-                                current_attempt += 1;
-                                let mut res = Ok(());
-                                for stmt in &body_inner {
-                                    if let Err(e) = eval(stmt, ctx_inner.clone()).await {
-                                        res = Err(e);
-                                        break;
-                                    }
-                                }
+                    match res {
+                        Ok(_) => {
+                            let goal_result = build_goal_result(
+                                &ctx_clone,
+                                &name_clone,
+                                &working_before,
+                                &outputs_clone,
+                                &result_into_clone,
+                            )
+                            .await?;
 
-                                match res {
-                                    Ok(_) => {
-                                        {
-                                            let mut audit = ctx_inner.audit_chain.lock().unwrap();
-                                            audit.append(format!("GOAL_SUCCESS:{}", name_inner));
-                                        }
-                                        let _ = tx_inner.send(Ok(())).await;
-                                        return Ok(());
-                                    }
-                                    Err(e) => {
-                                        if current_attempt <= max_retries_inner {
-                                            println!("  [Runtime] Goal '{}' attempt {} failed: {}. Retrying...", name_inner, current_attempt, e);
-                                        } else {
-                                            println!("  [Runtime] Goal '{}' exhausted all {} retries.", name_inner, max_retries_inner + 1);
-                                            let _ = tx_inner.send(Err(e)).await;
-                                            return Ok(());
-                                        }
-                                    }
-                                }
+                            store_goal_result(&ctx_clone, &name_clone, goal_result).await?;
+                            {
+                                let mut audit = ctx_clone.audit_chain.lock().unwrap();
+                                audit.append(format!("GOAL_SUCCESS:{}", name_clone));
+                            }
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                        Err(e) => {
+                            if current_attempt <= max_retries {
+                                println!(
+                                    "  [Runtime] Goal '{}' attempt {} failed: {}. Retrying...",
+                                    name_clone, current_attempt, e
+                                );
+                            } else {
+                                println!(
+                                    "  [Runtime] Goal '{}' exhausted all {} retries.",
+                                    name_clone,
+                                    max_retries + 1
+                                );
+                                return Err(e);
                             }
                         }
-                    })
-                })
-            }).expect("Failed to spawn supervised Goal");
+                    }
+                }
+            });
 
             let result = if let Some(d) = deadline {
-                match tokio::time::timeout(Duration::from_secs_f64(*d), rx.recv()).await {
-                    Ok(Some(res)) => res,
-                    Ok(None) => Err(anyhow!("Goal communication channel closed")),
-                    Err(_) => Err(anyhow!("Goal '{}' timed out after {}s", name, d)),
+                match tokio::time::timeout(Duration::from_secs_f64(*d), goal_tasks.join_next())
+                    .await
+                {
+                    Ok(Some(joined)) => joined.map_err(|e| anyhow!("Goal task failed: {}", e))?,
+                    Ok(None) => Err(anyhow!("Goal task completed without a result")),
+                    Err(_) => {
+                        goal_tasks.abort_all();
+                        while goal_tasks.join_next().await.is_some() {}
+                        Err(anyhow!("Goal '{}' timed out after {}s", name, d))
+                    }
                 }
             } else {
-                match rx.recv().await {
-                    Some(res) => res,
-                    None => Err(anyhow!("Goal communication channel closed")),
+                match goal_tasks.join_next().await {
+                    Some(joined) => joined.map_err(|e| anyhow!("Goal task failed: {}", e))?,
+                    None => Err(anyhow!("Goal task completed without a result")),
                 }
             };
 
@@ -702,8 +880,15 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                         name
                     );
                     let val = eval_expression(fallback_expr, &ctx).await?;
-                    ctx.set_variable(format!("{}.result", name), val, MemoryScope::Working)
-                        .await?;
+                    store_goal_result(
+                        &ctx,
+                        name,
+                        AnnotatedValue::from(Value::Object(HashMap::from([(
+                            "result".to_string(),
+                            val,
+                        )]))),
+                    )
+                    .await?;
                     Ok(())
                 } else {
                     Err(e)
@@ -1301,7 +1486,9 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                         .into_inner();
 
                     if response.success {
-                        Ok(AnnotatedValue::from(Value::Text(response.result_json)))
+                        serde_json::from_str::<AnnotatedValue>(&response.result_json).or_else(
+                            |_| Ok(AnnotatedValue::from(Value::Text(response.result_json))),
+                        )
                     } else {
                         Err(anyhow!("Remote execution failed: {}", response.result_json))
                     }
@@ -1343,7 +1530,7 @@ mod tests {
     use ed25519_dalek::Verifier;
 
     fn init_bastion() {
-        Bastion::init();
+        ensure_bastion_started();
     }
 
     #[test]
@@ -1747,6 +1934,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_eval_parallel_concurrency() {
+        let _guard = bastion_test_guard().await;
         init_bastion();
         let ctx = Context::new();
         let start = std::time::Instant::now();
@@ -1779,6 +1967,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_eval_goal_retry() {
+        let _guard = bastion_test_guard().await;
         init_bastion();
         let ctx = Context::new();
         // This goal will fail because the variable 'undefined_var' doesn't exist.
@@ -1801,6 +1990,8 @@ mod tests {
                 fuzzy: false,
                 threshold: None,
             }],
+            outputs: vec![],
+            result_into: None,
             retry: Some(2),
             on_fail,
             deadline: None,
@@ -1820,11 +2011,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_eval_goal_timeout() {
+        let _guard = bastion_test_guard().await;
         init_bastion();
         let ctx = Context::new();
         let stmt = Statement::Goal {
             name: "timeout_goal".to_string(),
             body: vec![Statement::Wait { duration: 1.0 }],
+            outputs: vec![],
+            result_into: None,
             retry: None,
             on_fail: HashMap::new(),
             deadline: Some(0.1),
@@ -1834,6 +2028,112 @@ mod tests {
         let res = eval(&stmt, ctx.clone()).await;
         assert!(res.is_err());
         assert!(res.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn test_goal_outputs_store_structured_result_object() {
+        let _guard = bastion_test_guard().await;
+        init_bastion();
+        let ctx = Context::new();
+        let stmt = Statement::Goal {
+            name: "search_flights".to_string(),
+            body: vec![
+                Statement::Set {
+                    name: "flights".to_string(),
+                    value: Expression::Literal(AnnotatedValue::from(Value::List(vec![
+                        AnnotatedValue::from(Value::Text("BA-123".to_string())),
+                    ]))),
+                },
+                Statement::Set {
+                    name: "confidence".to_string(),
+                    value: Expression::Literal(AnnotatedValue::from(Value::Number(0.91))),
+                },
+            ],
+            outputs: vec![
+                GoalOutput {
+                    name: "flights".to_string(),
+                    type_name: "list".to_string(),
+                    annotations: vec![],
+                },
+                GoalOutput {
+                    name: "confidence".to_string(),
+                    type_name: "float".to_string(),
+                    annotations: vec![Annotation::Confidence],
+                },
+            ],
+            result_into: None,
+            retry: None,
+            on_fail: HashMap::new(),
+            deadline: None,
+            idempotent: false,
+            fallback: None,
+        };
+
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let goal_result = ctx
+            .get_variable("search_flights", MemoryScope::Working)
+            .await
+            .unwrap();
+
+        match goal_result.value {
+            Value::Object(fields) => {
+                assert!(fields.contains_key("flights"));
+                let confidence = fields.get("confidence").unwrap();
+                assert_eq!(confidence.value, Value::Number(0.91));
+                assert_eq!(confidence.confidence, Some(1.0));
+            }
+            other => panic!("expected object goal result, found {:?}", other),
+        }
+
+        let confidence_expr = Expression::VariableRef(VariablePath {
+            root: "search_flights".to_string(),
+            segments: vec![PathSegment::Field("confidence".to_string())],
+        });
+        assert_eq!(
+            eval_expression(&confidence_expr, &ctx).await.unwrap().value,
+            Value::Number(0.91)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_goal_result_into_creates_result_aliases() {
+        let _guard = bastion_test_guard().await;
+        init_bastion();
+        let ctx = Context::new();
+        let stmt = Statement::Goal {
+            name: "summarize".to_string(),
+            body: vec![Statement::Set {
+                name: "summary".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Text("done".to_string()))),
+            }],
+            outputs: vec![],
+            result_into: Some("summary".to_string()),
+            retry: None,
+            on_fail: HashMap::new(),
+            deadline: None,
+            idempotent: false,
+            fallback: None,
+        };
+
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        assert_eq!(
+            ctx.get_variable("summarize.result", MemoryScope::Working)
+                .await
+                .unwrap()
+                .value,
+            Value::Text("done".to_string())
+        );
+
+        let result_expr = Expression::VariableRef(VariablePath {
+            root: "summarize".to_string(),
+            segments: vec![PathSegment::Field("result".to_string())],
+        });
+        assert_eq!(
+            eval_expression(&result_expr, &ctx).await.unwrap().value,
+            Value::Text("done".to_string())
+        );
     }
 
     #[tokio::test]
@@ -1961,6 +2261,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_goal_idempotent() {
+        let _guard = bastion_test_guard().await;
         init_bastion();
         let ctx = Context::new();
         ctx.set_variable(
@@ -1983,6 +2284,8 @@ mod tests {
                     )))),
                 },
             }],
+            outputs: vec![],
+            result_into: None,
             retry: None,
             on_fail: HashMap::new(),
             deadline: None,
@@ -2013,12 +2316,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_goal_fallback() {
+        let _guard = bastion_test_guard().await;
         init_bastion();
         let ctx = Context::new();
         // Goal that fails
         let stmt = Statement::Goal {
             name: "fail_goal".to_string(),
             body: vec![Statement::Wait { duration: 0.5 }],
+            outputs: vec![],
+            result_into: None,
             retry: None,
             on_fail: HashMap::new(),
             deadline: Some(0.1),

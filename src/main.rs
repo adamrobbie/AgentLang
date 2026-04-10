@@ -197,7 +197,7 @@ impl AgentService for MyAgentService {
             goals.get(&req.goal_name).cloned()
         };
 
-        if let Some(body) = goal_body {
+        if let Some(goal_definition) = goal_body {
             // Execute in an isolated context
             let isolated_ctx = runtime::Context::new();
 
@@ -224,16 +224,35 @@ impl AgentService for MyAgentService {
                     .map_err(|e| Status::internal(format!("Failed to set argument: {}", e)))?;
             }
 
-            for stmt in body {
-                if let Err(e) = runtime::eval(&stmt, isolated_ctx.clone()).await {
-                    return Ok(Response::new(CallResponse {
-                        result_json: format!("{{\"error\": \"{}\"}}", e),
-                        success: false,
-                    }));
-                }
+            let goal_stmt = ast::Statement::Goal {
+                name: req.goal_name.clone(),
+                body: goal_definition.body,
+                outputs: goal_definition.outputs,
+                result_into: goal_definition.result_into,
+                retry: goal_definition.retry,
+                on_fail: goal_definition.on_fail,
+                deadline: goal_definition.deadline,
+                idempotent: goal_definition.idempotent,
+                fallback: goal_definition.fallback,
+            };
+
+            if let Err(e) = runtime::eval(&goal_stmt, isolated_ctx.clone()).await {
+                return Ok(Response::new(CallResponse {
+                    result_json: format!("{{\"error\": \"{}\"}}", e),
+                    success: false,
+                }));
             }
+
+            let result_name = req.goal_name;
+            let result = isolated_ctx
+                .get_variable(&result_name, ast::MemoryScope::Working)
+                .await
+                .map_err(|e| Status::internal(format!("Failed to read goal result: {}", e)))?;
+            let result_json = serde_json::to_string(&result)
+                .map_err(|e| Status::internal(format!("Failed to serialize goal result: {}", e)))?;
+
             Ok(Response::new(CallResponse {
-                result_json: "{\"status\": \"Remote execution successful\"}".to_string(),
+                result_json,
                 success: true,
             }))
         } else {
@@ -247,8 +266,7 @@ impl AgentService for MyAgentService {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    bastion::prelude::Bastion::init();
-    bastion::prelude::Bastion::start();
+    runtime::ensure_bastion_started();
 
     println!("====================================================");
     println!("   AgentLang 1.0 - Production Runtime Execution     ");
@@ -277,12 +295,21 @@ async fn main() -> Result<()> {
         let mut goals = ctx_b.goals.lock().unwrap();
         goals.insert(
             "pay".to_string(),
-            vec![ast::Statement::Set {
-                name: "payment_status".to_string(),
-                value: ast::Expression::Literal(ast::AnnotatedValue::from(ast::Value::Boolean(
-                    true,
-                ))),
-            }],
+            ast::GoalDefinition {
+                body: vec![ast::Statement::Set {
+                    name: "payment_status".to_string(),
+                    value: ast::Expression::Literal(ast::AnnotatedValue::from(
+                        ast::Value::Boolean(true),
+                    )),
+                }],
+                outputs: vec![],
+                result_into: None,
+                retry: None,
+                on_fail: HashMap::new(),
+                deadline: None,
+                idempotent: false,
+                fallback: None,
+            },
         );
     }
     let service_b = MyAgentService {
@@ -442,6 +469,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_grpc_inter_agent_call() {
+        let _guard = runtime::bastion_test_guard().await;
         // Setup registry
         let registry_addr = "http://[::1]:50060";
         let registry_service_addr = "[::1]:50060".parse().unwrap();
@@ -457,6 +485,8 @@ mod tests {
                 .await;
         });
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // Initialize Bastion for goal supervision used by remote goal execution.
+        runtime::ensure_bastion_started();
 
         // Setup Agent B
         let ctx_b = Context::new();
@@ -469,12 +499,21 @@ mod tests {
             let mut goals = ctx_b.goals.lock().unwrap();
             goals.insert(
                 "test_goal".to_string(),
-                vec![ast::Statement::Set {
-                    name: "test_res".to_string(),
-                    value: ast::Expression::Literal(ast::AnnotatedValue::from(ast::Value::Text(
-                        "hello from remote".to_string(),
-                    ))),
-                }],
+                ast::GoalDefinition {
+                    body: vec![ast::Statement::Set {
+                        name: "test_res".to_string(),
+                        value: ast::Expression::Literal(ast::AnnotatedValue::from(
+                            ast::Value::Text("hello from remote".to_string()),
+                        )),
+                    }],
+                    outputs: vec![],
+                    result_into: None,
+                    retry: None,
+                    on_fail: HashMap::new(),
+                    deadline: None,
+                    idempotent: false,
+                    fallback: None,
+                },
             );
         }
         let service_b = MyAgentService {
@@ -573,6 +612,17 @@ mod tests {
             .get_variable("remote_res", ast::MemoryScope::Working)
             .await
             .unwrap();
-        assert!(format!("{:?}", res.value).contains("Remote execution successful"));
+        match res.value {
+            ast::Value::Object(fields) => {
+                assert_eq!(
+                    fields.get("test_res").unwrap().value,
+                    ast::Value::Text("hello from remote".to_string())
+                );
+            }
+            other => panic!(
+                "expected structured remote result object, found {:?}",
+                other
+            ),
+        }
     }
 }

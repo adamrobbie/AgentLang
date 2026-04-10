@@ -20,6 +20,8 @@ pub enum Statement {
     Goal {
         name: String,
         body: Vec<Statement>,
+        outputs: Vec<GoalOutput>,
+        result_into: Option<String>,
         retry: Option<usize>,
         on_fail: HashMap<String, Statement>, // Mapping failure type to recovery goal
         deadline: Option<f64>,
@@ -107,6 +109,25 @@ pub enum Statement {
     Await {
         call_id: String, // Simplified for now as result_into var
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoalOutput {
+    pub name: String,
+    pub type_name: String,
+    pub annotations: Vec<Annotation>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoalDefinition {
+    pub body: Vec<Statement>,
+    pub outputs: Vec<GoalOutput>,
+    pub result_into: Option<String>,
+    pub retry: Option<usize>,
+    pub on_fail: HashMap<String, Statement>,
+    pub deadline: Option<f64>,
+    pub idempotent: bool,
+    pub fallback: Option<Expression>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
