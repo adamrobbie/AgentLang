@@ -21,7 +21,7 @@ use bastion::prelude::*;
 use rand::RngCore;
 use ring::{aead, digest};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
 use std::pin::Pin;
@@ -299,6 +299,7 @@ pub struct Context {
     pub goals: Arc<Mutex<HashMap<String, GoalDefinition>>>,
     pub tools: Arc<Mutex<HashMap<String, ToolDefinition>>>,
     pub tool_adapters: Arc<Mutex<HashMap<String, ToolAdapter>>>,
+    pub approved_tool_actions: Arc<Mutex<HashSet<String>>>,
     pub registries: Arc<Mutex<Vec<String>>>,
     pub pending_calls:
         Arc<Mutex<HashMap<String, tokio::sync::oneshot::Receiver<Result<AnnotatedValue>>>>>,
@@ -412,6 +413,7 @@ impl Context {
             goals: Arc::new(Mutex::new(HashMap::new())),
             tools: Arc::new(Mutex::new(HashMap::new())),
             tool_adapters: Arc::new(Mutex::new(HashMap::new())),
+            approved_tool_actions: Arc::new(Mutex::new(HashSet::new())),
             registries: Arc::new(Mutex::new(vec!["http://[::1]:50050".to_string()])),
             pending_calls: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -439,6 +441,25 @@ impl Context {
 
     pub fn clear_all_tool_adapters(&self) {
         self.tool_adapters.lock().unwrap().clear();
+    }
+
+    pub fn approve_tool_action(&self, tool_name: &str) {
+        self.approved_tool_actions
+            .lock()
+            .unwrap()
+            .insert(tool_name.to_string());
+    }
+
+    pub fn revoke_tool_action(&self, tool_name: &str) {
+        self.approved_tool_actions.lock().unwrap().remove(tool_name);
+    }
+
+    pub fn clear_tool_approvals(&self) {
+        self.approved_tool_actions.lock().unwrap().clear();
+    }
+
+    fn consume_tool_approval(&self, tool_name: &str) -> bool {
+        self.approved_tool_actions.lock().unwrap().remove(tool_name)
     }
 
     pub async fn get_variable(&self, name: &str, scope: MemoryScope) -> Result<AnnotatedValue> {
@@ -748,7 +769,19 @@ fn normalize_tool_result(tool: &ToolDefinition, result: AnnotatedValue) -> Annot
     }
 }
 
+fn ensure_tool_confirmation(ctx: &Context, tool: &ToolDefinition) -> Result<()> {
+    if tool.side_effect && !tool.reversible && !ctx.consume_tool_approval(&tool.name) {
+        return Err(anyhow!(
+            "Tool '{}' requires confirmation before irreversible side effects",
+            tool.name
+        ));
+    }
+
+    Ok(())
+}
+
 fn validate_tool_invocation(
+    ctx: &Context,
     tool: &ToolDefinition,
     args: &HashMap<String, AnnotatedValue>,
 ) -> Result<()> {
@@ -772,12 +805,7 @@ fn validate_tool_invocation(
         }
     }
 
-    if tool.side_effect && !tool.reversible {
-        return Err(anyhow!(
-            "Tool '{}' requires confirmation before irreversible side effects",
-            tool.name
-        ));
-    }
+    ensure_tool_confirmation(ctx, tool)?;
 
     Ok(())
 }
@@ -787,7 +815,7 @@ async fn execute_declared_tool(
     tool: &ToolDefinition,
     args: &HashMap<String, AnnotatedValue>,
 ) -> Result<AnnotatedValue> {
-    validate_tool_invocation(tool, args)?;
+    validate_tool_invocation(ctx, tool, args)?;
 
     let result = if let Some(adapter) = ctx.get_tool_adapter(&tool.name) {
         adapter(args.clone()).await?
@@ -2825,6 +2853,98 @@ mod tests {
             )]),
             result_into: "payment_result".to_string(),
         };
+
+        let err = eval(&use_tool, ctx.clone()).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires confirmation before irreversible side effects")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_declared_tool_irreversible_side_effect_executes_after_approval() {
+        let ctx = Context::new();
+        let declare = Statement::Tool {
+            definition: ToolDefinition {
+                name: "charge_card".to_string(),
+                description: None,
+                category: ToolCategory::Write,
+                version: None,
+                input: vec![ToolField {
+                    name: "amount".to_string(),
+                    type_name: "number".to_string(),
+                    required: true,
+                    annotations: vec![],
+                }],
+                output: vec![],
+                reversible: false,
+                side_effect: true,
+                timeout: None,
+            },
+        };
+        eval(&declare, ctx.clone()).await.unwrap();
+        ctx.approve_tool_action("charge_card");
+
+        let use_tool = Statement::UseTool {
+            tool_name: "charge_card".to_string(),
+            args: HashMap::from([(
+                "amount".to_string(),
+                Expression::Literal(AnnotatedValue::from(Value::Number(42.0))),
+            )]),
+            result_into: "payment_result".to_string(),
+        };
+
+        eval(&use_tool, ctx.clone()).await.unwrap();
+
+        let result = ctx
+            .get_variable("payment_result", MemoryScope::Working)
+            .await
+            .unwrap();
+        match result.value {
+            Value::Object(fields) => {
+                assert_eq!(
+                    fields.get("result").unwrap().value,
+                    Value::Text("Executed tool charge_card".to_string())
+                );
+            }
+            other => panic!("expected object tool result, found {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_declared_tool_approval_is_single_use() {
+        let ctx = Context::new();
+        let declare = Statement::Tool {
+            definition: ToolDefinition {
+                name: "charge_card".to_string(),
+                description: None,
+                category: ToolCategory::Write,
+                version: None,
+                input: vec![ToolField {
+                    name: "amount".to_string(),
+                    type_name: "number".to_string(),
+                    required: true,
+                    annotations: vec![],
+                }],
+                output: vec![],
+                reversible: false,
+                side_effect: true,
+                timeout: None,
+            },
+        };
+        eval(&declare, ctx.clone()).await.unwrap();
+        ctx.approve_tool_action("charge_card");
+
+        let use_tool = Statement::UseTool {
+            tool_name: "charge_card".to_string(),
+            args: HashMap::from([(
+                "amount".to_string(),
+                Expression::Literal(AnnotatedValue::from(Value::Number(42.0))),
+            )]),
+            result_into: "payment_result".to_string(),
+        };
+
+        eval(&use_tool, ctx.clone()).await.unwrap();
 
         let err = eval(&use_tool, ctx.clone()).await.unwrap_err();
         assert!(
