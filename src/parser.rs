@@ -230,6 +230,17 @@ enum GoalOpt {
     Fallback(Expression),
 }
 
+enum ToolOpt {
+    Description(String),
+    Category(ToolCategory),
+    Version(String),
+    Input(Vec<ToolField>),
+    Output(Vec<ToolField>),
+    Reversible(bool),
+    SideEffect(bool),
+    Timeout(f64),
+}
+
 enum GoalItem {
     Statement(Statement),
     Outputs(Vec<GoalOutput>),
@@ -259,6 +270,139 @@ fn parse_goal_output(input: &str) -> IResult<&str, GoalOutput> {
             name,
             type_name,
             annotations,
+        },
+    )
+    .parse(input)
+}
+
+fn parse_tool_category(input: &str) -> IResult<&str, ToolCategory> {
+    alt((
+        map(tag("read"), |_| ToolCategory::Read),
+        map(tag("write"), |_| ToolCategory::Write),
+        map(tag("agent"), |_| ToolCategory::Agent),
+    ))
+    .parse(input)
+}
+
+fn parse_required_flag(input: &str) -> IResult<&str, bool> {
+    alt((
+        map(tag("REQUIRED"), |_| true),
+        map(tag("OPTIONAL"), |_| false),
+    ))
+    .parse(input)
+}
+
+fn parse_tool_field(input: &str) -> IResult<&str, ToolField> {
+    map(
+        (
+            parse_identifier,
+            ws(parse_identifier),
+            ws(parse_required_flag),
+            many0(preceded(ws(tag("AS")), parse_annotation)),
+        ),
+        |(name, type_name, required, annotations)| ToolField {
+            name,
+            type_name,
+            required,
+            annotations,
+        },
+    )
+    .parse(input)
+}
+
+fn parse_tool_fields_block<'a>(
+    keyword: &'static str,
+) -> impl FnMut(&'a str) -> IResult<&'a str, Vec<ToolField>> {
+    move |input| {
+        map(
+            preceded(
+                tag(keyword),
+                many_till(ws(parse_tool_field), ws(tag("END"))),
+            ),
+            |(fields, _)| fields,
+        )
+        .parse(input)
+    }
+}
+
+fn parse_tool_opt(input: &str) -> IResult<&str, ToolOpt> {
+    alt((
+        map(
+            preceded(ws(tag("DESCRIPTION")), ws(parse_string)),
+            |value| {
+                let Value::Text(text) = value else {
+                    unreachable!()
+                };
+                ToolOpt::Description(text)
+            },
+        ),
+        map(
+            preceded(ws(tag("CATEGORY")), ws(parse_tool_category)),
+            ToolOpt::Category,
+        ),
+        map(
+            preceded(ws(tag("VERSION")), ws(parse_identifier)),
+            ToolOpt::Version,
+        ),
+        map(parse_tool_fields_block("INPUT"), ToolOpt::Input),
+        map(parse_tool_fields_block("OUTPUT"), ToolOpt::Output),
+        map(
+            preceded(ws(tag("REVERSIBLE")), ws(parse_boolean)),
+            |value| match value {
+                Value::Boolean(flag) => ToolOpt::Reversible(flag),
+                _ => ToolOpt::Reversible(false),
+            },
+        ),
+        map(
+            preceded(ws(tag("SIDE_EFFECT")), ws(parse_boolean)),
+            |value| match value {
+                Value::Boolean(flag) => ToolOpt::SideEffect(flag),
+                _ => ToolOpt::SideEffect(false),
+            },
+        ),
+        map(
+            preceded(ws(tag("TIMEOUT")), ws(parse_duration)),
+            ToolOpt::Timeout,
+        ),
+    ))
+    .parse(input)
+}
+
+fn parse_tool(input: &str) -> IResult<&str, Statement> {
+    map(
+        (
+            tag("TOOL"),
+            ws(parse_identifier),
+            many0(ws(parse_tool_opt)),
+            tag("END"),
+        ),
+        |(_, name, opts, _)| {
+            let mut definition = ToolDefinition {
+                name,
+                description: None,
+                category: ToolCategory::Read,
+                version: None,
+                input: Vec::new(),
+                output: Vec::new(),
+                reversible: true,
+                side_effect: false,
+                timeout: None,
+            };
+
+            for opt in opts {
+                match opt {
+                    ToolOpt::Description(text) => definition.description = Some(text),
+                    ToolOpt::Category(category) => definition.category = category,
+                    ToolOpt::Version(version) => definition.version = Some(version),
+                    ToolOpt::Input(fields) => definition.input = fields,
+                    ToolOpt::Output(fields) => definition.output = fields,
+                    ToolOpt::Reversible(value) => definition.reversible = value,
+                    ToolOpt::SideEffect(value) => definition.side_effect = value,
+                    ToolOpt::Timeout(duration) => definition.timeout = Some(duration),
+                }
+            }
+
+            Statement::Tool { definition }
         },
     )
     .parse(input)
@@ -903,27 +1047,32 @@ fn parse_await(input: &str) -> IResult<&str, Statement> {
 /// Parse any statement.
 fn parse_statement(input: &str) -> IResult<&str, Statement> {
     ws(alt((
-        parse_set,
-        parse_if,
-        parse_use,
-        parse_goal,
-        parse_parallel,
-        parse_race,
-        parse_foreach,
-        parse_repeat,
-        parse_wait,
-        parse_remember,
-        parse_recall,
-        parse_forget,
-        parse_agent,
-        parse_contract,
-        parse_emit,
-        parse_on,
-        parse_prove,
-        parse_reveal,
-        parse_use_wasm,
-        parse_call,
-        parse_await,
+        alt((
+            parse_tool,
+            parse_set,
+            parse_if,
+            parse_use,
+            parse_goal,
+            parse_parallel,
+            parse_race,
+            parse_foreach,
+            parse_repeat,
+            parse_wait,
+            parse_remember,
+        )),
+        alt((
+            parse_recall,
+            parse_forget,
+            parse_agent,
+            parse_contract,
+            parse_emit,
+            parse_on,
+            parse_prove,
+            parse_reveal,
+            parse_use_wasm,
+            parse_call,
+            parse_await,
+        )),
     )))
     .parse(input)
 }
@@ -1324,6 +1473,59 @@ mod tests {
         } else {
             panic!("Failed to parse AWAIT");
         }
+    }
+
+    #[test]
+    fn test_parse_tool_declaration() {
+        let input = "TOOL search DESCRIPTION \"Search knowledge base\" CATEGORY read VERSION v1 INPUT query text REQUIRED AS sensitive END OUTPUT result text OPTIONAL confidence float OPTIONAL AS confidence END REVERSIBLE true SIDE_EFFECT false TIMEOUT 5s END";
+        let expected = Statement::Tool {
+            definition: ToolDefinition {
+                name: "search".to_string(),
+                description: Some("Search knowledge base".to_string()),
+                category: ToolCategory::Read,
+                version: Some("v1".to_string()),
+                input: vec![ToolField {
+                    name: "query".to_string(),
+                    type_name: "text".to_string(),
+                    required: true,
+                    annotations: vec![Annotation::Sensitive],
+                }],
+                output: vec![
+                    ToolField {
+                        name: "result".to_string(),
+                        type_name: "text".to_string(),
+                        required: false,
+                        annotations: vec![],
+                    },
+                    ToolField {
+                        name: "confidence".to_string(),
+                        type_name: "float".to_string(),
+                        required: false,
+                        annotations: vec![Annotation::Confidence],
+                    },
+                ],
+                reversible: true,
+                side_effect: false,
+                timeout: Some(5.0),
+            },
+        };
+
+        assert_eq!(parse_tool(input), Ok(("", expected)));
+    }
+
+    #[test]
+    fn test_parse_use_tool_statement() {
+        let input = "USE search query \"hotels\" RESULT INTO {search_result} END";
+        let expected = Statement::UseTool {
+            tool_name: "search".to_string(),
+            args: HashMap::from([(
+                "query".to_string(),
+                Expression::Literal(AnnotatedValue::from(Value::Text("hotels".to_string()))),
+            )]),
+            result_into: "search_result".to_string(),
+        };
+
+        assert_eq!(parse_use(input), Ok(("", expected)));
     }
 
     #[test]

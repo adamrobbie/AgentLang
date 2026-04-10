@@ -12,6 +12,9 @@ pub enum Statement {
         then_branch: Vec<Statement>,
         else_branch: Option<Vec<Statement>>,
     },
+    Tool {
+        definition: ToolDefinition,
+    },
     UseTool {
         tool_name: String,
         args: HashMap<String, Expression>,
@@ -118,6 +121,34 @@ pub struct GoalOutput {
     pub name: String,
     pub type_name: String,
     pub annotations: Vec<Annotation>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolField {
+    pub name: String,
+    pub type_name: String,
+    pub required: bool,
+    pub annotations: Vec<Annotation>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolCategory {
+    Read,
+    Write,
+    Agent,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: Option<String>,
+    pub category: ToolCategory,
+    pub version: Option<String>,
+    pub input: Vec<ToolField>,
+    pub output: Vec<ToolField>,
+    pub reversible: bool,
+    pub side_effect: bool,
+    pub timeout: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

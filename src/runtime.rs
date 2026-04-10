@@ -292,6 +292,7 @@ pub struct Context {
     pub wasm_engine: Engine,
     pub proofs: Arc<Mutex<HashMap<String, crypto::StarkProof>>>,
     pub goals: Arc<Mutex<HashMap<String, GoalDefinition>>>,
+    pub tools: Arc<Mutex<HashMap<String, ToolDefinition>>>,
     pub registries: Arc<Mutex<Vec<String>>>,
     pub pending_calls:
         Arc<Mutex<HashMap<String, tokio::sync::oneshot::Receiver<Result<AnnotatedValue>>>>>,
@@ -403,6 +404,7 @@ impl Context {
             wasm_engine,
             proofs: Arc::new(Mutex::new(HashMap::new())),
             goals: Arc::new(Mutex::new(HashMap::new())),
+            tools: Arc::new(Mutex::new(HashMap::new())),
             registries: Arc::new(Mutex::new(vec!["http://[::1]:50050".to_string()])),
             pending_calls: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -634,6 +636,97 @@ fn apply_annotations(mut value: AnnotatedValue, annotations: &[Annotation]) -> A
         }
     }
     value
+}
+
+fn tool_capability_name(tool_name: &str) -> String {
+    format!("tool:{}", tool_name)
+}
+
+fn default_tool_value(field: &ToolField) -> AnnotatedValue {
+    let base = match field.type_name.as_str() {
+        "text" => AnnotatedValue::from(Value::Text(format!("{} result", field.name))),
+        "number" | "float" => AnnotatedValue::from(Value::Number(0.0)),
+        "boolean" => AnnotatedValue::from(Value::Boolean(true)),
+        "list" => AnnotatedValue::from(Value::List(Vec::new())),
+        _ => AnnotatedValue::from(Value::Null),
+    };
+    apply_annotations(base, &field.annotations)
+}
+
+fn build_declared_tool_result(
+    tool: &ToolDefinition,
+    args: &HashMap<String, AnnotatedValue>,
+) -> Result<AnnotatedValue> {
+    let mut fields = HashMap::new();
+
+    for output in &tool.output {
+        let value = if output.name == "result" {
+            args.values()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| default_tool_value(output))
+        } else if let Some(input_value) = args.get(&output.name) {
+            apply_annotations(input_value.clone(), &output.annotations)
+        } else {
+            default_tool_value(output)
+        };
+        fields.insert(output.name.clone(), value);
+    }
+
+    if fields.is_empty() {
+        fields.insert(
+            "result".to_string(),
+            AnnotatedValue::from(Value::Text(format!("Executed tool {}", tool.name))),
+        );
+    } else if !fields.contains_key("result")
+        && let Some(first_value) = fields.values().next().cloned()
+    {
+        fields.insert("result".to_string(), first_value);
+    }
+
+    Ok(AnnotatedValue::from(Value::Object(fields)))
+}
+
+fn validate_tool_invocation(
+    tool: &ToolDefinition,
+    args: &HashMap<String, AnnotatedValue>,
+) -> Result<()> {
+    for field in &tool.input {
+        if field.required && !args.contains_key(&field.name) {
+            return Err(anyhow!(
+                "Tool '{}' missing required input '{}'",
+                tool.name,
+                field.name
+            ));
+        }
+    }
+
+    for arg_name in args.keys() {
+        if !tool.input.iter().any(|field| field.name == *arg_name) {
+            return Err(anyhow!(
+                "Tool '{}' received undeclared input '{}'",
+                tool.name,
+                arg_name
+            ));
+        }
+    }
+
+    if tool.side_effect && !tool.reversible {
+        return Err(anyhow!(
+            "Tool '{}' requires confirmation before irreversible side effects",
+            tool.name
+        ));
+    }
+
+    Ok(())
+}
+
+fn execute_declared_tool(
+    tool: &ToolDefinition,
+    args: &HashMap<String, AnnotatedValue>,
+) -> Result<AnnotatedValue> {
+    validate_tool_invocation(tool, args)?;
+    build_declared_tool_result(tool, args)
 }
 
 fn collect_changed_working_values(
@@ -1087,16 +1180,60 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             }
             Ok(())
         }
+        Statement::Tool { definition } => {
+            println!("  [Runtime] REGISTER TOOL: {}", definition.name);
+            ctx.tools
+                .lock()
+                .unwrap()
+                .insert(definition.name.clone(), definition.clone());
+            Ok(())
+        }
         Statement::UseTool {
             tool_name,
-            args: _,
+            args,
             result_into,
         } => {
-            ctx.check_contracts(tool_name)?;
+            let capability = tool_capability_name(tool_name);
+            ctx.check_contracts(&capability)?;
+
+            let tool = {
+                let tools = ctx.tools.lock().unwrap();
+                tools
+                    .get(tool_name)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Tool '{}' is not declared", tool_name))?
+            };
+
             println!("  [Runtime] USE TOOL: {}", tool_name);
-            let mock_result =
-                AnnotatedValue::from(Value::Text(format!("Result from {}", tool_name)));
-            ctx.set_variable(result_into.clone(), mock_result, MemoryScope::Working)
+            let mut evaluated_args = HashMap::new();
+            for (arg_name, expr) in args {
+                let value = eval_expression(expr, &ctx).await?;
+                if tool.side_effect {
+                    ensure_value_safe_for_irreversible_action(
+                        &value,
+                        &format!("send tool input '{}' to '{}'", arg_name, tool_name),
+                    )?;
+                }
+                evaluated_args.insert(arg_name.clone(), value);
+            }
+
+            let execution = async { execute_declared_tool(&tool, &evaluated_args) };
+            let result = if let Some(timeout_secs) = tool.timeout {
+                match tokio::time::timeout(Duration::from_secs_f64(timeout_secs), execution).await {
+                    Ok(res) => res,
+                    Err(_) => {
+                        return Err(anyhow!(
+                            "Tool '{}' timed out after {}s",
+                            tool_name,
+                            timeout_secs
+                        ));
+                    }
+                }
+            } else {
+                execution.await
+            }?;
+
+            ctx.set_variable(result_into.clone(), result, MemoryScope::Working)
                 .await?;
             Ok(())
         }
@@ -2246,6 +2383,190 @@ mod tests {
                 .value,
             Value::Boolean(true)
         );
+    }
+
+    #[tokio::test]
+    async fn test_declared_tool_registration_and_use_store_structured_result() {
+        let ctx = Context::new();
+        let declare = Statement::Tool {
+            definition: ToolDefinition {
+                name: "search".to_string(),
+                description: Some("Search knowledge base".to_string()),
+                category: ToolCategory::Read,
+                version: Some("v1".to_string()),
+                input: vec![ToolField {
+                    name: "query".to_string(),
+                    type_name: "text".to_string(),
+                    required: true,
+                    annotations: vec![],
+                }],
+                output: vec![
+                    ToolField {
+                        name: "result".to_string(),
+                        type_name: "text".to_string(),
+                        required: false,
+                        annotations: vec![],
+                    },
+                    ToolField {
+                        name: "confidence".to_string(),
+                        type_name: "float".to_string(),
+                        required: false,
+                        annotations: vec![Annotation::Confidence],
+                    },
+                ],
+                reversible: true,
+                side_effect: false,
+                timeout: Some(1.0),
+            },
+        };
+        eval(&declare, ctx.clone()).await.unwrap();
+
+        let use_tool = Statement::UseTool {
+            tool_name: "search".to_string(),
+            args: HashMap::from([(
+                "query".to_string(),
+                Expression::Literal(AnnotatedValue::from(Value::Text("flights".to_string()))),
+            )]),
+            result_into: "search_result".to_string(),
+        };
+        eval(&use_tool, ctx.clone()).await.unwrap();
+
+        let result = ctx
+            .get_variable("search_result", MemoryScope::Working)
+            .await
+            .unwrap();
+
+        match result.value {
+            Value::Object(fields) => {
+                assert_eq!(
+                    fields.get("result").unwrap().value,
+                    Value::Text("flights".to_string())
+                );
+                let confidence = fields.get("confidence").unwrap();
+                assert_eq!(confidence.value, Value::Number(0.0));
+                assert_eq!(confidence.confidence, Some(1.0));
+            }
+            other => panic!("expected object tool result, found {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_declared_tool_missing_required_input_fails() {
+        let ctx = Context::new();
+        let declare = Statement::Tool {
+            definition: ToolDefinition {
+                name: "search".to_string(),
+                description: None,
+                category: ToolCategory::Read,
+                version: None,
+                input: vec![ToolField {
+                    name: "query".to_string(),
+                    type_name: "text".to_string(),
+                    required: true,
+                    annotations: vec![],
+                }],
+                output: vec![],
+                reversible: true,
+                side_effect: false,
+                timeout: None,
+            },
+        };
+        eval(&declare, ctx.clone()).await.unwrap();
+
+        let use_tool = Statement::UseTool {
+            tool_name: "search".to_string(),
+            args: HashMap::new(),
+            result_into: "search_result".to_string(),
+        };
+
+        let err = eval(&use_tool, ctx.clone()).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Tool 'search' missing required input 'query'")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_declared_tool_irreversible_side_effect_is_blocked() {
+        let ctx = Context::new();
+        let declare = Statement::Tool {
+            definition: ToolDefinition {
+                name: "charge_card".to_string(),
+                description: None,
+                category: ToolCategory::Write,
+                version: None,
+                input: vec![ToolField {
+                    name: "amount".to_string(),
+                    type_name: "number".to_string(),
+                    required: true,
+                    annotations: vec![],
+                }],
+                output: vec![],
+                reversible: false,
+                side_effect: true,
+                timeout: None,
+            },
+        };
+        eval(&declare, ctx.clone()).await.unwrap();
+
+        let use_tool = Statement::UseTool {
+            tool_name: "charge_card".to_string(),
+            args: HashMap::from([(
+                "amount".to_string(),
+                Expression::Literal(AnnotatedValue::from(Value::Number(42.0))),
+            )]),
+            result_into: "payment_result".to_string(),
+        };
+
+        let err = eval(&use_tool, ctx.clone()).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires confirmation before irreversible side effects")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_declared_tool_requires_contract_capability() {
+        let ctx = Context::new();
+        let declare = Statement::Tool {
+            definition: ToolDefinition {
+                name: "search".to_string(),
+                description: None,
+                category: ToolCategory::Read,
+                version: None,
+                input: vec![ToolField {
+                    name: "query".to_string(),
+                    type_name: "text".to_string(),
+                    required: true,
+                    annotations: vec![],
+                }],
+                output: vec![],
+                reversible: true,
+                side_effect: false,
+                timeout: None,
+            },
+        };
+        eval(&declare, ctx.clone()).await.unwrap();
+        ctx.active_contracts.lock().unwrap().insert(
+            "restrictive".to_string(),
+            ContractInfo {
+                issued_by: "registry".to_string(),
+                capabilities: vec![Permission::CannotUse("tool:search".to_string())],
+                expires: None,
+            },
+        );
+
+        let use_tool = Statement::UseTool {
+            tool_name: "search".to_string(),
+            args: HashMap::from([(
+                "query".to_string(),
+                Expression::Literal(AnnotatedValue::from(Value::Text("hotels".to_string()))),
+            )]),
+            result_into: "search_result".to_string(),
+        };
+
+        let err = eval(&use_tool, ctx.clone()).await.unwrap_err();
+        assert!(err.to_string().contains("Permission denied"));
     }
 
     #[tokio::test]
