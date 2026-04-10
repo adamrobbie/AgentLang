@@ -139,10 +139,31 @@ pub enum ParallelPattern {
     GatherAll,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VariablePath {
+    pub root: String,
+    pub segments: Vec<PathSegment>,
+}
+
+impl VariablePath {
+    pub fn root(name: impl Into<String>) -> Self {
+        Self {
+            root: name.into(),
+            segments: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum PathSegment {
+    Field(String),
+    Index(usize),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
     Literal(AnnotatedValue),
-    VariableRef(String),
+    VariableRef(VariablePath),
     Annotated {
         expr: Box<Expression>,
         annotation: Annotation,
@@ -198,4 +219,6 @@ pub enum Value {
     Number(f64),
     Boolean(bool),
     List(Vec<AnnotatedValue>),
+    Object(HashMap<String, AnnotatedValue>),
+    Null,
 }

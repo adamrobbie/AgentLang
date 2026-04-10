@@ -436,16 +436,67 @@ pub enum StoredValue {
     Encrypted { nonce: Vec<u8>, ciphertext: Vec<u8> },
 }
 
+fn resolve_path(value: &AnnotatedValue, path: &VariablePath) -> Result<AnnotatedValue> {
+    let mut current = value.clone();
+
+    for segment in &path.segments {
+        match segment {
+            PathSegment::Field(field) => match &current.value {
+                Value::Object(fields) => {
+                    current = fields.get(field).cloned().ok_or_else(|| {
+                        anyhow!(
+                            "Field '{}' not found while resolving '{}.{}'",
+                            field,
+                            path.root,
+                            field
+                        )
+                    })?;
+                }
+                other => {
+                    return Err(anyhow!(
+                        "Cannot access field '{}' on non-object value {:?}",
+                        field,
+                        other
+                    ));
+                }
+            },
+            PathSegment::Index(index) => match &current.value {
+                Value::List(items) => {
+                    current = items.get(*index).cloned().ok_or_else(|| {
+                        anyhow!(
+                            "Index {} out of bounds while resolving '{}'",
+                            index,
+                            path.root
+                        )
+                    })?;
+                }
+                other => {
+                    return Err(anyhow!(
+                        "Cannot index into non-list value {:?} at [{}]",
+                        other,
+                        index
+                    ));
+                }
+            },
+        }
+    }
+
+    Ok(current)
+}
+
 #[async_recursion]
 pub async fn eval_expression(expr: &Expression, ctx: &Context) -> Result<AnnotatedValue> {
     match expr {
         Expression::Literal(val) => Ok(val.clone()),
-        Expression::VariableRef(name) => {
-            if let Ok(v) = ctx.get_variable(name, MemoryScope::Working).await {
-                Ok(v)
+        Expression::VariableRef(path) => {
+            let root_value = if let Ok(v) = ctx.get_variable(&path.root, MemoryScope::Working).await
+            {
+                v
             } else {
-                ctx.get_variable(name, MemoryScope::Session).await
-            }
+                ctx.get_variable(&path.root, MemoryScope::Session).await?
+            };
+
+            resolve_path(&root_value, path)
         }
         Expression::Annotated { expr, annotation } => {
             let mut val = eval_expression(expr, ctx).await?;
@@ -529,6 +580,7 @@ pub async fn eval_expression(expr: &Expression, ctx: &Context) -> Result<Annotat
     }
 }
 
+#[allow(unused_variables)]
 #[async_recursion]
 pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
     match statement {
@@ -678,6 +730,8 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 Value::Number(n) => n != 0.0,
                 Value::Text(s) => !s.is_empty(),
                 Value::List(l) => !l.is_empty(),
+                Value::Object(o) => !o.is_empty(),
+                Value::Null => false,
             };
             if is_true {
                 for stmt in then_branch {
@@ -800,6 +854,8 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                     Value::Number(n) => n != 0.0,
                     Value::Text(s) => !s.is_empty(),
                     Value::List(l) => !l.is_empty(),
+                    Value::Object(o) => !o.is_empty(),
+                    Value::Null => false,
                 };
                 if is_true {
                     break;
@@ -1348,11 +1404,143 @@ mod tests {
         )
         .await
         .unwrap();
-        let expr = Expression::VariableRef("x".to_string());
+        let expr = Expression::VariableRef(VariablePath::root("x"));
         assert_eq!(
             eval_expression(&expr, &ctx).await.unwrap().value,
             Value::Boolean(true)
         );
+    }
+
+    #[tokio::test]
+    async fn test_eval_expression_nested_field_path() {
+        let ctx = Context::new();
+        let mut city = HashMap::new();
+        city.insert(
+            "confidence".to_string(),
+            AnnotatedValue::from(Value::Number(0.92)),
+        );
+        city.insert(
+            "name".to_string(),
+            AnnotatedValue::from(Value::Text("London".to_string())),
+        );
+
+        ctx.set_variable(
+            "travel".to_string(),
+            AnnotatedValue::from(Value::Object(HashMap::from([(
+                "city".to_string(),
+                AnnotatedValue::from(Value::Object(city)),
+            )]))),
+            MemoryScope::Working,
+        )
+        .await
+        .unwrap();
+
+        let expr = Expression::VariableRef(VariablePath {
+            root: "travel".to_string(),
+            segments: vec![
+                PathSegment::Field("city".to_string()),
+                PathSegment::Field("confidence".to_string()),
+            ],
+        });
+
+        assert_eq!(
+            eval_expression(&expr, &ctx).await.unwrap().value,
+            Value::Number(0.92)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_eval_expression_nested_index_path() {
+        let ctx = Context::new();
+        let first = AnnotatedValue::from(Value::Object(HashMap::from([(
+            "price".to_string(),
+            AnnotatedValue::from(Value::Number(199.0)),
+        )])));
+        let second = AnnotatedValue::from(Value::Object(HashMap::from([(
+            "price".to_string(),
+            AnnotatedValue::from(Value::Number(249.0)),
+        )])));
+
+        ctx.set_variable(
+            "results".to_string(),
+            AnnotatedValue::from(Value::List(vec![first, second])),
+            MemoryScope::Working,
+        )
+        .await
+        .unwrap();
+
+        let expr = Expression::VariableRef(VariablePath {
+            root: "results".to_string(),
+            segments: vec![
+                PathSegment::Index(0),
+                PathSegment::Field("price".to_string()),
+            ],
+        });
+
+        assert_eq!(
+            eval_expression(&expr, &ctx).await.unwrap().value,
+            Value::Number(199.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_eval_expression_missing_field_errors() {
+        let ctx = Context::new();
+        ctx.set_variable(
+            "profile".to_string(),
+            AnnotatedValue::from(Value::Object(HashMap::new())),
+            MemoryScope::Working,
+        )
+        .await
+        .unwrap();
+
+        let expr = Expression::VariableRef(VariablePath {
+            root: "profile".to_string(),
+            segments: vec![PathSegment::Field("name".to_string())],
+        });
+
+        let err = eval_expression(&expr, &ctx).await.unwrap_err();
+        assert!(err.to_string().contains("Field 'name' not found"));
+    }
+
+    #[tokio::test]
+    async fn test_eval_expression_out_of_bounds_index_errors() {
+        let ctx = Context::new();
+        ctx.set_variable(
+            "items".to_string(),
+            AnnotatedValue::from(Value::List(vec![AnnotatedValue::from(Value::Number(1.0))])),
+            MemoryScope::Working,
+        )
+        .await
+        .unwrap();
+
+        let expr = Expression::VariableRef(VariablePath {
+            root: "items".to_string(),
+            segments: vec![PathSegment::Index(2)],
+        });
+
+        let err = eval_expression(&expr, &ctx).await.unwrap_err();
+        assert!(err.to_string().contains("Index 2 out of bounds"));
+    }
+
+    #[tokio::test]
+    async fn test_eval_expression_field_access_on_scalar_errors() {
+        let ctx = Context::new();
+        ctx.set_variable(
+            "count".to_string(),
+            AnnotatedValue::from(Value::Number(3.0)),
+            MemoryScope::Working,
+        )
+        .await
+        .unwrap();
+
+        let expr = Expression::VariableRef(VariablePath {
+            root: "count".to_string(),
+            segments: vec![PathSegment::Field("value".to_string())],
+        });
+
+        let err = eval_expression(&expr, &ctx).await.unwrap_err();
+        assert!(err.to_string().contains("Cannot access field 'value'"));
     }
 
     #[tokio::test]
@@ -1673,13 +1861,13 @@ mod tests {
 
         let foreach = Statement::ForEach {
             item: "x".to_string(),
-            list: Expression::VariableRef("my_list".to_string()),
+            list: Expression::VariableRef(VariablePath::root("my_list")),
             body: vec![Statement::Set {
                 name: "total".to_string(),
                 value: Expression::BinaryOp {
-                    left: Box::new(Expression::VariableRef("total".to_string())),
+                    left: Box::new(Expression::VariableRef(VariablePath::root("total"))),
                     op: BinaryOperator::Add,
-                    right: Box::new(Expression::VariableRef("x".to_string())),
+                    right: Box::new(Expression::VariableRef(VariablePath::root("x"))),
                 },
             }],
         };
@@ -1707,7 +1895,7 @@ mod tests {
 
         let repeat = Statement::Repeat {
             condition: Expression::BinaryOp {
-                left: Box::new(Expression::VariableRef("counter".to_string())),
+                left: Box::new(Expression::VariableRef(VariablePath::root("counter"))),
                 op: BinaryOperator::Eq,
                 right: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
                     3.0,
@@ -1716,7 +1904,7 @@ mod tests {
             body: vec![Statement::Set {
                 name: "counter".to_string(),
                 value: Expression::BinaryOp {
-                    left: Box::new(Expression::VariableRef("counter".to_string())),
+                    left: Box::new(Expression::VariableRef(VariablePath::root("counter"))),
                     op: BinaryOperator::Add,
                     right: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
                         1.0,
@@ -1788,7 +1976,7 @@ mod tests {
             body: vec![Statement::Set {
                 name: "count".to_string(),
                 value: Expression::BinaryOp {
-                    left: Box::new(Expression::VariableRef("count".to_string())),
+                    left: Box::new(Expression::VariableRef(VariablePath::root("count"))),
                     op: BinaryOperator::Add,
                     right: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
                         1.0,

@@ -3,8 +3,8 @@ use nom::{
     IResult, Parser,
     branch::alt,
     bytes::complete::{tag, take_while1},
-    character::complete::{alpha1, alphanumeric1, char, multispace0, none_of},
-    combinator::{map, opt, recognize},
+    character::complete::{alpha1, alphanumeric1, char, digit1, multispace0, none_of},
+    combinator::{map, map_res, opt, recognize},
     multi::many0,
     sequence::{delimited, pair, preceded},
 };
@@ -31,6 +31,25 @@ fn parse_identifier(input: &str) -> IResult<&str, String> {
             many0(alt((alphanumeric1, tag("_")))),
         )),
         |s: &str| s.to_string(),
+    )
+    .parse(input)
+}
+
+fn parse_path_segment(input: &str) -> IResult<&str, PathSegment> {
+    alt((
+        map(preceded(char('.'), parse_identifier), PathSegment::Field),
+        map(
+            delimited(char('['), map_res(digit1, str::parse::<usize>), char(']')),
+            PathSegment::Index,
+        ),
+    ))
+    .parse(input)
+}
+
+fn parse_variable_path(input: &str) -> IResult<&str, VariablePath> {
+    map(
+        pair(parse_identifier, many0(parse_path_segment)),
+        |(root, segments)| VariablePath { root, segments },
     )
     .parse(input)
 }
@@ -78,7 +97,7 @@ fn parse_list(input: &str) -> IResult<&str, Value> {
 fn parse_value(input: &str) -> IResult<&str, AnnotatedValue> {
     map(
         alt((parse_boolean, parse_number, parse_string, parse_list)),
-        |v| AnnotatedValue::from(v),
+        AnnotatedValue::from,
     )
     .parse(input)
 }
@@ -111,7 +130,7 @@ fn parse_expression(input: &str) -> IResult<&str, Expression> {
     let (input, mut left) = alt((
         map(parse_value, Expression::Literal),
         map(
-            delimited(char('{'), parse_identifier, char('}')),
+            delimited(char('{'), parse_variable_path, char('}')),
             Expression::VariableRef,
         ),
     ))
@@ -856,8 +875,45 @@ mod tests {
         );
         assert_eq!(
             parse_expression("{my_var}"),
-            Ok(("", Expression::VariableRef("my_var".to_string())))
+            Ok(("", Expression::VariableRef(VariablePath::root("my_var"))))
         );
+        assert_eq!(
+            parse_expression("{foo.bar}"),
+            Ok((
+                "",
+                Expression::VariableRef(VariablePath {
+                    root: "foo".to_string(),
+                    segments: vec![PathSegment::Field("bar".to_string())],
+                })
+            ))
+        );
+        assert_eq!(
+            parse_expression("{items[0]}"),
+            Ok((
+                "",
+                Expression::VariableRef(VariablePath {
+                    root: "items".to_string(),
+                    segments: vec![PathSegment::Index(0)],
+                })
+            ))
+        );
+        assert_eq!(
+            parse_expression("{trip.flight[0].price}"),
+            Ok((
+                "",
+                Expression::VariableRef(VariablePath {
+                    root: "trip".to_string(),
+                    segments: vec![
+                        PathSegment::Field("flight".to_string()),
+                        PathSegment::Index(0),
+                        PathSegment::Field("price".to_string()),
+                    ],
+                })
+            ))
+        );
+        assert!(parse_expression("{foo.}").is_err());
+        assert!(parse_expression("{[0]}").is_err());
+        assert!(parse_expression("{foo[]}").is_err());
     }
 
     #[test]
