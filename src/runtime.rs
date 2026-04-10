@@ -53,8 +53,9 @@ pub async fn bastion_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
 fn unique_test_path(prefix: &str) -> String {
     static TEST_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
     let id = TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
     std::env::temp_dir()
-        .join(format!("agentlang-{}-{}", prefix, id))
+        .join(format!("agentlang-{}-{}-{}", prefix, pid, id))
         .to_string_lossy()
         .into_owned()
 }
@@ -868,6 +869,24 @@ pub async fn eval_expression(expr: &Expression, ctx: &Context) -> Result<Annotat
     }
 }
 
+fn classify_goal_failure(error: &anyhow::Error) -> GoalFailureType {
+    let error_msg = error.to_string().to_lowercase();
+
+    if error_msg.contains("timed out") || error_msg.contains("timeout") {
+        GoalFailureType::Timeout
+    } else if error_msg.contains("permission denied") || error_msg.contains("privacy violation") {
+        GoalFailureType::Permission
+    } else if error_msg.contains("hallucination") {
+        GoalFailureType::Hallucination
+    } else if error_msg.contains("ambiguous") {
+        GoalFailureType::Ambiguous
+    } else if error_msg.contains("tool") {
+        GoalFailureType::ToolFail
+    } else {
+        GoalFailureType::Any
+    }
+}
+
 #[allow(unused_variables)]
 #[async_recursion]
 pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
@@ -880,7 +899,9 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             retry,
             on_fail,
             deadline,
+            wait,
             idempotent,
+            audit_trail,
             fallback,
         } => {
             println!("  [Runtime] Goal: {}", name);
@@ -893,12 +914,13 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                     retry: *retry,
                     on_fail: on_fail.clone(),
                     deadline: *deadline,
+                    wait: *wait,
                     idempotent: *idempotent,
+                    audit_trail: *audit_trail,
                     fallback: fallback.clone(),
                 },
             );
 
-            // 1. Idempotency check
             if *idempotent {
                 let audit = ctx.audit_chain.lock().unwrap();
                 if audit
@@ -914,6 +936,10 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 }
             }
 
+            if let Some(delay) = wait {
+                sleep(Duration::from_secs_f64(*delay)).await;
+            }
+
             let max_retries = retry.unwrap_or(0);
             use tokio::task::JoinSet;
 
@@ -924,6 +950,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             let outputs_clone = outputs.clone();
             let result_into_clone = result_into.clone();
             let working_before = ctx.working_variables.lock().unwrap().clone();
+            let audit_enabled = *audit_trail;
 
             goal_tasks.spawn(async move {
                 let mut current_attempt = 0;
@@ -949,7 +976,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                             .await?;
 
                             store_goal_result(&ctx_clone, &name_clone, goal_result).await?;
-                            {
+                            if audit_enabled {
                                 let mut audit = ctx_clone.audit_chain.lock().unwrap();
                                 audit.append(format!("GOAL_SUCCESS:{}", name_clone));
                             }
@@ -994,19 +1021,14 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             };
 
             if let Err(e) = result {
-                // Determine failure type for specialized ON_FAIL
-                let error_msg = e.to_string();
-                let failure_type = if error_msg.contains("timed out") {
-                    "TIMEOUT"
-                } else if error_msg.contains("Permission") {
-                    "PERMISSION"
-                } else {
-                    "*"
-                };
+                let failure_type = classify_goal_failure(&e);
 
-                if let Some(fail_stmt) = on_fail.get(failure_type).or_else(|| on_fail.get("*")) {
+                if let Some(fail_stmt) = on_fail
+                    .get(&failure_type)
+                    .or_else(|| on_fail.get(&GoalFailureType::Any))
+                {
                     println!(
-                        "  [Runtime] Goal '{}' failed ({}). Executing ON_FAIL.",
+                        "  [Runtime] Goal '{}' failed ({:?}). Executing ON_FAIL.",
                         name, failure_type
                     );
                     eval(fail_stmt, ctx.clone()).await
@@ -2234,7 +2256,7 @@ mod tests {
         // This goal will fail because the variable 'undefined_var' doesn't exist.
         let mut on_fail = HashMap::new();
         on_fail.insert(
-            "*".to_string(),
+            GoalFailureType::Any,
             Statement::Set {
                 name: "failed".to_string(),
                 value: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))),
@@ -2256,7 +2278,9 @@ mod tests {
             retry: Some(2),
             on_fail,
             deadline: None,
+            wait: None,
             idempotent: false,
+            audit_trail: true,
             fallback: None,
         };
         // It should still return Ok(()) because on_fail handles it.
@@ -2283,12 +2307,119 @@ mod tests {
             retry: None,
             on_fail: HashMap::new(),
             deadline: Some(0.1),
+            wait: None,
             idempotent: false,
+            audit_trail: true,
             fallback: None,
         };
         let res = eval(&stmt, ctx.clone()).await;
         assert!(res.is_err());
         assert!(res.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn test_goal_wait_and_timeout_specific_on_fail() {
+        let _guard = bastion_test_guard().await;
+        init_bastion();
+        let ctx = Context::new();
+        let mut on_fail = HashMap::new();
+        on_fail.insert(
+            GoalFailureType::Timeout,
+            Statement::Set {
+                name: "timeout_handled".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))),
+            },
+        );
+
+        let stmt = Statement::Goal {
+            name: "guarded_timeout_goal".to_string(),
+            body: vec![Statement::Wait { duration: 0.2 }],
+            outputs: vec![],
+            result_into: None,
+            retry: None,
+            on_fail,
+            deadline: Some(0.05),
+            wait: None,
+            idempotent: false,
+            audit_trail: true,
+            fallback: None,
+        };
+
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        assert_eq!(
+            ctx.get_variable("timeout_handled", MemoryScope::Working)
+                .await
+                .unwrap()
+                .value,
+            Value::Boolean(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_goal_wait_directive_delays_execution() {
+        let _guard = bastion_test_guard().await;
+        init_bastion();
+        let ctx = Context::new();
+        let stmt = Statement::Goal {
+            name: "delayed_goal".to_string(),
+            body: vec![Statement::Set {
+                name: "delayed_value".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))),
+            }],
+            outputs: vec![],
+            result_into: None,
+            retry: None,
+            on_fail: HashMap::new(),
+            deadline: None,
+            wait: Some(0.05),
+            idempotent: false,
+            audit_trail: true,
+            fallback: None,
+        };
+
+        let start = std::time::Instant::now();
+        eval(&stmt, ctx.clone()).await.unwrap();
+        assert!(start.elapsed().as_secs_f64() >= 0.05);
+        assert_eq!(
+            ctx.get_variable("delayed_value", MemoryScope::Working)
+                .await
+                .unwrap()
+                .value,
+            Value::Boolean(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_goal_audit_trail_false_skips_success_audit_entry() {
+        let _guard = bastion_test_guard().await;
+        init_bastion();
+        let ctx = Context::new();
+        let stmt = Statement::Goal {
+            name: "quiet_goal".to_string(),
+            body: vec![Statement::Set {
+                name: "quiet_value".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))),
+            }],
+            outputs: vec![],
+            result_into: None,
+            retry: None,
+            on_fail: HashMap::new(),
+            deadline: None,
+            wait: None,
+            idempotent: false,
+            audit_trail: false,
+            fallback: None,
+        };
+
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let audit_entries = ctx.audit_chain.lock().unwrap().entries.clone();
+        assert!(
+            audit_entries
+                .iter()
+                .all(|entry| !entry.op.starts_with("GOAL_SUCCESS:quiet_goal"))
+        );
     }
 
     #[tokio::test]
@@ -2326,7 +2457,9 @@ mod tests {
             retry: None,
             on_fail: HashMap::new(),
             deadline: None,
+            wait: None,
             idempotent: false,
+            audit_trail: true,
             fallback: None,
         };
 
@@ -2373,7 +2506,9 @@ mod tests {
             retry: None,
             on_fail: HashMap::new(),
             deadline: None,
+            wait: None,
             idempotent: false,
+            audit_trail: true,
             fallback: None,
         };
 
@@ -2550,7 +2685,9 @@ mod tests {
             retry: None,
             on_fail: HashMap::new(),
             deadline: None,
+            wait: None,
             idempotent: true,
+            audit_trail: true,
             fallback: None,
         };
 
@@ -2589,7 +2726,9 @@ mod tests {
             retry: None,
             on_fail: HashMap::new(),
             deadline: Some(0.1),
+            wait: None,
             idempotent: false,
+            audit_trail: true,
             fallback: Some(Expression::Literal(AnnotatedValue::from(Value::Text(
                 "fallback_active".to_string(),
             )))),

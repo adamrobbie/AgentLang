@@ -232,7 +232,9 @@ impl AgentService for MyAgentService {
                 retry: goal_definition.retry,
                 on_fail: goal_definition.on_fail,
                 deadline: goal_definition.deadline,
+                wait: goal_definition.wait,
                 idempotent: goal_definition.idempotent,
+                audit_trail: goal_definition.audit_trail,
                 fallback: goal_definition.fallback,
             };
 
@@ -307,7 +309,9 @@ async fn main() -> Result<()> {
                 retry: None,
                 on_fail: HashMap::new(),
                 deadline: None,
+                wait: None,
                 idempotent: false,
+                audit_trail: true,
                 fallback: None,
             },
         );
@@ -511,7 +515,9 @@ mod tests {
                     retry: None,
                     on_fail: HashMap::new(),
                     deadline: None,
+                    wait: None,
                     idempotent: false,
+                    audit_trail: true,
                     fallback: None,
                 },
             );

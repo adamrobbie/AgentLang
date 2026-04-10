@@ -23,9 +23,11 @@ pub enum Statement {
         outputs: Vec<GoalOutput>,
         result_into: Option<String>,
         retry: Option<usize>,
-        on_fail: HashMap<String, Statement>, // Mapping failure type to recovery goal
+        on_fail: HashMap<GoalFailureType, Statement>,
         deadline: Option<f64>,
+        wait: Option<f64>,
         idempotent: bool,
+        audit_trail: bool,
         fallback: Option<Expression>,
     },
     Parallel {
@@ -124,10 +126,22 @@ pub struct GoalDefinition {
     pub outputs: Vec<GoalOutput>,
     pub result_into: Option<String>,
     pub retry: Option<usize>,
-    pub on_fail: HashMap<String, Statement>,
+    pub on_fail: HashMap<GoalFailureType, Statement>,
     pub deadline: Option<f64>,
+    pub wait: Option<f64>,
     pub idempotent: bool,
+    pub audit_trail: bool,
     pub fallback: Option<Expression>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GoalFailureType {
+    ToolFail,
+    Timeout,
+    Hallucination,
+    Ambiguous,
+    Permission,
+    Any,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

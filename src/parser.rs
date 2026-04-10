@@ -220,11 +220,13 @@ fn parse_if(input: &str) -> IResult<&str, Statement> {
 enum GoalOpt {
     Retry(usize),
     OnFail {
-        failure_type: String,
+        failure_type: GoalFailureType,
         handler: Box<Statement>,
     },
     Deadline(f64),
+    Wait(f64),
     Idempotent,
+    AuditTrail(bool),
     Fallback(Expression),
 }
 
@@ -233,6 +235,17 @@ enum GoalItem {
     Outputs(Vec<GoalOutput>),
     ResultInto(String),
     Opt(GoalOpt),
+}
+
+fn parse_goal_failure_type(input: &str) -> IResult<&str, GoalFailureType> {
+    alt((
+        map(tag("TOOL_FAIL"), |_| GoalFailureType::ToolFail),
+        map(tag("TIMEOUT"), |_| GoalFailureType::Timeout),
+        map(tag("HALLUCINATION"), |_| GoalFailureType::Hallucination),
+        map(tag("AMBIGUOUS"), |_| GoalFailureType::Ambiguous),
+        map(tag("PERMISSION"), |_| GoalFailureType::Permission),
+    ))
+    .parse(input)
 }
 
 fn parse_goal_output(input: &str) -> IResult<&str, GoalOutput> {
@@ -287,12 +300,12 @@ fn parse_goal_opt(input: &str) -> IResult<&str, GoalOpt> {
             pair(
                 preceded(
                     ws(tag("ON_FAIL")),
-                    opt(delimited(char('['), parse_identifier, char(']'))),
+                    opt(delimited(char('['), parse_goal_failure_type, char(']'))),
                 ),
                 ws(parse_statement),
             ),
             |(ft, handler)| GoalOpt::OnFail {
-                failure_type: ft.unwrap_or("*".to_string()),
+                failure_type: ft.unwrap_or(GoalFailureType::Any),
                 handler: Box::new(handler),
             },
         ),
@@ -300,7 +313,15 @@ fn parse_goal_opt(input: &str) -> IResult<&str, GoalOpt> {
             preceded(ws(tag("DEADLINE")), ws(parse_duration)),
             GoalOpt::Deadline,
         ),
+        map(preceded(ws(tag("WAIT")), ws(parse_duration)), GoalOpt::Wait),
         map(ws(tag("IDEMPOTENT")), |_| GoalOpt::Idempotent),
+        map(
+            preceded(ws(tag("AUDIT_TRAIL")), ws(parse_boolean)),
+            |value| match value {
+                Value::Boolean(enabled) => GoalOpt::AuditTrail(enabled),
+                _ => GoalOpt::AuditTrail(true),
+            },
+        ),
         map(
             preceded(ws(tag("FALLBACK")), ws(parse_expression)),
             GoalOpt::Fallback,
@@ -335,7 +356,9 @@ fn parse_goal(input: &str) -> IResult<&str, Statement> {
             let mut retry = None;
             let mut on_fail = HashMap::new();
             let mut deadline = None;
+            let mut wait = None;
             let mut idempotent = false;
+            let mut audit_trail = true;
             let mut fallback = None;
 
             for item in items {
@@ -352,7 +375,9 @@ fn parse_goal(input: &str) -> IResult<&str, Statement> {
                             on_fail.insert(failure_type, *handler);
                         }
                         GoalOpt::Deadline(d) => deadline = Some(d),
+                        GoalOpt::Wait(d) => wait = Some(d),
                         GoalOpt::Idempotent => idempotent = true,
+                        GoalOpt::AuditTrail(enabled) => audit_trail = enabled,
                         GoalOpt::Fallback(e) => fallback = Some(e),
                     },
                 }
@@ -366,7 +391,9 @@ fn parse_goal(input: &str) -> IResult<&str, Statement> {
                 retry,
                 on_fail,
                 deadline,
+                wait,
                 idempotent,
+                audit_trail,
                 fallback,
             }
         },
@@ -1028,7 +1055,9 @@ mod tests {
             retry: None,
             on_fail: HashMap::new(),
             deadline: None,
+            wait: None,
             idempotent: false,
+            audit_trail: true,
             fallback: None,
         };
         assert_eq!(parse_goal(input), Ok(("", expected)));
@@ -1060,7 +1089,36 @@ mod tests {
             retry: None,
             on_fail: HashMap::new(),
             deadline: None,
+            wait: None,
             idempotent: false,
+            audit_trail: true,
+            fallback: None,
+        };
+        assert_eq!(parse_goal(input), Ok(("", expected)));
+    }
+
+    #[test]
+    fn test_parse_goal_with_failure_directives_wait_and_audit() {
+        let input = "GOAL guarded WAIT 2s ON_FAIL[TIMEOUT] SET failed = true AUDIT_TRAIL false END";
+        let mut on_fail = HashMap::new();
+        on_fail.insert(
+            GoalFailureType::Timeout,
+            Statement::Set {
+                name: "failed".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))),
+            },
+        );
+        let expected = Statement::Goal {
+            name: "guarded".to_string(),
+            body: vec![],
+            outputs: vec![],
+            result_into: None,
+            retry: None,
+            on_fail,
+            deadline: None,
+            wait: Some(2.0),
+            idempotent: false,
+            audit_trail: false,
             fallback: None,
         };
         assert_eq!(parse_goal(input), Ok(("", expected)));
