@@ -147,11 +147,134 @@ impl AuditChain {
 }
 
 pub fn format_value_safe(val: &AnnotatedValue) -> String {
+    format_value_safe_inner(val)
+}
+
+fn format_value_safe_inner(val: &AnnotatedValue) -> String {
     if val.is_sensitive {
-        "[REDACTED]".to_string()
-    } else {
-        format!("{:?}", val.value)
+        return "[REDACTED]".to_string();
     }
+
+    match &val.value {
+        Value::List(items) => {
+            let parts: Vec<String> = items.iter().map(format_value_safe_inner).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        Value::Object(fields) => {
+            let mut parts: Vec<String> = fields
+                .iter()
+                .map(|(key, value)| format!("{}: {}", key, format_value_safe_inner(value)))
+                .collect();
+            parts.sort();
+            format!("{{{}}}", parts.join(", "))
+        }
+        _ => format!("{:?}", val.value),
+    }
+}
+
+fn merge_confidence(left: Option<f64>, right: Option<f64>) -> Option<f64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn inherit_metadata(target: &mut AnnotatedValue, source: &AnnotatedValue) {
+    target.confidence = merge_confidence(target.confidence, source.confidence);
+    target.is_sensitive |= source.is_sensitive;
+    target.is_uncertain |= source.is_uncertain;
+    target.is_approximate |= source.is_approximate;
+}
+
+fn propagate_container_metadata(mut value: AnnotatedValue) -> AnnotatedValue {
+    match &value.value {
+        Value::List(items) => {
+            for item in items {
+                value.confidence = merge_confidence(value.confidence, item.confidence);
+                value.is_approximate |= item.is_approximate;
+                value.is_uncertain |= item.is_uncertain;
+                value.is_sensitive |= item.is_sensitive;
+            }
+        }
+        Value::Object(fields) => {
+            for field in fields.values() {
+                value.confidence = merge_confidence(value.confidence, field.confidence);
+                value.is_approximate |= field.is_approximate;
+                value.is_uncertain |= field.is_uncertain;
+                value.is_sensitive |= field.is_sensitive;
+            }
+        }
+        _ => {}
+    }
+
+    value
+}
+
+fn contains_sensitive_content(value: &AnnotatedValue) -> bool {
+    value.is_sensitive
+        || match &value.value {
+            Value::List(items) => items.iter().any(contains_sensitive_content),
+            Value::Object(fields) => fields.values().any(contains_sensitive_content),
+            _ => false,
+        }
+}
+
+fn contains_uncertain_content(value: &AnnotatedValue) -> bool {
+    value.is_uncertain
+        || match &value.value {
+            Value::List(items) => items.iter().any(contains_uncertain_content),
+            Value::Object(fields) => fields.values().any(contains_uncertain_content),
+            _ => false,
+        }
+}
+
+fn redact_sensitive_content(value: &AnnotatedValue) -> AnnotatedValue {
+    if value.is_sensitive {
+        let mut redacted = value.clone();
+        redacted.value = Value::Text("[REDACTED]".to_string());
+        return redacted;
+    }
+
+    let redacted_value = match &value.value {
+        Value::List(items) => Value::List(items.iter().map(redact_sensitive_content).collect()),
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), redact_sensitive_content(value)))
+                .collect(),
+        ),
+        _ => value.value.clone(),
+    };
+
+    let mut redacted = value.clone();
+    redacted.value = redacted_value;
+    redacted
+}
+
+fn sanitize_recalled_value(value: AnnotatedValue, scope: MemoryScope) -> AnnotatedValue {
+    match scope {
+        MemoryScope::LongTerm | MemoryScope::Shared => redact_sensitive_content(&value),
+        _ => value,
+    }
+}
+
+fn ensure_value_safe_for_irreversible_action(value: &AnnotatedValue, action: &str) -> Result<()> {
+    if contains_sensitive_content(value) {
+        return Err(anyhow!(
+            "Privacy violation: Attempted to {} sensitive data",
+            action
+        ));
+    }
+
+    if contains_uncertain_content(value) {
+        return Err(anyhow!(
+            "Verification required: Attempted to {} uncertain data",
+            action
+        ));
+    }
+
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -500,6 +623,7 @@ pub enum StoredValue {
 }
 
 fn apply_annotations(mut value: AnnotatedValue, annotations: &[Annotation]) -> AnnotatedValue {
+    value = propagate_container_metadata(value);
     for annotation in annotations {
         match annotation {
             Annotation::Confidence => value.confidence = value.confidence.or(Some(1.0)),
@@ -592,8 +716,9 @@ fn resolve_path(value: &AnnotatedValue, path: &VariablePath) -> Result<Annotated
     let mut current = value.clone();
 
     for segment in &path.segments {
+        let current_source = current.clone();
         match segment {
-            PathSegment::Field(field) => match &current.value {
+            PathSegment::Field(field) => match &current_source.value {
                 Value::Object(fields) => {
                     current = fields.get(field).cloned().ok_or_else(|| {
                         anyhow!(
@@ -603,6 +728,7 @@ fn resolve_path(value: &AnnotatedValue, path: &VariablePath) -> Result<Annotated
                             field
                         )
                     })?;
+                    inherit_metadata(&mut current, &current_source);
                 }
                 other => {
                     return Err(anyhow!(
@@ -612,7 +738,7 @@ fn resolve_path(value: &AnnotatedValue, path: &VariablePath) -> Result<Annotated
                     ));
                 }
             },
-            PathSegment::Index(index) => match &current.value {
+            PathSegment::Index(index) => match &current_source.value {
                 Value::List(items) => {
                     current = items.get(*index).cloned().ok_or_else(|| {
                         anyhow!(
@@ -621,6 +747,7 @@ fn resolve_path(value: &AnnotatedValue, path: &VariablePath) -> Result<Annotated
                             path.root
                         )
                     })?;
+                    inherit_metadata(&mut current, &current_source);
                 }
                 other => {
                     return Err(anyhow!(
@@ -633,13 +760,13 @@ fn resolve_path(value: &AnnotatedValue, path: &VariablePath) -> Result<Annotated
         }
     }
 
-    Ok(current)
+    Ok(propagate_container_metadata(current))
 }
 
 #[async_recursion]
 pub async fn eval_expression(expr: &Expression, ctx: &Context) -> Result<AnnotatedValue> {
     match expr {
-        Expression::Literal(val) => Ok(val.clone()),
+        Expression::Literal(val) => Ok(propagate_container_metadata(val.clone())),
         Expression::VariableRef(path) => {
             let root_value = if let Ok(v) = ctx.get_variable(&path.root, MemoryScope::Working).await
             {
@@ -658,7 +785,7 @@ pub async fn eval_expression(expr: &Expression, ctx: &Context) -> Result<Annotat
                 Annotation::Uncertain => val.is_uncertain = true,
                 Annotation::Approximate => val.is_approximate = true,
             }
-            Ok(val)
+            Ok(propagate_container_metadata(val))
         }
         Expression::BinaryOp { left, op, right } => {
             let l_val = eval_expression(left, ctx).await?;
@@ -671,6 +798,8 @@ pub async fn eval_expression(expr: &Expression, ctx: &Context) -> Result<Annotat
                 BinaryOperator::Add => {
                     if let (Value::Number(l), Value::Number(r)) = (&l_val.value, &r_val.value) {
                         let mut res = AnnotatedValue::from(Value::Number(l + r));
+                        inherit_metadata(&mut res, &l_val);
+                        inherit_metadata(&mut res, &r_val);
                         res.is_approximate = is_approx;
                         Ok(res)
                     } else {
@@ -680,6 +809,8 @@ pub async fn eval_expression(expr: &Expression, ctx: &Context) -> Result<Annotat
                 BinaryOperator::Sub => {
                     if let (Value::Number(l), Value::Number(r)) = (&l_val.value, &r_val.value) {
                         let mut res = AnnotatedValue::from(Value::Number(l - r));
+                        inherit_metadata(&mut res, &l_val);
+                        inherit_metadata(&mut res, &r_val);
                         res.is_approximate = is_approx;
                         Ok(res)
                     } else {
@@ -687,42 +818,47 @@ pub async fn eval_expression(expr: &Expression, ctx: &Context) -> Result<Annotat
                     }
                 }
                 BinaryOperator::Eq => {
-                    if let (Value::Number(l), Value::Number(r)) = (&l_val.value, &r_val.value) {
+                    let mut res = if let (Value::Number(l), Value::Number(r)) =
+                        (&l_val.value, &r_val.value)
+                    {
                         if is_approx {
                             let diff = (l - r).abs();
                             let threshold = l.abs().max(r.abs()) * tolerance;
-                            Ok(AnnotatedValue::from(Value::Boolean(diff <= threshold)))
+                            AnnotatedValue::from(Value::Boolean(diff <= threshold))
                         } else {
-                            Ok(AnnotatedValue::from(Value::Boolean(l == r)))
+                            AnnotatedValue::from(Value::Boolean(l == r))
                         }
                     } else {
-                        Ok(AnnotatedValue::from(Value::Boolean(
-                            l_val.value == r_val.value,
-                        )))
-                    }
+                        AnnotatedValue::from(Value::Boolean(l_val.value == r_val.value))
+                    };
+                    inherit_metadata(&mut res, &l_val);
+                    inherit_metadata(&mut res, &r_val);
+                    Ok(res)
                 }
                 BinaryOperator::Gt => {
                     if let (Value::Number(l), Value::Number(r)) = (&l_val.value, &r_val.value) {
-                        if is_approx {
-                            Ok(AnnotatedValue::from(Value::Boolean(
-                                l > &(r * (1.0 - tolerance)),
-                            )))
+                        let mut res = if is_approx {
+                            AnnotatedValue::from(Value::Boolean(l > &(r * (1.0 - tolerance))))
                         } else {
-                            Ok(AnnotatedValue::from(Value::Boolean(l > r)))
-                        }
+                            AnnotatedValue::from(Value::Boolean(l > r))
+                        };
+                        inherit_metadata(&mut res, &l_val);
+                        inherit_metadata(&mut res, &r_val);
+                        Ok(res)
                     } else {
                         Err(anyhow!("GT only supports numbers"))
                     }
                 }
                 BinaryOperator::Lt => {
                     if let (Value::Number(l), Value::Number(r)) = (&l_val.value, &r_val.value) {
-                        if is_approx {
-                            Ok(AnnotatedValue::from(Value::Boolean(
-                                l < &(r * (1.0 + tolerance)),
-                            )))
+                        let mut res = if is_approx {
+                            AnnotatedValue::from(Value::Boolean(l < &(r * (1.0 + tolerance))))
                         } else {
-                            Ok(AnnotatedValue::from(Value::Boolean(l < r)))
-                        }
+                            AnnotatedValue::from(Value::Boolean(l < r))
+                        };
+                        inherit_metadata(&mut res, &l_val);
+                        inherit_metadata(&mut res, &r_val);
+                        Ok(res)
                     } else {
                         Err(anyhow!("LT only supports numbers"))
                     }
@@ -1060,6 +1196,12 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             name, value, scope, ..
         } => {
             let val = eval_expression(value, &ctx).await?;
+            if *scope == MemoryScope::Shared {
+                ensure_value_safe_for_irreversible_action(
+                    &val,
+                    &format!("write shared memory '{}'", name),
+                )?;
+            }
             println!("  [Runtime] REMEMBER {} IN {:?}", name, scope);
             ctx.set_variable(name.clone(), val, *scope).await?;
             Ok(())
@@ -1098,13 +1240,14 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
 
             match result {
                 Ok(val) => {
+                    let recalled = sanitize_recalled_value(val, *scope);
                     println!(
                         "  [Runtime] RECALL SUCCESS: {} -> {} (Value: {})",
                         name,
                         into_var,
-                        format_value_safe(&val)
+                        format_value_safe(&recalled)
                     );
-                    ctx.set_variable(into_var.clone(), val, MemoryScope::Working)
+                    ctx.set_variable(into_var.clone(), recalled, MemoryScope::Working)
                         .await?;
                 }
                 Err(_) => {
@@ -1156,12 +1299,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
         }
         Statement::Emit { event, data } => {
             let val = eval_expression(data, &ctx).await?;
-            if val.is_sensitive {
-                return Err(anyhow!(
-                    "Privacy violation: Attempted to EMIT sensitive data for event '{}'",
-                    event
-                ));
-            }
+            ensure_value_safe_for_irreversible_action(&val, &format!("emit event '{}'", event))?;
             println!(
                 "  [Runtime] EMIT: {} (Data: {})",
                 event,
@@ -1399,17 +1537,14 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 agent_id, goal_name
             );
 
-            // 1. Check for sensitive arguments FIRST (Privacy Policy)
+            // 1. Check for protected arguments FIRST (Privacy / verification policy)
             let mut rpc_args = HashMap::new();
             for (k, expr) in args {
                 let val = eval_expression(expr, &ctx).await?;
-                if val.is_sensitive {
-                    return Err(anyhow!(
-                        "Privacy violation: Attempted to send sensitive argument '{}' to agent '{}'",
-                        k,
-                        agent_id
-                    ));
-                }
+                ensure_value_safe_for_irreversible_action(
+                    &val,
+                    &format!("send argument '{}' to agent '{}'", k, agent_id),
+                )?;
                 rpc_args.insert(k.clone(), format!("{:?}", val.value));
             }
 
@@ -1599,28 +1734,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_eval_expression_nested_field_path() {
+    async fn test_eval_expression_nested_field_path_inherits_annotations() {
         let ctx = Context::new();
         let mut city = HashMap::new();
         city.insert(
             "confidence".to_string(),
             AnnotatedValue::from(Value::Number(0.92)),
         );
-        city.insert(
-            "name".to_string(),
-            AnnotatedValue::from(Value::Text("London".to_string())),
-        );
+        let mut travel = AnnotatedValue::from(Value::Object(HashMap::from([(
+            "city".to_string(),
+            AnnotatedValue::from(Value::Object(city)),
+        )])));
+        travel.is_sensitive = true;
+        travel.confidence = Some(0.7);
 
-        ctx.set_variable(
-            "travel".to_string(),
-            AnnotatedValue::from(Value::Object(HashMap::from([(
-                "city".to_string(),
-                AnnotatedValue::from(Value::Object(city)),
-            )]))),
-            MemoryScope::Working,
-        )
-        .await
-        .unwrap();
+        ctx.set_variable("travel".to_string(), travel, MemoryScope::Working)
+            .await
+            .unwrap();
 
         let expr = Expression::VariableRef(VariablePath {
             root: "travel".to_string(),
@@ -1630,10 +1760,10 @@ mod tests {
             ],
         });
 
-        assert_eq!(
-            eval_expression(&expr, &ctx).await.unwrap().value,
-            Value::Number(0.92)
-        );
+        let resolved = eval_expression(&expr, &ctx).await.unwrap();
+        assert_eq!(resolved.value, Value::Number(0.92));
+        assert!(resolved.is_sensitive);
+        assert_eq!(resolved.confidence, Some(0.7));
     }
 
     #[tokio::test]
@@ -1745,6 +1875,27 @@ mod tests {
                 .value,
             Value::Text("hello".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_eval_expression_binary_op_propagates_confidence_and_uncertainty() {
+        let ctx = Context::new();
+        let mut left = AnnotatedValue::from(Value::Number(10.0));
+        left.confidence = Some(0.81);
+        left.is_uncertain = true;
+        let mut right = AnnotatedValue::from(Value::Number(5.0));
+        right.confidence = Some(0.93);
+
+        let expr = Expression::BinaryOp {
+            left: Box::new(Expression::Literal(left)),
+            op: BinaryOperator::Add,
+            right: Box::new(Expression::Literal(right)),
+        };
+
+        let result = eval_expression(&expr, &ctx).await.unwrap();
+        assert_eq!(result.value, Value::Number(15.0));
+        assert_eq!(result.confidence, Some(0.81));
+        assert!(result.is_uncertain);
     }
 
     #[tokio::test]
@@ -1921,15 +2072,126 @@ mod tests {
         };
 
         eval(&recall, ctx.clone()).await.unwrap();
-        assert_eq!(
-            ctx.get_variable("decrypted", MemoryScope::Working)
-                .await
-                .unwrap()
-                .value,
-            Value::Text("top-secret-data".to_string())
-        );
+        let recalled = ctx
+            .get_variable("decrypted", MemoryScope::Working)
+            .await
+            .unwrap();
+        assert_eq!(recalled.value, Value::Text("[REDACTED]".to_string()));
+        assert!(recalled.is_sensitive);
 
         let _ = fs::remove_file(&ctx.long_term_file);
+    }
+
+    #[tokio::test]
+    async fn test_eval_recall_long_term_redacts_sensitive_content() {
+        let mut ctx = Context::new();
+        ctx.long_term_file = unique_test_path("test-encrypted-memory");
+
+        let remember = Statement::Remember {
+            name: "secret_key".to_string(),
+            value: Expression::Annotated {
+                expr: Box::new(Expression::Literal(AnnotatedValue::from(Value::Text(
+                    "top-secret-data".to_string(),
+                )))),
+                annotation: Annotation::Sensitive,
+            },
+            scope: MemoryScope::LongTerm,
+            expires: None,
+        };
+
+        eval(&remember, ctx.clone()).await.unwrap();
+
+        let recall = Statement::Recall {
+            name: "secret_key".to_string(),
+            into_var: "decrypted".to_string(),
+            scope: MemoryScope::LongTerm,
+            on_missing: None,
+            fuzzy: false,
+            threshold: None,
+        };
+
+        eval(&recall, ctx.clone()).await.unwrap();
+        let recalled = ctx
+            .get_variable("decrypted", MemoryScope::Working)
+            .await
+            .unwrap();
+        assert_eq!(recalled.value, Value::Text("[REDACTED]".to_string()));
+        assert!(recalled.is_sensitive);
+
+        let _ = fs::remove_file(&ctx.long_term_file);
+    }
+
+    #[tokio::test]
+    async fn test_emit_blocks_nested_sensitive_content() {
+        let ctx = Context::new();
+        let payload = Expression::Literal(AnnotatedValue::from(Value::Object(HashMap::from([(
+            "secret".to_string(),
+            AnnotatedValue {
+                value: Value::Text("classified".to_string()),
+                confidence: None,
+                is_sensitive: true,
+                is_uncertain: false,
+                is_approximate: false,
+            },
+        )]))));
+
+        let stmt = Statement::Emit {
+            event: "alarm".to_string(),
+            data: payload,
+        };
+
+        let err = eval(&stmt, ctx.clone()).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("emit event 'alarm' sensitive data")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_call_blocks_uncertain_arguments() {
+        let ctx = Context::new();
+        let stmt = Statement::Call {
+            agent_id: "AgentB".to_string(),
+            goal_name: "test_goal".to_string(),
+            args: HashMap::from([(
+                "amount".to_string(),
+                Expression::Annotated {
+                    expr: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                        10.0,
+                    )))),
+                    annotation: Annotation::Uncertain,
+                },
+            )]),
+            result_into: "remote_res".to_string(),
+        };
+
+        let err = eval(&stmt, ctx.clone()).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("send argument 'amount' to agent 'AgentB' uncertain data")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shared_remember_blocks_sensitive_content() {
+        let ctx = Context::new();
+        let stmt = Statement::Remember {
+            name: "shared_secret".to_string(),
+            value: Expression::Annotated {
+                expr: Box::new(Expression::Literal(AnnotatedValue::from(Value::Text(
+                    "classified".to_string(),
+                )))),
+                annotation: Annotation::Sensitive,
+            },
+            scope: MemoryScope::Shared,
+            expires: None,
+        };
+
+        let err = eval(&stmt, ctx.clone()).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("write shared memory 'shared_secret' sensitive data")
+        );
     }
 
     #[tokio::test]
@@ -1950,7 +2212,6 @@ mod tests {
         };
         eval(&stmt, ctx.clone()).await.unwrap();
         let elapsed = start.elapsed();
-        // If it was sequential, it would take 1.5s. Parallel should take ~0.5s.
         assert!(
             elapsed.as_secs_f64() < 1.0,
             "Parallel execution took too long: {:?}",
