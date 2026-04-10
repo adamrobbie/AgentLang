@@ -23,6 +23,8 @@ use ring::{aead, digest};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
+use std::pin::Pin;
 #[cfg(test)]
 use std::sync::LazyLock;
 #[cfg(test)]
@@ -39,6 +41,9 @@ pub fn ensure_bastion_started() {
         Bastion::start();
     });
 }
+
+type ToolAdapterFuture = Pin<Box<dyn Future<Output = Result<AnnotatedValue>> + Send>>;
+type ToolAdapter = Arc<dyn Fn(HashMap<String, AnnotatedValue>) -> ToolAdapterFuture + Send + Sync>;
 
 #[cfg(test)]
 static BASTION_TEST_MUTEX: LazyLock<tokio::sync::Mutex<()>> =
@@ -293,6 +298,7 @@ pub struct Context {
     pub proofs: Arc<Mutex<HashMap<String, crypto::StarkProof>>>,
     pub goals: Arc<Mutex<HashMap<String, GoalDefinition>>>,
     pub tools: Arc<Mutex<HashMap<String, ToolDefinition>>>,
+    pub tool_adapters: Arc<Mutex<HashMap<String, ToolAdapter>>>,
     pub registries: Arc<Mutex<Vec<String>>>,
     pub pending_calls:
         Arc<Mutex<HashMap<String, tokio::sync::oneshot::Receiver<Result<AnnotatedValue>>>>>,
@@ -405,9 +411,34 @@ impl Context {
             proofs: Arc::new(Mutex::new(HashMap::new())),
             goals: Arc::new(Mutex::new(HashMap::new())),
             tools: Arc::new(Mutex::new(HashMap::new())),
+            tool_adapters: Arc::new(Mutex::new(HashMap::new())),
             registries: Arc::new(Mutex::new(vec!["http://[::1]:50050".to_string()])),
             pending_calls: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn register_tool_adapter<F, Fut>(&self, tool_name: &str, adapter: F)
+    where
+        F: Fn(HashMap<String, AnnotatedValue>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<AnnotatedValue>> + Send + 'static,
+    {
+        let wrapped: ToolAdapter = Arc::new(move |args| Box::pin(adapter(args)));
+        self.tool_adapters
+            .lock()
+            .unwrap()
+            .insert(tool_name.to_string(), wrapped);
+    }
+
+    pub fn get_tool_adapter(&self, tool_name: &str) -> Option<ToolAdapter> {
+        self.tool_adapters.lock().unwrap().get(tool_name).cloned()
+    }
+
+    pub fn clear_tool_adapter(&self, tool_name: &str) {
+        self.tool_adapters.lock().unwrap().remove(tool_name);
+    }
+
+    pub fn clear_all_tool_adapters(&self) {
+        self.tool_adapters.lock().unwrap().clear();
     }
 
     pub async fn get_variable(&self, name: &str, scope: MemoryScope) -> Result<AnnotatedValue> {
@@ -656,7 +687,7 @@ fn default_tool_value(field: &ToolField) -> AnnotatedValue {
 fn build_declared_tool_result(
     tool: &ToolDefinition,
     args: &HashMap<String, AnnotatedValue>,
-) -> Result<AnnotatedValue> {
+) -> AnnotatedValue {
     let mut fields = HashMap::new();
 
     for output in &tool.output {
@@ -684,7 +715,37 @@ fn build_declared_tool_result(
         fields.insert("result".to_string(), first_value);
     }
 
-    Ok(AnnotatedValue::from(Value::Object(fields)))
+    AnnotatedValue::from(Value::Object(fields))
+}
+
+fn normalize_tool_result(tool: &ToolDefinition, result: AnnotatedValue) -> AnnotatedValue {
+    let result = propagate_container_metadata(result);
+    match result.value {
+        Value::Object(mut fields) => {
+            for output in &tool.output {
+                if let Some(value) = fields.get_mut(&output.name) {
+                    let updated = apply_annotations(value.clone(), &output.annotations);
+                    *value = updated;
+                }
+            }
+
+            if !fields.contains_key("result") {
+                if let Some(first_output) = tool.output.first() {
+                    if let Some(first_value) = fields.get(&first_output.name).cloned() {
+                        fields.insert("result".to_string(), first_value);
+                    }
+                } else if let Some(first_value) = fields.values().next().cloned() {
+                    fields.insert("result".to_string(), first_value);
+                }
+            }
+
+            AnnotatedValue::from(Value::Object(fields))
+        }
+        other => AnnotatedValue::from(Value::Object(HashMap::from([(
+            "result".to_string(),
+            AnnotatedValue::from(other),
+        )]))),
+    }
 }
 
 fn validate_tool_invocation(
@@ -721,12 +782,20 @@ fn validate_tool_invocation(
     Ok(())
 }
 
-fn execute_declared_tool(
+async fn execute_declared_tool(
+    ctx: &Context,
     tool: &ToolDefinition,
     args: &HashMap<String, AnnotatedValue>,
 ) -> Result<AnnotatedValue> {
     validate_tool_invocation(tool, args)?;
-    build_declared_tool_result(tool, args)
+
+    let result = if let Some(adapter) = ctx.get_tool_adapter(&tool.name) {
+        adapter(args.clone()).await?
+    } else {
+        build_declared_tool_result(tool, args)
+    };
+
+    Ok(normalize_tool_result(tool, result))
 }
 
 fn collect_changed_working_values(
@@ -1217,7 +1286,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 evaluated_args.insert(arg_name.clone(), value);
             }
 
-            let execution = async { execute_declared_tool(&tool, &evaluated_args) };
+            let execution = async { execute_declared_tool(&ctx, &tool, &evaluated_args).await };
             let result = if let Some(timeout_secs) = tool.timeout {
                 match tokio::time::timeout(Duration::from_secs_f64(timeout_secs), execution).await {
                     Ok(res) => res,
@@ -2445,6 +2514,245 @@ mod tests {
                 let confidence = fields.get("confidence").unwrap();
                 assert_eq!(confidence.value, Value::Number(0.0));
                 assert_eq!(confidence.confidence, Some(1.0));
+            }
+            other => panic!("expected object tool result, found {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_declared_tool_executes_registered_adapter() {
+        let ctx = Context::new();
+        let declare = Statement::Tool {
+            definition: ToolDefinition {
+                name: "search".to_string(),
+                description: Some("Search knowledge base".to_string()),
+                category: ToolCategory::Read,
+                version: Some("v1".to_string()),
+                input: vec![ToolField {
+                    name: "query".to_string(),
+                    type_name: "text".to_string(),
+                    required: true,
+                    annotations: vec![],
+                }],
+                output: vec![
+                    ToolField {
+                        name: "result".to_string(),
+                        type_name: "text".to_string(),
+                        required: false,
+                        annotations: vec![],
+                    },
+                    ToolField {
+                        name: "confidence".to_string(),
+                        type_name: "float".to_string(),
+                        required: false,
+                        annotations: vec![Annotation::Confidence],
+                    },
+                ],
+                reversible: true,
+                side_effect: false,
+                timeout: Some(1.0),
+            },
+        };
+        eval(&declare, ctx.clone()).await.unwrap();
+        ctx.register_tool_adapter("search", |args| async move {
+            let query = args.get("query").cloned().unwrap();
+            Ok(AnnotatedValue::from(Value::Object(HashMap::from([
+                (
+                    "result".to_string(),
+                    AnnotatedValue::from(Value::Text(format!(
+                        "adapter:{}",
+                        format_value_safe(&query)
+                    ))),
+                ),
+                (
+                    "confidence".to_string(),
+                    AnnotatedValue::from(Value::Number(0.87)),
+                ),
+            ]))))
+        });
+
+        let use_tool = Statement::UseTool {
+            tool_name: "search".to_string(),
+            args: HashMap::from([(
+                "query".to_string(),
+                Expression::Literal(AnnotatedValue::from(Value::Text("flights".to_string()))),
+            )]),
+            result_into: "search_result".to_string(),
+        };
+        eval(&use_tool, ctx.clone()).await.unwrap();
+
+        let result = ctx
+            .get_variable("search_result", MemoryScope::Working)
+            .await
+            .unwrap();
+
+        match result.value {
+            Value::Object(fields) => {
+                assert_eq!(
+                    fields.get("result").unwrap().value,
+                    Value::Text("adapter:Text(\"flights\")".to_string())
+                );
+                let confidence = fields.get("confidence").unwrap();
+                assert_eq!(confidence.value, Value::Number(0.87));
+                assert_eq!(confidence.confidence, Some(1.0));
+            }
+            other => panic!("expected object tool result, found {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_declared_tool_without_adapter_falls_back_to_synthesized_result() {
+        let ctx = Context::new();
+        let declare = Statement::Tool {
+            definition: ToolDefinition {
+                name: "search".to_string(),
+                description: Some("Search knowledge base".to_string()),
+                category: ToolCategory::Read,
+                version: Some("v1".to_string()),
+                input: vec![ToolField {
+                    name: "query".to_string(),
+                    type_name: "text".to_string(),
+                    required: true,
+                    annotations: vec![],
+                }],
+                output: vec![ToolField {
+                    name: "result".to_string(),
+                    type_name: "text".to_string(),
+                    required: false,
+                    annotations: vec![],
+                }],
+                reversible: true,
+                side_effect: false,
+                timeout: Some(1.0),
+            },
+        };
+        eval(&declare, ctx.clone()).await.unwrap();
+
+        let use_tool = Statement::UseTool {
+            tool_name: "search".to_string(),
+            args: HashMap::from([(
+                "query".to_string(),
+                Expression::Literal(AnnotatedValue::from(Value::Text("flights".to_string()))),
+            )]),
+            result_into: "search_result".to_string(),
+        };
+        eval(&use_tool, ctx.clone()).await.unwrap();
+
+        let result = ctx
+            .get_variable("search_result", MemoryScope::Working)
+            .await
+            .unwrap();
+
+        match result.value {
+            Value::Object(fields) => {
+                assert_eq!(
+                    fields.get("result").unwrap().value,
+                    Value::Text("flights".to_string())
+                );
+            }
+            other => panic!("expected object tool result, found {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_declared_tool_timeout_from_registered_adapter() {
+        let ctx = Context::new();
+        let declare = Statement::Tool {
+            definition: ToolDefinition {
+                name: "slow_search".to_string(),
+                description: None,
+                category: ToolCategory::Read,
+                version: None,
+                input: vec![ToolField {
+                    name: "query".to_string(),
+                    type_name: "text".to_string(),
+                    required: true,
+                    annotations: vec![],
+                }],
+                output: vec![ToolField {
+                    name: "result".to_string(),
+                    type_name: "text".to_string(),
+                    required: false,
+                    annotations: vec![],
+                }],
+                reversible: true,
+                side_effect: false,
+                timeout: Some(0.01),
+            },
+        };
+        eval(&declare, ctx.clone()).await.unwrap();
+        ctx.register_tool_adapter("slow_search", |_args| async move {
+            sleep(Duration::from_millis(50)).await;
+            Ok(AnnotatedValue::from(Value::Text("too slow".to_string())))
+        });
+
+        let use_tool = Statement::UseTool {
+            tool_name: "slow_search".to_string(),
+            args: HashMap::from([(
+                "query".to_string(),
+                Expression::Literal(AnnotatedValue::from(Value::Text("flights".to_string()))),
+            )]),
+            result_into: "search_result".to_string(),
+        };
+
+        let err = eval(&use_tool, ctx.clone()).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Tool 'slow_search' timed out after 0.01s")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_declared_tool_adapter_scalar_result_is_wrapped() {
+        let ctx = Context::new();
+        let declare = Statement::Tool {
+            definition: ToolDefinition {
+                name: "word_count".to_string(),
+                description: None,
+                category: ToolCategory::Read,
+                version: None,
+                input: vec![ToolField {
+                    name: "query".to_string(),
+                    type_name: "text".to_string(),
+                    required: true,
+                    annotations: vec![],
+                }],
+                output: vec![ToolField {
+                    name: "count".to_string(),
+                    type_name: "number".to_string(),
+                    required: false,
+                    annotations: vec![],
+                }],
+                reversible: true,
+                side_effect: false,
+                timeout: None,
+            },
+        };
+        eval(&declare, ctx.clone()).await.unwrap();
+        ctx.register_tool_adapter("word_count", |_args| async move {
+            Ok(AnnotatedValue::from(Value::Number(3.0)))
+        });
+
+        let use_tool = Statement::UseTool {
+            tool_name: "word_count".to_string(),
+            args: HashMap::from([(
+                "query".to_string(),
+                Expression::Literal(AnnotatedValue::from(Value::Text(
+                    "three words here".to_string(),
+                ))),
+            )]),
+            result_into: "word_count_result".to_string(),
+        };
+        eval(&use_tool, ctx.clone()).await.unwrap();
+
+        let result = ctx
+            .get_variable("word_count_result", MemoryScope::Working)
+            .await
+            .unwrap();
+
+        match result.value {
+            Value::Object(fields) => {
+                assert_eq!(fields.get("result").unwrap().value, Value::Number(3.0));
             }
             other => panic!("expected object tool result, found {:?}", other),
         }
