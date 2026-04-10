@@ -1,5 +1,5 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -21,14 +21,25 @@ pub enum Statement {
         name: String,
         body: Vec<Statement>,
         retry: Option<usize>,
-        on_fail: Option<Box<Statement>>,
+        on_fail: HashMap<String, Statement>, // Mapping failure type to recovery goal
         deadline: Option<f64>,
+        idempotent: bool,
+        fallback: Option<Expression>,
     },
     Parallel {
         pattern: ParallelPattern,
         branches: Vec<Statement>,
         result_into: Option<String>,
         deadline: Option<f64>,
+    },
+    Repeat {
+        condition: Expression,
+        body: Vec<Statement>,
+    },
+    ForEach {
+        item: String,
+        list: Expression,
+        body: Vec<Statement>,
     },
     Wait {
         duration: f64,
@@ -70,15 +81,16 @@ pub enum Statement {
     },
     On {
         event: String,
-        handler: Box<Statement>,
+        handler: Vec<Statement>,
     },
     Prove {
-        statement: Box<Statement>,
+        statements: Vec<Statement>,
         proof_name: String,
     },
     Reveal {
         proof_name: String,
         to_agent: Option<String>,
+        result_into: Option<String>,
     },
     UseWasm {
         module_path: String,
@@ -135,6 +147,20 @@ pub enum Expression {
         expr: Box<Expression>,
         annotation: Annotation,
     },
+    BinaryOp {
+        left: Box<Expression>,
+        op: BinaryOperator,
+        right: Box<Expression>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BinaryOperator {
+    Eq,
+    Gt,
+    Lt,
+    Add,
+    Sub,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -171,4 +197,5 @@ pub enum Value {
     Text(String),
     Number(f64),
     Boolean(bool),
+    List(Vec<AnnotatedValue>),
 }

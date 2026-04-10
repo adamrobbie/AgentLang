@@ -9,6 +9,7 @@ message CallRequest {
   string goal_name = 1;
   map<string, string> args = 2;
   string caller_id = 3;
+  bytes signature = 4;
 }
 
 message CallResponse {
