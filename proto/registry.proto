@@ -4,12 +4,15 @@ package registry;
 service RegistryService {
   rpc RegisterAgent (RegisterRequest) returns (RegisterResponse);
   rpc LookupAgent (LookupRequest) returns (LookupResponse);
+  rpc PutSharedState (PutSharedRequest) returns (PutSharedResponse);
+  rpc GetSharedState (GetSharedRequest) returns (GetSharedResponse);
 }
 
 message RegisterRequest {
   string agent_id = 1;
   string endpoint = 2;
-  string public_key = 3;
+  bytes public_key = 3;
+  bytes signature = 4;
 }
 
 message RegisterResponse {
@@ -22,6 +25,24 @@ message LookupRequest {
 
 message LookupResponse {
   string endpoint = 1;
-  string public_key = 2;
+  bytes public_key = 2;
   bool found = 3;
+}
+
+message PutSharedRequest {
+  string key = 1;
+  bytes value_json = 2;
+}
+
+message PutSharedResponse {
+  bool success = 1;
+}
+
+message GetSharedRequest {
+  string key = 1;
+}
+
+message GetSharedResponse {
+  bytes value_json = 1;
+  bool found = 2;
 }

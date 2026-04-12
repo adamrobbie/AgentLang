@@ -1,5 +1,5 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -20,15 +20,30 @@ pub enum Statement {
     Goal {
         name: String,
         body: Vec<Statement>,
+        outputs: Vec<GoalOutput>,
+        result_into: Option<String>,
         retry: Option<usize>,
-        on_fail: Option<Box<Statement>>,
+        on_fail: HashMap<GoalFailureType, Statement>,
         deadline: Option<f64>,
+        wait: Option<f64>,
+        idempotent: bool,
+        audit_trail: bool,
+        fallback: Option<Expression>,
     },
     Parallel {
         pattern: ParallelPattern,
         branches: Vec<Statement>,
         result_into: Option<String>,
         deadline: Option<f64>,
+    },
+    Repeat {
+        condition: Expression,
+        body: Vec<Statement>,
+    },
+    ForEach {
+        item: String,
+        list: Expression,
+        body: Vec<Statement>,
     },
     Wait {
         duration: f64,
@@ -70,15 +85,16 @@ pub enum Statement {
     },
     On {
         event: String,
-        handler: Box<Statement>,
+        handler: Vec<Statement>,
     },
     Prove {
-        statement: Box<Statement>,
+        statements: Vec<Statement>,
         proof_name: String,
     },
     Reveal {
         proof_name: String,
         to_agent: Option<String>,
+        result_into: Option<String>,
     },
     UseWasm {
         module_path: String,
@@ -95,6 +111,37 @@ pub enum Statement {
     Await {
         call_id: String, // Simplified for now as result_into var
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoalOutput {
+    pub name: String,
+    pub type_name: String,
+    pub annotations: Vec<Annotation>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoalDefinition {
+    pub body: Vec<Statement>,
+    pub outputs: Vec<GoalOutput>,
+    pub result_into: Option<String>,
+    pub retry: Option<usize>,
+    pub on_fail: HashMap<GoalFailureType, Statement>,
+    pub deadline: Option<f64>,
+    pub wait: Option<f64>,
+    pub idempotent: bool,
+    pub audit_trail: bool,
+    pub fallback: Option<Expression>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GoalFailureType {
+    ToolFail,
+    Timeout,
+    Hallucination,
+    Ambiguous,
+    Permission,
+    Any,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -127,14 +174,49 @@ pub enum ParallelPattern {
     GatherAll,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VariablePath {
+    pub root: String,
+    pub segments: Vec<PathSegment>,
+}
+
+impl VariablePath {
+    pub fn root(name: impl Into<String>) -> Self {
+        Self {
+            root: name.into(),
+            segments: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum PathSegment {
+    Field(String),
+    Index(usize),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
     Literal(AnnotatedValue),
-    VariableRef(String),
+    VariableRef(VariablePath),
     Annotated {
         expr: Box<Expression>,
         annotation: Annotation,
     },
+    BinaryOp {
+        left: Box<Expression>,
+        op: BinaryOperator,
+        right: Box<Expression>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BinaryOperator {
+    Eq,
+    Gt,
+    Lt,
+    Add,
+    Sub,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -171,4 +253,7 @@ pub enum Value {
     Text(String),
     Number(f64),
     Boolean(bool),
+    List(Vec<AnnotatedValue>),
+    Object(HashMap<String, AnnotatedValue>),
+    Null,
 }
