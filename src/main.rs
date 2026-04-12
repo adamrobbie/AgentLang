@@ -134,6 +134,24 @@ pub struct MyAgentService {
     pub registries: Vec<String>,
 }
 
+fn parse_rpc_argument(value: &str) -> ast::AnnotatedValue {
+    if let Ok(decoded) = serde_json::from_str::<ast::AnnotatedValue>(value) {
+        return decoded;
+    }
+
+    let primitive = if let Ok(n) = value.parse::<f64>() {
+        ast::Value::Number(n)
+    } else if value == "true" {
+        ast::Value::Boolean(true)
+    } else if value == "false" {
+        ast::Value::Boolean(false)
+    } else {
+        ast::Value::Text(value.trim_matches('"').to_string())
+    };
+
+    ast::AnnotatedValue::from(primitive)
+}
+
 #[tonic::async_trait]
 impl AgentService for MyAgentService {
     async fn call_goal(
@@ -201,25 +219,12 @@ impl AgentService for MyAgentService {
             // Execute in an isolated context
             let isolated_ctx = runtime::Context::new();
 
-            // Phase 1.1: Inject arguments into the isolated context
+            // Inject arguments into the isolated context.
             for (name, val_str) in req.args {
-                // Simple heuristic parsing for the prototype (ideally use JSON serialization)
-                let value = if let Ok(n) = val_str.parse::<f64>() {
-                    ast::Value::Number(n)
-                } else if val_str == "true" {
-                    ast::Value::Boolean(true)
-                } else if val_str == "false" {
-                    ast::Value::Boolean(false)
-                } else {
-                    ast::Value::Text(val_str.trim_matches('"').to_string())
-                };
+                let value = parse_rpc_argument(&val_str);
 
                 isolated_ctx
-                    .set_variable(
-                        name,
-                        ast::AnnotatedValue::from(value),
-                        ast::MemoryScope::Working,
-                    )
+                    .set_variable(name, value, ast::MemoryScope::Working)
                     .await
                     .map_err(|e| Status::internal(format!("Failed to set argument: {}", e)))?;
             }
@@ -621,12 +626,30 @@ mod tests {
         match res.value {
             ast::Value::Object(fields) => {
                 assert_eq!(
-                    fields.get("test_res").unwrap().value,
-                    ast::Value::Text("hello from remote".to_string())
+                    fields.get("status").unwrap().value,
+                    ast::Value::Text("completed".to_string())
                 );
+                assert_eq!(
+                    fields.get("agent_id").unwrap().value,
+                    ast::Value::Text("AgentB".to_string())
+                );
+                assert_eq!(
+                    fields.get("goal").unwrap().value,
+                    ast::Value::Text("test_goal".to_string())
+                );
+
+                match &fields.get("result").unwrap().value {
+                    ast::Value::Object(result_fields) => {
+                        assert_eq!(
+                            result_fields.get("test_res").unwrap().value,
+                            ast::Value::Text("hello from remote".to_string())
+                        );
+                    }
+                    other => panic!("expected nested remote result object, found {:?}", other),
+                }
             }
             other => panic!(
-                "expected structured remote result object, found {:?}",
+                "expected structured remote call envelope, found {:?}",
                 other
             ),
         }

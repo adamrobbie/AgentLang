@@ -301,8 +301,7 @@ pub struct Context {
     pub tool_adapters: Arc<Mutex<HashMap<String, ToolAdapter>>>,
     pub approved_tool_actions: Arc<Mutex<HashSet<String>>>,
     pub registries: Arc<Mutex<Vec<String>>>,
-    pub pending_calls:
-        Arc<Mutex<HashMap<String, tokio::sync::oneshot::Receiver<Result<AnnotatedValue>>>>>,
+    pub pending_calls: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Receiver<AnnotatedValue>>>>,
 }
 
 #[derive(Clone)]
@@ -1076,6 +1075,216 @@ fn build_parallel_result(
             ])))
         }
     }
+}
+
+fn build_pending_remote_call_result(
+    agent_id: &str,
+    goal_name: &str,
+    call_id: &str,
+    args: &HashMap<String, AnnotatedValue>,
+) -> AnnotatedValue {
+    AnnotatedValue::from(Value::Object(HashMap::from([
+        (
+            "agent_id".to_string(),
+            AnnotatedValue::from(Value::Text(agent_id.to_string())),
+        ),
+        (
+            "goal".to_string(),
+            AnnotatedValue::from(Value::Text(goal_name.to_string())),
+        ),
+        (
+            "goal_name".to_string(),
+            AnnotatedValue::from(Value::Text(goal_name.to_string())),
+        ),
+        (
+            "call_id".to_string(),
+            AnnotatedValue::from(Value::Text(call_id.to_string())),
+        ),
+        (
+            "args".to_string(),
+            AnnotatedValue::from(Value::Object(args.clone())),
+        ),
+        (
+            "status".to_string(),
+            AnnotatedValue::from(Value::Text("pending".to_string())),
+        ),
+        ("result".to_string(), AnnotatedValue::from(Value::Null)),
+    ])))
+}
+
+fn build_remote_call_result(
+    agent_id: &str,
+    goal_name: &str,
+    call_id: &str,
+    args: &HashMap<String, AnnotatedValue>,
+    outcome: Result<AnnotatedValue>,
+) -> AnnotatedValue {
+    let mut fields = HashMap::from([
+        (
+            "agent_id".to_string(),
+            AnnotatedValue::from(Value::Text(agent_id.to_string())),
+        ),
+        (
+            "goal".to_string(),
+            AnnotatedValue::from(Value::Text(goal_name.to_string())),
+        ),
+        (
+            "goal_name".to_string(),
+            AnnotatedValue::from(Value::Text(goal_name.to_string())),
+        ),
+        (
+            "call_id".to_string(),
+            AnnotatedValue::from(Value::Text(call_id.to_string())),
+        ),
+        (
+            "args".to_string(),
+            AnnotatedValue::from(Value::Object(args.clone())),
+        ),
+    ]);
+
+    match outcome {
+        Ok(result) => {
+            fields.insert(
+                "status".to_string(),
+                AnnotatedValue::from(Value::Text("completed".to_string())),
+            );
+            fields.insert("result".to_string(), result);
+        }
+        Err(error) => {
+            fields.insert(
+                "status".to_string(),
+                AnnotatedValue::from(Value::Text("error".to_string())),
+            );
+            fields.insert(
+                "error".to_string(),
+                AnnotatedValue::from(Value::Text(error.to_string())),
+            );
+            fields.insert("result".to_string(), AnnotatedValue::from(Value::Null));
+        }
+    }
+
+    AnnotatedValue::from(Value::Object(fields))
+}
+
+async fn execute_remote_call(
+    ctx: Context,
+    agent_id: String,
+    goal_name: String,
+    rpc_args: HashMap<String, String>,
+) -> Result<AnnotatedValue> {
+    let mut lookup_res = None;
+    let registries = ctx.registries.lock().unwrap().clone();
+
+    for reg_addr in registries {
+        if let Ok(mut reg_client) = RegistryServiceClient::connect(reg_addr.clone()).await
+            && let Ok(res) = reg_client
+                .lookup_agent(LookupRequest {
+                    agent_id: agent_id.clone(),
+                })
+                .await
+        {
+            let res = res.into_inner();
+            if res.found {
+                lookup_res = Some((reg_addr, res));
+                break;
+            }
+        }
+    }
+
+    let (_reg_addr, lookup_data) = lookup_res
+        .ok_or_else(|| anyhow!("Agent '{}' not found in any registered registry", agent_id))?;
+
+    let caller_id = "PrimaryOrchestrator".to_string();
+    let payload = format!("{}:{}", goal_name, caller_id);
+    let signature = ctx
+        .identity
+        .signing_key
+        .sign(payload.as_bytes())
+        .to_bytes()
+        .to_vec();
+
+    let mut agent_client = AgentServiceClient::connect(lookup_data.endpoint.clone())
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "Failed to connect to agent '{}' at {}: {}",
+                agent_id,
+                lookup_data.endpoint,
+                e
+            )
+        })?;
+
+    let response = agent_client
+        .call_goal(CallRequest {
+            goal_name,
+            args: rpc_args,
+            caller_id,
+            signature,
+        })
+        .await?
+        .into_inner();
+
+    if response.success {
+        serde_json::from_str::<AnnotatedValue>(&response.result_json)
+            .or_else(|_| Ok(AnnotatedValue::from(Value::Text(response.result_json))))
+    } else {
+        Err(anyhow!("Remote execution failed: {}", response.result_json))
+    }
+}
+
+async fn dispatch_remote_call(
+    ctx: Context,
+    agent_id: String,
+    goal_name: String,
+    call_id: String,
+    args: HashMap<String, AnnotatedValue>,
+) -> AnnotatedValue {
+    let rpc_args = args
+        .iter()
+        .filter_map(|(key, value)| {
+            serde_json::to_string(value)
+                .ok()
+                .map(|serialized| (key.clone(), serialized))
+        })
+        .collect::<HashMap<_, _>>();
+
+    let outcome = execute_remote_call(ctx, agent_id.clone(), goal_name.clone(), rpc_args).await;
+    build_remote_call_result(&agent_id, &goal_name, &call_id, &args, outcome)
+}
+
+async fn await_remote_call(ctx: Context, call_id: &str) -> Result<AnnotatedValue> {
+    let receiver = ctx
+        .pending_calls
+        .lock()
+        .unwrap()
+        .remove(call_id)
+        .ok_or_else(|| anyhow!("No pending call found for ID '{}'", call_id))?;
+
+    receiver
+        .await
+        .map_err(|_| anyhow!("Call task for '{}' panicked or was dropped", call_id))
+}
+
+async fn store_remote_call_result(
+    ctx: &Context,
+    call_id: &str,
+    envelope: AnnotatedValue,
+) -> Result<()> {
+    let flat_result = if let Value::Object(fields) = &envelope.value {
+        fields.get("result").cloned()
+    } else {
+        None
+    };
+
+    ctx.set_variable(call_id.to_string(), envelope, MemoryScope::Working)
+        .await?;
+
+    if let Some(result) = flat_result {
+        ctx.set_variable(format!("{}.result", call_id), result, MemoryScope::Working)
+            .await?;
+    }
+
+    Ok(())
 }
 
 async fn build_goal_result(
@@ -2075,15 +2284,14 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 agent_id, goal_name
             );
 
-            // 1. Check for protected arguments FIRST (Privacy / verification policy)
-            let mut rpc_args = HashMap::new();
+            let mut evaluated_args = HashMap::new();
             for (k, expr) in args {
                 let val = eval_expression(expr, &ctx).await?;
                 ensure_value_safe_for_irreversible_action(
                     &val,
                     &format!("send argument '{}' to agent '{}'", k, agent_id),
                 )?;
-                rpc_args.insert(k.clone(), format!("{:?}", val.value));
+                evaluated_args.insert(k.clone(), val);
             }
 
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2092,106 +2300,38 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 .unwrap()
                 .insert(result_into.clone(), rx);
 
+            let pending_envelope =
+                build_pending_remote_call_result(agent_id, goal_name, result_into, &evaluated_args);
+            store_remote_call_result(&ctx, result_into, pending_envelope).await?;
+
             let ctx_clone = ctx.clone();
             let agent_id_clone = agent_id.clone();
             let goal_name_clone = goal_name.clone();
-
+            let call_id_clone = result_into.clone();
             tokio::spawn(async move {
-                let res = async {
-                    // 2. Lookup agent in registry (Federated lookup)
-                    let mut lookup_res = None;
-                    let registries = ctx_clone.registries.lock().unwrap().clone();
-
-                    for reg_addr in registries {
-                        if let Ok(mut reg_client) =
-                            RegistryServiceClient::connect(reg_addr.clone()).await
-                            && let Ok(res) = reg_client
-                                .lookup_agent(LookupRequest {
-                                    agent_id: agent_id_clone.clone(),
-                                })
-                                .await
-                        {
-                            let res = res.into_inner();
-                            if res.found {
-                                lookup_res = Some((reg_addr, res));
-                                break;
-                            }
-                        }
-                    }
-
-                    let (_reg_addr, lookup_data) = lookup_res.ok_or_else(|| {
-                        anyhow!(
-                            "Agent '{}' not found in any registered registry",
-                            agent_id_clone
-                        )
-                    })?;
-
-                    // 3. Prepare sign
-                    let caller_id = "PrimaryOrchestrator".to_string(); // In a real system, this comes from context
-                    let payload = format!("{}:{}", goal_name_clone, caller_id);
-                    let signature = ctx_clone
-                        .identity
-                        .signing_key
-                        .sign(payload.as_bytes())
-                        .to_bytes()
-                        .to_vec();
-
-                    let mut agent_client =
-                        AgentServiceClient::connect(lookup_data.endpoint.clone())
-                            .await
-                            .map_err(|e| {
-                                anyhow!(
-                                    "Failed to connect to agent '{}' at {}: {}",
-                                    agent_id_clone,
-                                    lookup_data.endpoint,
-                                    e
-                                )
-                            })?;
-
-                    let response = agent_client
-                        .call_goal(CallRequest {
-                            goal_name: goal_name_clone,
-                            args: rpc_args,
-                            caller_id,
-                            signature,
-                        })
-                        .await?
-                        .into_inner();
-
-                    if response.success {
-                        serde_json::from_str::<AnnotatedValue>(&response.result_json).or_else(
-                            |_| Ok(AnnotatedValue::from(Value::Text(response.result_json))),
-                        )
-                    } else {
-                        Err(anyhow!("Remote execution failed: {}", response.result_json))
-                    }
-                }
+                let envelope = dispatch_remote_call(
+                    ctx_clone,
+                    agent_id_clone,
+                    goal_name_clone,
+                    call_id_clone,
+                    evaluated_args,
+                )
                 .await;
-                let _ = tx.send(res);
+                let _ = tx.send(envelope);
             });
 
             Ok(())
         }
         Statement::Await { call_id } => {
             println!("  [Runtime] AWAITING result for '{}'...", call_id);
-            let rx = ctx
-                .pending_calls
-                .lock()
-                .unwrap()
-                .remove(call_id)
-                .ok_or_else(|| anyhow!("No pending call found for ID '{}'", call_id))?;
-
-            let result = rx
-                .await
-                .map_err(|_| anyhow!("Call task for '{}' panicked or was dropped", call_id))??;
+            let result = await_remote_call(ctx.clone(), call_id).await?;
 
             println!(
                 "  [Runtime] AWAIT SUCCESS for '{}': {}",
                 call_id,
                 format_value_safe(&result)
             );
-            ctx.set_variable(call_id.clone(), result, MemoryScope::Working)
-                .await?;
+            store_remote_call_result(&ctx, call_id, result).await?;
             Ok(())
         }
     }
@@ -2835,6 +2975,147 @@ mod tests {
                 assert_eq!(confidence.confidence, Some(1.0));
             }
             other => panic!("expected object tool result, found {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pending_remote_call_result_creates_pending_envelope() {
+        let args = HashMap::from([(
+            "city".to_string(),
+            AnnotatedValue::from(Value::Text("Paris".to_string())),
+        )]);
+
+        let pending = build_pending_remote_call_result("AgentB", "plan_trip", "call_1", &args);
+
+        match pending.value {
+            Value::Object(fields) => {
+                assert_eq!(
+                    fields.get("status").unwrap().value,
+                    Value::Text("pending".to_string())
+                );
+                assert_eq!(
+                    fields.get("agent_id").unwrap().value,
+                    Value::Text("AgentB".to_string())
+                );
+                assert_eq!(
+                    fields.get("goal").unwrap().value,
+                    Value::Text("plan_trip".to_string())
+                );
+                assert_eq!(
+                    fields.get("goal_name").unwrap().value,
+                    Value::Text("plan_trip".to_string())
+                );
+                assert_eq!(fields.get("result").unwrap().value, Value::Null);
+                match &fields.get("args").unwrap().value {
+                    Value::Object(arg_fields) => {
+                        assert_eq!(
+                            arg_fields.get("city").unwrap().value,
+                            Value::Text("Paris".to_string())
+                        );
+                    }
+                    other => panic!("expected args object, found {:?}", other),
+                }
+            }
+            other => panic!("expected pending call envelope object, found {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_store_remote_call_result_persists_envelope_and_result_alias() {
+        let ctx = Context::new();
+        let args = HashMap::from([(
+            "city".to_string(),
+            AnnotatedValue::from(Value::Text("Paris".to_string())),
+        )]);
+        let envelope = build_remote_call_result(
+            "AgentB",
+            "plan_trip",
+            "call_1",
+            &args,
+            Ok(AnnotatedValue::from(Value::Object(HashMap::from([(
+                "destination".to_string(),
+                AnnotatedValue::from(Value::Text("Paris".to_string())),
+            )])))),
+        );
+
+        store_remote_call_result(&ctx, "call_1", envelope)
+            .await
+            .unwrap();
+
+        let stored = ctx
+            .get_variable("call_1", MemoryScope::Working)
+            .await
+            .unwrap();
+        let alias = ctx
+            .get_variable("call_1.result", MemoryScope::Working)
+            .await
+            .unwrap();
+
+        match stored.value {
+            Value::Object(fields) => {
+                assert_eq!(
+                    fields.get("status").unwrap().value,
+                    Value::Text("completed".to_string())
+                );
+                match &fields.get("result").unwrap().value {
+                    Value::Object(result_fields) => {
+                        assert_eq!(
+                            result_fields.get("destination").unwrap().value,
+                            Value::Text("Paris".to_string())
+                        );
+                    }
+                    other => panic!("expected nested result object, found {:?}", other),
+                }
+            }
+            other => panic!("expected stored call envelope object, found {:?}", other),
+        }
+
+        match alias.value {
+            Value::Object(result_fields) => {
+                assert_eq!(
+                    result_fields.get("destination").unwrap().value,
+                    Value::Text("Paris".to_string())
+                );
+            }
+            other => panic!("expected flat result alias object, found {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_await_remote_call_returns_completed_envelope() {
+        let ctx = Context::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ctx.pending_calls
+            .lock()
+            .unwrap()
+            .insert("call_1".to_string(), rx);
+
+        let args = HashMap::new();
+        tokio::spawn(async move {
+            let envelope = build_remote_call_result(
+                "AgentB",
+                "plan_trip",
+                "call_1",
+                &args,
+                Ok(AnnotatedValue::from(Value::Text("done".to_string()))),
+            );
+            let _ = tx.send(envelope);
+        });
+
+        let awaited = await_remote_call(ctx, "call_1").await.unwrap();
+
+        match awaited.value {
+            Value::Object(fields) => {
+                assert_eq!(
+                    fields.get("status").unwrap().value,
+                    Value::Text("completed".to_string())
+                );
+                assert_eq!(
+                    fields.get("result").unwrap().value,
+                    Value::Text("done".to_string())
+                );
+            }
+            other => panic!("expected completed call envelope object, found {:?}", other),
         }
     }
 
