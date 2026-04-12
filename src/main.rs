@@ -29,6 +29,22 @@ type AgentRegistry = Arc<Mutex<HashMap<String, (String, Vec<u8>)>>>;
 
 type SharedState = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
+fn decode_call_arg_value(val_str: &str) -> ast::AnnotatedValue {
+    serde_json::from_str::<ast::AnnotatedValue>(val_str).unwrap_or_else(|_| {
+        let value = if let Ok(n) = val_str.parse::<f64>() {
+            ast::Value::Number(n)
+        } else if val_str == "true" {
+            ast::Value::Boolean(true)
+        } else if val_str == "false" {
+            ast::Value::Boolean(false)
+        } else {
+            ast::Value::Text(val_str.trim_matches('"').to_string())
+        };
+
+        ast::AnnotatedValue::from(value)
+    })
+}
+
 pub struct MyRegistryService {
     pub agents: AgentRegistry,
     pub shared_state: SharedState,
@@ -203,21 +219,10 @@ impl AgentService for MyAgentService {
 
             // Phase 1.1: Inject arguments into the isolated context
             for (name, val_str) in req.args {
-                // Simple heuristic parsing for the prototype (ideally use JSON serialization)
-                let value = if let Ok(n) = val_str.parse::<f64>() {
-                    ast::Value::Number(n)
-                } else if val_str == "true" {
-                    ast::Value::Boolean(true)
-                } else if val_str == "false" {
-                    ast::Value::Boolean(false)
-                } else {
-                    ast::Value::Text(val_str.trim_matches('"').to_string())
-                };
-
                 isolated_ctx
                     .set_variable(
                         name,
-                        ast::AnnotatedValue::from(value),
+                        decode_call_arg_value(&val_str),
                         ast::MemoryScope::Working,
                     )
                     .await
@@ -621,14 +626,45 @@ mod tests {
         match res.value {
             ast::Value::Object(fields) => {
                 assert_eq!(
+                    fields.get("status").unwrap().value,
+                    ast::Value::Text("completed".to_string())
+                );
+                assert_eq!(
+                    fields.get("agent_id").unwrap().value,
+                    ast::Value::Text("AgentB".to_string())
+                );
+                assert_eq!(
+                    fields.get("goal_name").unwrap().value,
+                    ast::Value::Text("test_goal".to_string())
+                );
+                match &fields.get("result").unwrap().value {
+                    ast::Value::Object(result_fields) => {
+                        assert_eq!(
+                            result_fields.get("test_res").unwrap().value,
+                            ast::Value::Text("hello from remote".to_string())
+                        );
+                    }
+                    other => panic!("expected nested remote result object, found {:?}", other),
+                }
+            }
+            other => panic!(
+                "expected structured remote call envelope, found {:?}",
+                other
+            ),
+        }
+
+        let result_alias = ctx_a
+            .get_variable("remote_res.result", ast::MemoryScope::Working)
+            .await
+            .unwrap();
+        match result_alias.value {
+            ast::Value::Object(fields) => {
+                assert_eq!(
                     fields.get("test_res").unwrap().value,
                     ast::Value::Text("hello from remote".to_string())
                 );
             }
-            other => panic!(
-                "expected structured remote result object, found {:?}",
-                other
-            ),
+            other => panic!("expected remote result alias object, found {:?}", other),
         }
     }
 }
