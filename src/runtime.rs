@@ -826,15 +826,15 @@ async fn execute_declared_tool(
     Ok(normalize_tool_result(tool, result))
 }
 
-fn collect_changed_working_values(
+fn collect_changed_working_values_excluding(
     before: &HashMap<String, AnnotatedValue>,
     after: &HashMap<String, AnnotatedValue>,
-    goal_name: &str,
+    excluded_keys: &[String],
 ) -> HashMap<String, AnnotatedValue> {
     after
         .iter()
         .filter_map(|(key, value)| {
-            if key == goal_name || key == &format!("{}.result", goal_name) {
+            if excluded_keys.iter().any(|excluded| excluded == key) {
                 return None;
             }
 
@@ -844,6 +844,238 @@ fn collect_changed_working_values(
             }
         })
         .collect()
+}
+
+fn collect_changed_working_values(
+    before: &HashMap<String, AnnotatedValue>,
+    after: &HashMap<String, AnnotatedValue>,
+    goal_name: &str,
+) -> HashMap<String, AnnotatedValue> {
+    collect_changed_working_values_excluding(
+        before,
+        after,
+        &[goal_name.to_string(), format!("{}.result", goal_name)],
+    )
+}
+
+#[derive(Clone, Debug)]
+struct ParallelBranchReport {
+    index: usize,
+    success: bool,
+    result: AnnotatedValue,
+    changes: HashMap<String, AnnotatedValue>,
+    error: Option<String>,
+}
+
+impl ParallelBranchReport {
+    fn to_value(&self) -> AnnotatedValue {
+        let mut fields = HashMap::from([
+            (
+                "index".to_string(),
+                AnnotatedValue::from(Value::Number(self.index as f64)),
+            ),
+            (
+                "status".to_string(),
+                AnnotatedValue::from(Value::Text(if self.success {
+                    "ok".to_string()
+                } else {
+                    "error".to_string()
+                })),
+            ),
+            ("result".to_string(), self.result.clone()),
+            (
+                "changes".to_string(),
+                AnnotatedValue::from(Value::Object(self.changes.clone())),
+            ),
+        ]);
+
+        if let Some(error) = &self.error {
+            fields.insert(
+                "error".to_string(),
+                AnnotatedValue::from(Value::Text(error.clone())),
+            );
+        }
+
+        AnnotatedValue::from(Value::Object(fields))
+    }
+}
+
+fn clone_parallel_branch_context(
+    ctx: &Context,
+    working_seed: &HashMap<String, AnnotatedValue>,
+    session_seed: &HashMap<String, AnnotatedValue>,
+) -> Context {
+    Context {
+        working_variables: Arc::new(Mutex::new(working_seed.clone())),
+        session_variables: Arc::new(Mutex::new(session_seed.clone())),
+        long_term_file: ctx.long_term_file.clone(),
+        shared_file: ctx.shared_file.clone(),
+        identity: ctx.identity.clone(),
+        active_contracts: ctx.active_contracts.clone(),
+        event_tx: ctx.event_tx.clone(),
+        audit_chain: ctx.audit_chain.clone(),
+        session_key: ctx.session_key.clone(),
+        wasm_engine: ctx.wasm_engine.clone(),
+        proofs: ctx.proofs.clone(),
+        goals: ctx.goals.clone(),
+        tools: ctx.tools.clone(),
+        tool_adapters: ctx.tool_adapters.clone(),
+        approved_tool_actions: ctx.approved_tool_actions.clone(),
+        registries: ctx.registries.clone(),
+        pending_calls: ctx.pending_calls.clone(),
+    }
+}
+
+fn extract_statement_result(
+    statement: &Statement,
+    after: &HashMap<String, AnnotatedValue>,
+    changes: &HashMap<String, AnnotatedValue>,
+) -> AnnotatedValue {
+    let named_value = match statement {
+        Statement::Goal { name, .. } => after
+            .get(name)
+            .cloned()
+            .or_else(|| after.get(&format!("{}.result", name)).cloned()),
+        Statement::UseTool { result_into, .. }
+        | Statement::UseWasm { result_into, .. }
+        | Statement::Call { result_into, .. } => after.get(result_into).cloned(),
+        Statement::Set { name, .. }
+        | Statement::Remember { name, .. }
+        | Statement::Forget { name, .. } => after.get(name).cloned(),
+        Statement::Recall { into_var, .. } => after.get(into_var).cloned(),
+        Statement::Reveal {
+            result_into: Some(result_into),
+            ..
+        }
+        | Statement::Parallel {
+            result_into: Some(result_into),
+            ..
+        } => after.get(result_into).cloned(),
+        _ => None,
+    };
+
+    if let Some(value) = named_value {
+        value
+    } else if changes.len() == 1 {
+        changes
+            .values()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| AnnotatedValue::from(Value::Null))
+    } else {
+        AnnotatedValue::from(Value::Null)
+    }
+}
+
+fn build_parallel_branch_report(
+    index: usize,
+    statement: &Statement,
+    before: &HashMap<String, AnnotatedValue>,
+    after: &HashMap<String, AnnotatedValue>,
+    execution: Result<()>,
+) -> ParallelBranchReport {
+    let changes = collect_changed_working_values_excluding(before, after, &[]);
+    let result = extract_statement_result(statement, after, &changes);
+
+    match execution {
+        Ok(()) => ParallelBranchReport {
+            index,
+            success: true,
+            result,
+            changes,
+            error: None,
+        },
+        Err(error) => ParallelBranchReport {
+            index,
+            success: false,
+            result,
+            changes,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+async fn merge_parallel_changes(ctx: &Context, reports: &[ParallelBranchReport]) -> Result<()> {
+    let mut ordered_reports = reports.iter().collect::<Vec<_>>();
+    ordered_reports.sort_by_key(|report| report.index);
+
+    for report in ordered_reports.into_iter().filter(|report| report.success) {
+        for (key, value) in &report.changes {
+            ctx.set_variable(key.clone(), value.clone(), MemoryScope::Working)
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn build_parallel_result(
+    pattern: &ParallelPattern,
+    reports: &[ParallelBranchReport],
+) -> AnnotatedValue {
+    let mut ordered_reports = reports.to_vec();
+    ordered_reports.sort_by_key(|report| report.index);
+
+    match pattern {
+        ParallelPattern::Race => {
+            let winner = ordered_reports
+                .iter()
+                .find(|report| report.success)
+                .cloned()
+                .unwrap_or_else(|| ParallelBranchReport {
+                    index: 0,
+                    success: false,
+                    result: AnnotatedValue::from(Value::Null),
+                    changes: HashMap::new(),
+                    error: None,
+                });
+
+            AnnotatedValue::from(Value::Object(HashMap::from([
+                (
+                    "winner_index".to_string(),
+                    AnnotatedValue::from(Value::Number(winner.index as f64)),
+                ),
+                ("winner".to_string(), winner.result.clone()),
+                ("outcome".to_string(), winner.to_value()),
+                ("result".to_string(), winner.result),
+            ])))
+        }
+        _ => {
+            let successes = ordered_reports
+                .iter()
+                .filter(|report| report.success)
+                .count();
+            let failures = ordered_reports.len().saturating_sub(successes);
+            let outcomes = ordered_reports
+                .iter()
+                .map(|report| report.to_value())
+                .collect::<Vec<_>>();
+            let successful_results = ordered_reports
+                .iter()
+                .filter(|report| report.success)
+                .map(|report| report.result.clone())
+                .collect::<Vec<_>>();
+
+            AnnotatedValue::from(Value::Object(HashMap::from([
+                (
+                    "results".to_string(),
+                    AnnotatedValue::from(Value::List(outcomes)),
+                ),
+                (
+                    "successes".to_string(),
+                    AnnotatedValue::from(Value::Number(successes as f64)),
+                ),
+                (
+                    "failures".to_string(),
+                    AnnotatedValue::from(Value::Number(failures as f64)),
+                ),
+                (
+                    "result".to_string(),
+                    AnnotatedValue::from(Value::List(successful_results)),
+                ),
+            ])))
+        }
+    }
 }
 
 async fn build_goal_result(
@@ -1341,69 +1573,119 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             deadline,
         } => {
             println!("  [Runtime] Parallel START ({:?})", pattern);
+            let working_seed = ctx.working_variables.lock().unwrap().clone();
+            let session_seed = ctx.session_variables.lock().unwrap().clone();
+            let branch_specs = branches
+                .iter()
+                .cloned()
+                .enumerate()
+                .collect::<Vec<(usize, Statement)>>();
+
             let mut join_set = tokio::task::JoinSet::new();
-            for stmt in branches {
-                let stmt_clone = stmt.clone();
-                let ctx_clone = ctx.clone();
-                join_set.spawn(async move { eval(&stmt_clone, ctx_clone).await });
+            for (index, stmt_clone) in branch_specs {
+                let branch_ctx = clone_parallel_branch_context(&ctx, &working_seed, &session_seed);
+                let branch_before = working_seed.clone();
+                join_set.spawn(async move {
+                    let execution = eval(&stmt_clone, branch_ctx.clone()).await;
+                    let branch_after = branch_ctx.working_variables.lock().unwrap().clone();
+                    build_parallel_branch_report(
+                        index,
+                        &stmt_clone,
+                        &branch_before,
+                        &branch_after,
+                        execution,
+                    )
+                });
             }
 
             let pattern_clone = pattern.clone();
             let parallel_future = async move {
+                let mut reports = Vec::new();
                 match pattern_clone {
                     ParallelPattern::Gather | ParallelPattern::GatherAll => {
-                        let mut results = Vec::new();
                         while let Some(res) = join_set.join_next().await {
-                            results.push(res?);
-                        }
-                        if pattern_clone == ParallelPattern::Gather {
-                            for r in results {
-                                r?;
+                            let report = res?;
+                            if pattern_clone == ParallelPattern::Gather && !report.success {
+                                return Err(anyhow!(
+                                    report
+                                        .error
+                                        .clone()
+                                        .unwrap_or_else(|| "Parallel branch failed".to_string())
+                                ));
                             }
+                            reports.push(report);
                         }
-                        Ok::<(), anyhow::Error>(())
+                        Ok::<Vec<ParallelBranchReport>, anyhow::Error>(reports)
                     }
                     ParallelPattern::Race => {
-                        if let Some(res) = join_set.join_next().await {
-                            res??;
-                        }
-                        Ok::<(), anyhow::Error>(())
-                    }
-                    ParallelPattern::GatherMin(n) => {
-                        let mut success_count = 0;
                         while let Some(res) = join_set.join_next().await {
-                            if res?.is_ok() {
-                                success_count += 1;
-                            }
-                            if success_count >= n {
+                            let report = res?;
+                            let should_finish = report.success;
+                            reports.push(report);
+                            if should_finish {
+                                join_set.abort_all();
+                                while join_set.join_next().await.is_some() {}
                                 break;
                             }
                         }
-                        Ok::<(), anyhow::Error>(())
+
+                        if reports.iter().any(|report| report.success) {
+                            Ok::<Vec<ParallelBranchReport>, anyhow::Error>(reports)
+                        } else {
+                            let message = reports
+                                .iter()
+                                .find_map(|report| report.error.clone())
+                                .unwrap_or_else(|| {
+                                    "Race block completed without a winner".to_string()
+                                });
+                            Err(anyhow!(message))
+                        }
+                    }
+                    ParallelPattern::GatherMin(n) => {
+                        while let Some(res) = join_set.join_next().await {
+                            let report = res?;
+                            reports.push(report);
+                            if reports.iter().filter(|report| report.success).count() >= n {
+                                join_set.abort_all();
+                                while join_set.join_next().await.is_some() {}
+                                break;
+                            }
+                        }
+
+                        if reports.iter().filter(|report| report.success).count() >= n {
+                            Ok::<Vec<ParallelBranchReport>, anyhow::Error>(reports)
+                        } else {
+                            Err(anyhow!(
+                                "Parallel block did not reach minimum successful branches ({})",
+                                n
+                            ))
+                        }
                     }
                 }
             };
 
-            let result = if let Some(d) = deadline {
+            let reports = if let Some(d) = deadline {
                 match tokio::time::timeout(Duration::from_secs_f64(*d), parallel_future).await {
                     Ok(res) => res,
                     Err(_) => Err(anyhow!("Parallel block timed out after {}s", d)),
                 }
             } else {
                 parallel_future.await
-            };
+            }?;
+
+            merge_parallel_changes(&ctx, &reports).await?;
 
             if let Some(var) = result_into {
-                ctx.set_variable(
-                    var.clone(),
-                    AnnotatedValue::from(Value::Boolean(result.is_ok())),
-                    MemoryScope::Working,
-                )
-                .await?;
+                let aggregated = build_parallel_result(pattern, &reports);
+                ctx.set_variable(var.clone(), aggregated, MemoryScope::Working)
+                    .await?;
             }
 
-            println!("  [Runtime] Parallel FINISHED: success={}", result.is_ok());
-            result
+            println!(
+                "  [Runtime] Parallel FINISHED: success_count={}",
+                reports.iter().filter(|report| report.success).count()
+            );
+            Ok(())
         }
         Statement::ForEach { item, list, body } => {
             let list_val = eval_expression(list, &ctx).await?;
@@ -2473,13 +2755,22 @@ mod tests {
             "Parallel execution took too long: {:?}",
             elapsed
         );
-        assert_eq!(
-            ctx.get_variable("p_res", MemoryScope::Working)
-                .await
-                .unwrap()
-                .value,
-            Value::Boolean(true)
-        );
+
+        let result = ctx
+            .get_variable("p_res", MemoryScope::Working)
+            .await
+            .unwrap();
+        match result.value {
+            Value::Object(fields) => {
+                assert_eq!(fields.get("successes").unwrap().value, Value::Number(3.0));
+                assert_eq!(fields.get("failures").unwrap().value, Value::Number(0.0));
+                match &fields.get("result").unwrap().value {
+                    Value::List(results) => assert_eq!(results.len(), 3),
+                    other => panic!("expected aggregated result list, found {:?}", other),
+                }
+            }
+            other => panic!("expected structured parallel result, found {:?}", other),
+        }
     }
 
     #[tokio::test]
@@ -2995,6 +3286,243 @@ mod tests {
 
         let err = eval(&use_tool, ctx.clone()).await.unwrap_err();
         assert!(err.to_string().contains("Permission denied"));
+    }
+
+    #[tokio::test]
+    async fn test_parallel_gather_collects_branch_results() {
+        let ctx = Context::new();
+        let stmt = Statement::Parallel {
+            pattern: ParallelPattern::Gather,
+            branches: vec![
+                Statement::Set {
+                    name: "alpha".to_string(),
+                    value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+                },
+                Statement::Set {
+                    name: "beta".to_string(),
+                    value: Expression::Literal(AnnotatedValue::from(Value::Text("ok".to_string()))),
+                },
+            ],
+            result_into: Some("parallel_result".to_string()),
+            deadline: None,
+        };
+
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let aggregated = ctx
+            .get_variable("parallel_result", MemoryScope::Working)
+            .await
+            .unwrap();
+
+        match &aggregated.value {
+            Value::Object(fields) => {
+                assert_eq!(fields.get("successes").unwrap().value, Value::Number(2.0));
+                assert_eq!(fields.get("failures").unwrap().value, Value::Number(0.0));
+
+                match &fields.get("result").unwrap().value {
+                    Value::List(results) => {
+                        assert_eq!(results.len(), 2);
+                        assert_eq!(results[0].value, Value::Number(1.0));
+                        assert_eq!(results[1].value, Value::Text("ok".to_string()));
+                    }
+                    other => panic!("expected successful result list, found {:?}", other),
+                }
+
+                match &fields.get("results").unwrap().value {
+                    Value::List(outcomes) => {
+                        assert_eq!(outcomes.len(), 2);
+                    }
+                    other => panic!("expected outcome list, found {:?}", other),
+                }
+            }
+            other => panic!("expected aggregated object result, found {:?}", other),
+        }
+
+        let nested_expr = Expression::VariableRef(VariablePath {
+            root: "parallel_result".to_string(),
+            segments: vec![
+                PathSegment::Field("results".to_string()),
+                PathSegment::Index(1),
+                PathSegment::Field("result".to_string()),
+            ],
+        });
+        assert_eq!(
+            eval_expression(&nested_expr, &ctx).await.unwrap().value,
+            Value::Text("ok".to_string())
+        );
+
+        assert_eq!(
+            ctx.get_variable("alpha", MemoryScope::Working)
+                .await
+                .unwrap()
+                .value,
+            Value::Number(1.0)
+        );
+        assert_eq!(
+            ctx.get_variable("beta", MemoryScope::Working)
+                .await
+                .unwrap()
+                .value,
+            Value::Text("ok".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parallel_gather_all_collects_successes_and_failures() {
+        let ctx = Context::new();
+        let stmt = Statement::Parallel {
+            pattern: ParallelPattern::GatherAll,
+            branches: vec![
+                Statement::Set {
+                    name: "completed".to_string(),
+                    value: Expression::Literal(AnnotatedValue::from(Value::Number(7.0))),
+                },
+                Statement::If {
+                    condition: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))),
+                    then_branch: vec![
+                        Statement::Set {
+                            name: "should_not_merge".to_string(),
+                            value: Expression::Literal(AnnotatedValue::from(Value::Number(99.0))),
+                        },
+                        Statement::Recall {
+                            name: "missing".to_string(),
+                            into_var: "never".to_string(),
+                            scope: MemoryScope::Working,
+                            on_missing: None,
+                            fuzzy: false,
+                            threshold: None,
+                        },
+                    ],
+                    else_branch: None,
+                },
+            ],
+            result_into: Some("parallel_all_result".to_string()),
+            deadline: None,
+        };
+
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let aggregated = ctx
+            .get_variable("parallel_all_result", MemoryScope::Working)
+            .await
+            .unwrap();
+
+        match &aggregated.value {
+            Value::Object(fields) => {
+                assert_eq!(fields.get("successes").unwrap().value, Value::Number(1.0));
+                assert_eq!(fields.get("failures").unwrap().value, Value::Number(1.0));
+
+                match &fields.get("result").unwrap().value {
+                    Value::List(results) => {
+                        assert_eq!(results.len(), 1);
+                        assert_eq!(results[0].value, Value::Number(7.0));
+                    }
+                    other => panic!("expected successful result list, found {:?}", other),
+                }
+
+                match &fields.get("results").unwrap().value {
+                    Value::List(outcomes) => {
+                        assert_eq!(outcomes.len(), 2);
+                        match &outcomes[1].value {
+                            Value::Object(failure_fields) => {
+                                assert_eq!(
+                                    failure_fields.get("status").unwrap().value,
+                                    Value::Text("error".to_string())
+                                );
+                                assert!(failure_fields.contains_key("error"));
+                            }
+                            other => panic!("expected failure outcome object, found {:?}", other),
+                        }
+                    }
+                    other => panic!("expected outcome list, found {:?}", other),
+                }
+            }
+            other => panic!("expected aggregated object result, found {:?}", other),
+        }
+
+        assert_eq!(
+            ctx.get_variable("completed", MemoryScope::Working)
+                .await
+                .unwrap()
+                .value,
+            Value::Number(7.0)
+        );
+        assert!(
+            ctx.get_variable("should_not_merge", MemoryScope::Working)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_race_first_into_stores_winner_details() {
+        let ctx = Context::new();
+        let stmt = Statement::Parallel {
+            pattern: ParallelPattern::Race,
+            branches: vec![
+                Statement::Wait { duration: 0.05 },
+                Statement::Set {
+                    name: "winner_payload".to_string(),
+                    value: Expression::Literal(AnnotatedValue::from(Value::Text(
+                        "fast".to_string(),
+                    ))),
+                },
+            ],
+            result_into: Some("race_result".to_string()),
+            deadline: None,
+        };
+
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let aggregated = ctx
+            .get_variable("race_result", MemoryScope::Working)
+            .await
+            .unwrap();
+
+        match &aggregated.value {
+            Value::Object(fields) => {
+                assert_eq!(
+                    fields.get("winner_index").unwrap().value,
+                    Value::Number(1.0)
+                );
+                assert_eq!(
+                    fields.get("winner").unwrap().value,
+                    Value::Text("fast".to_string())
+                );
+                assert_eq!(
+                    fields.get("result").unwrap().value,
+                    Value::Text("fast".to_string())
+                );
+
+                match &fields.get("outcome").unwrap().value {
+                    Value::Object(outcome_fields) => {
+                        assert_eq!(
+                            outcome_fields.get("status").unwrap().value,
+                            Value::Text("ok".to_string())
+                        );
+                    }
+                    other => panic!("expected race outcome object, found {:?}", other),
+                }
+            }
+            other => panic!("expected race object result, found {:?}", other),
+        }
+
+        let winner_expr = Expression::VariableRef(VariablePath {
+            root: "race_result".to_string(),
+            segments: vec![PathSegment::Field("winner".to_string())],
+        });
+        assert_eq!(
+            eval_expression(&winner_expr, &ctx).await.unwrap().value,
+            Value::Text("fast".to_string())
+        );
+
+        assert_eq!(
+            ctx.get_variable("winner_payload", MemoryScope::Working)
+                .await
+                .unwrap()
+                .value,
+            Value::Text("fast".to_string())
+        );
     }
 
     #[tokio::test]
