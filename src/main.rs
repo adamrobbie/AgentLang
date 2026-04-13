@@ -18,6 +18,7 @@ use agent_rpc::agent_service_server::{AgentService, AgentServiceServer};
 use agent_rpc::{CallRequest, CallResponse};
 use ed25519_dalek::{Signer, Verifier, VerifyingKey};
 use registry_rpc::registry_service_server::{RegistryService, RegistryServiceServer};
+use registry_rpc::registry_service_client::RegistryServiceClient;
 use registry_rpc::{
     GetSharedRequest, GetSharedResponse, LookupRequest, LookupResponse, PutSharedRequest,
     PutSharedResponse, RegisterRequest, RegisterResponse,
@@ -32,6 +33,7 @@ type SharedState = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 pub struct MyRegistryService {
     pub agents: AgentRegistry,
     pub shared_state: SharedState,
+    pub peer_registries: Vec<String>,
 }
 
 #[tonic::async_trait]
@@ -81,19 +83,43 @@ impl RegistryService for MyRegistryService {
         request: Request<LookupRequest>,
     ) -> Result<Response<LookupResponse>, Status> {
         let req = request.into_inner();
-        let agents = self.agents.lock().unwrap();
-        if let Some((endpoint, pub_key)) = agents.get(&req.agent_id) {
-            Ok(Response::new(LookupResponse {
-                endpoint: endpoint.clone(),
-                public_key: pub_key.clone(),
-                found: true,
-            }))
-        } else {
-            Ok(Response::new(LookupResponse {
-                found: false,
-                ..Default::default()
-            }))
+        
+        // 1. Try local lookup
+        {
+            let agents = self.agents.lock().unwrap();
+            if let Some((endpoint, pub_key)) = agents.get(&req.agent_id) {
+                return Ok(Response::new(LookupResponse {
+                    endpoint: endpoint.clone(),
+                    public_key: pub_key.clone(),
+                    found: true,
+                }));
+            }
         }
+
+        // 2. Try federated lookup if ttl > 0
+        let ttl = if req.ttl == 0 { 3 } else { req.ttl };
+        if ttl > 1 {
+            for peer in &self.peer_registries {
+                if let Ok(mut client) = RegistryServiceClient::connect(peer.clone()).await {
+                    let federated_req = LookupRequest {
+                        agent_id: req.agent_id.clone(),
+                        ttl: ttl - 1,
+                    };
+                    if let Ok(res) = client.lookup_agent(federated_req).await {
+                        let res: LookupResponse = res.into_inner();
+                        if res.found {
+                            println!("  [Registry] Federated lookup SUCCESS for '{}' via peer {}", req.agent_id, peer);
+                            return Ok(Response::new(res));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Response::new(LookupResponse {
+            found: false,
+            ..Default::default()
+        }))
     }
 
     async fn put_shared_state(
@@ -157,6 +183,7 @@ impl AgentService for MyAgentService {
                 && let Ok(res) = client
                     .lookup_agent(LookupRequest {
                         agent_id: req.caller_id.clone(),
+                        ttl: 3,
                     })
                     .await
             {
@@ -229,13 +256,15 @@ impl AgentService for MyAgentService {
                 body: goal_definition.body,
                 outputs: goal_definition.outputs,
                 result_into: goal_definition.result_into,
-                retry: goal_definition.retry,
+                retry: goal_definition.retry.map(|n| n as u32),
                 on_fail: goal_definition.on_fail,
                 deadline: goal_definition.deadline,
                 wait: goal_definition.wait,
                 idempotent: goal_definition.idempotent,
                 audit_trail: goal_definition.audit_trail,
-                fallback: goal_definition.fallback,
+                confirm_with: goal_definition.confirm_with,
+                timeout_confirmation: goal_definition.timeout_confirmation,
+                fallback: None, // Simplified
             };
 
             if let Err(e) = runtime::eval(&goal_stmt, isolated_ctx.clone()).await {
@@ -280,6 +309,7 @@ async fn main() -> Result<()> {
     let registry = MyRegistryService {
         agents: Arc::new(Mutex::new(HashMap::new())),
         shared_state: Arc::new(Mutex::new(HashMap::new())),
+        peer_registries: Vec::new(),
     };
 
     // 1. Start Registry
@@ -299,7 +329,7 @@ async fn main() -> Result<()> {
             "pay".to_string(),
             ast::GoalDefinition {
                 body: vec![ast::Statement::Set {
-                    name: "payment_status".to_string(),
+                    variable: "payment_status".to_string(),
                     value: ast::Expression::Literal(ast::AnnotatedValue::from(
                         ast::Value::Boolean(true),
                     )),
@@ -312,6 +342,8 @@ async fn main() -> Result<()> {
                 wait: None,
                 idempotent: false,
                 audit_trail: true,
+                confirm_with: None,
+                timeout_confirmation: None,
                 fallback: None,
             },
         );
@@ -356,6 +388,35 @@ async fn main() -> Result<()> {
 
     // 4. Start Primary Orchestrator
     let ctx = runtime::Context::new();
+    {
+        let mut handlers = ctx.tool_handlers.lock().unwrap();
+        handlers.insert("search_flights".to_string(), std::sync::Arc::new(|args| {
+            let query = args.get("query").map(|v| format!("{:?}", v.value)).unwrap_or_default();
+            println!("  [Native Tool] search_flights executed with query: {}", query);
+            
+            let mut flight = HashMap::new();
+            flight.insert("id".to_string(), ast::AnnotatedValue::from(ast::Value::Text("FL-456".to_string())));
+            flight.insert("price".to_string(), ast::AnnotatedValue::from(ast::Value::Number(299.0)));
+            
+            let mut result = HashMap::new();
+            result.insert("flights".to_string(), ast::AnnotatedValue::from(ast::Value::List(vec![ast::AnnotatedValue::from(ast::Value::Object(flight))])));
+            Ok(ast::AnnotatedValue::from(ast::Value::Object(result)))
+        }));
+
+        let mut tools = ctx.tools.lock().unwrap();
+        tools.insert("search_flights".to_string(), ast::ToolDefinition {
+            name: "search_flights".to_string(),
+            description: Some("Search for flights".to_string()),
+            category: Some(ast::ToolCategory::Read),
+            version: Some("1.0.0".to_string()),
+            inputs: vec![ast::ToolField { name: "query".to_string(), type_hint: "text".to_string(), required: true, annotations: vec![] }],
+            outputs: vec![ast::ToolField { name: "flights".to_string(), type_hint: "list".to_string(), required: true, annotations: vec![] }],
+            reversible: false,
+            side_effect: false,
+            rate_limit: None,
+            timeout: Some(5.0),
+        });
+    }
     let service_a = MyAgentService {
         ctx: ctx.clone(),
         registries: registries.clone(),
@@ -480,6 +541,7 @@ mod tests {
         let registry = MyRegistryService {
             agents: Arc::new(Mutex::new(HashMap::new())),
             shared_state: Arc::new(Mutex::new(HashMap::new())),
+            peer_registries: Vec::new(),
         };
 
         tokio::spawn(async move {
@@ -505,7 +567,7 @@ mod tests {
                 "test_goal".to_string(),
                 ast::GoalDefinition {
                     body: vec![ast::Statement::Set {
-                        name: "test_res".to_string(),
+                        variable: "test_res".to_string(),
                         value: ast::Expression::Literal(ast::AnnotatedValue::from(
                             ast::Value::Text("hello from remote".to_string()),
                         )),
@@ -518,6 +580,8 @@ mod tests {
                     wait: None,
                     idempotent: false,
                     audit_trail: true,
+                    confirm_with: None,
+                    timeout_confirmation: None,
                     fallback: None,
                 },
             );
@@ -603,7 +667,9 @@ mod tests {
             agent_id: "AgentB".to_string(),
             goal_name: "test_goal".to_string(),
             args: HashMap::new(),
-            result_into: "remote_res".to_string(),
+            timeout: None,
+            signed_by: None,
+            result_into: Some(ast::VariablePath::root("remote_res")),
         };
 
         eval(&call_stmt, ctx_a.clone()).await.unwrap();
@@ -611,6 +677,7 @@ mod tests {
         // Wait for result
         let await_stmt = ast::Statement::Await {
             call_id: "remote_res".to_string(),
+            result_into: None,
         };
         eval(&await_stmt, ctx_a.clone()).await.unwrap();
 
@@ -630,5 +697,61 @@ mod tests {
                 other
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn test_registry_federation() {
+        let _guard = runtime::bastion_test_guard().await;
+        
+        // 1. Start Registry A (Secondary)
+        let addr_a = "http://[::1]:50070";
+        let svc_addr_a = "[::1]:50070".parse().unwrap();
+        let reg_a = MyRegistryService {
+            agents: Arc::new(Mutex::new(HashMap::new())),
+            shared_state: Arc::new(Mutex::new(HashMap::new())),
+            peer_registries: Vec::new(),
+        };
+        tokio::spawn(async move {
+            let _ = Server::builder().add_service(RegistryServiceServer::new(reg_a)).serve(svc_addr_a).await;
+        });
+
+        // 2. Start Registry B (Primary, with A as peer)
+        let addr_b = "http://[::1]:50071";
+        let svc_addr_b = "[::1]:50071".parse().unwrap();
+        let reg_b = MyRegistryService {
+            agents: Arc::new(Mutex::new(HashMap::new())),
+            shared_state: Arc::new(Mutex::new(HashMap::new())),
+            peer_registries: vec![addr_a.to_string()],
+        };
+        tokio::spawn(async move {
+            let _ = Server::builder().add_service(RegistryServiceServer::new(reg_b)).serve(svc_addr_b).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // 3. Register Agent X in Registry A
+        let ctx_x = runtime::Context::new();
+        let agent_id = "AgentX".to_string();
+        let endpoint = "http://[::1]:50072".to_string();
+        let payload = format!("{}:{}", agent_id, endpoint);
+        let signature = ctx_x.identity.signing_key.sign(payload.as_bytes()).to_bytes().to_vec();
+
+        let mut client_a = RegistryServiceClient::connect(addr_a.to_string()).await.unwrap();
+        client_a.register_agent(RegisterRequest {
+            agent_id: agent_id.clone(),
+            endpoint,
+            public_key: ctx_x.identity.verifying_key.to_bytes().to_vec(),
+            signature,
+        }).await.unwrap();
+
+        // 4. Lookup Agent X via Registry B
+        let mut client_b = RegistryServiceClient::connect(addr_b.to_string()).await.unwrap();
+        let res = client_b.lookup_agent(LookupRequest {
+            agent_id: agent_id.clone(),
+            ttl: 3,
+        }).await.unwrap().into_inner();
+
+        assert!(res.found);
+        assert_eq!(res.endpoint, "http://[::1]:50072");
     }
 }
