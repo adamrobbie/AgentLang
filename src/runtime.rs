@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use tokio::sync::broadcast;
 use tokio::time::{Duration, sleep};
-use wasmtime::*;
+use wasmtime::{Engine, Linker, Module, Store, Val, ValType};
 
 pub fn ensure_bastion_started() {
     static BASTION_START: Once = Once::new();
@@ -293,8 +293,7 @@ pub struct Context {
     pub proofs: Arc<Mutex<HashMap<String, crypto::StarkProof>>>,
     pub goals: Arc<Mutex<HashMap<String, GoalDefinition>>>,
     pub registries: Arc<Mutex<Vec<String>>>,
-    pub pending_calls:
-        Arc<Mutex<HashMap<String, tokio::sync::oneshot::Receiver<Result<AnnotatedValue>>>>>,
+    pub pending_calls: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Receiver<AnnotatedValue>>>>,
 }
 
 #[derive(Clone)]
@@ -707,6 +706,123 @@ async fn store_goal_result(ctx: &Context, goal_name: &str, result: AnnotatedValu
 
     if let Some(value) = flat_result {
         ctx.set_variable(format!("{}.result", goal_name), value, MemoryScope::Working)
+            .await?;
+    }
+
+    Ok(())
+}
+
+fn build_pending_call_envelope(
+    call_id: &str,
+    agent_id: &str,
+    goal_name: &str,
+    args: &HashMap<String, AnnotatedValue>,
+) -> AnnotatedValue {
+    let mut fields = HashMap::new();
+    fields.insert(
+        "call_id".to_string(),
+        AnnotatedValue::from(Value::Text(call_id.to_string())),
+    );
+    fields.insert(
+        "agent_id".to_string(),
+        AnnotatedValue::from(Value::Text(agent_id.to_string())),
+    );
+    fields.insert(
+        "goal_name".to_string(),
+        AnnotatedValue::from(Value::Text(goal_name.to_string())),
+    );
+    fields.insert(
+        "status".to_string(),
+        AnnotatedValue::from(Value::Text("pending".to_string())),
+    );
+    fields.insert(
+        "args".to_string(),
+        AnnotatedValue::from(Value::Object(args.clone())),
+    );
+    fields.insert("result".to_string(), AnnotatedValue::from(Value::Null));
+    AnnotatedValue::from(Value::Object(fields))
+}
+
+fn build_completed_call_envelope(
+    call_id: &str,
+    agent_id: &str,
+    goal_name: &str,
+    args: &HashMap<String, AnnotatedValue>,
+    result: AnnotatedValue,
+) -> AnnotatedValue {
+    let mut fields = HashMap::new();
+    fields.insert(
+        "call_id".to_string(),
+        AnnotatedValue::from(Value::Text(call_id.to_string())),
+    );
+    fields.insert(
+        "agent_id".to_string(),
+        AnnotatedValue::from(Value::Text(agent_id.to_string())),
+    );
+    fields.insert(
+        "goal_name".to_string(),
+        AnnotatedValue::from(Value::Text(goal_name.to_string())),
+    );
+    fields.insert(
+        "status".to_string(),
+        AnnotatedValue::from(Value::Text("completed".to_string())),
+    );
+    fields.insert(
+        "args".to_string(),
+        AnnotatedValue::from(Value::Object(args.clone())),
+    );
+    fields.insert("result".to_string(), result);
+    AnnotatedValue::from(Value::Object(fields))
+}
+
+fn build_failed_call_envelope(
+    call_id: &str,
+    agent_id: &str,
+    goal_name: &str,
+    args: &HashMap<String, AnnotatedValue>,
+    error: &str,
+) -> AnnotatedValue {
+    let mut fields = HashMap::new();
+    fields.insert(
+        "call_id".to_string(),
+        AnnotatedValue::from(Value::Text(call_id.to_string())),
+    );
+    fields.insert(
+        "agent_id".to_string(),
+        AnnotatedValue::from(Value::Text(agent_id.to_string())),
+    );
+    fields.insert(
+        "goal_name".to_string(),
+        AnnotatedValue::from(Value::Text(goal_name.to_string())),
+    );
+    fields.insert(
+        "status".to_string(),
+        AnnotatedValue::from(Value::Text("error".to_string())),
+    );
+    fields.insert(
+        "args".to_string(),
+        AnnotatedValue::from(Value::Object(args.clone())),
+    );
+    fields.insert(
+        "error".to_string(),
+        AnnotatedValue::from(Value::Text(error.to_string())),
+    );
+    fields.insert("result".to_string(), AnnotatedValue::from(Value::Null));
+    AnnotatedValue::from(Value::Object(fields))
+}
+
+async fn store_call_result(ctx: &Context, call_id: &str, envelope: AnnotatedValue) -> Result<()> {
+    let flat_result = if let Value::Object(fields) = &envelope.value {
+        fields.get("result").cloned()
+    } else {
+        None
+    };
+
+    ctx.set_variable(call_id.to_string(), envelope, MemoryScope::Working)
+        .await?;
+
+    if let Some(value) = flat_result {
+        ctx.set_variable(format!("{}.result", call_id), value, MemoryScope::Working)
             .await?;
     }
 
@@ -1559,7 +1675,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 agent_id, goal_name
             );
 
-            // 1. Check for protected arguments FIRST (Privacy / verification policy)
+            let mut evaluated_args = HashMap::new();
             let mut rpc_args = HashMap::new();
             for (k, expr) in args {
                 let val = eval_expression(expr, &ctx).await?;
@@ -1567,8 +1683,13 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                     &val,
                     &format!("send argument '{}' to agent '{}'", k, agent_id),
                 )?;
-                rpc_args.insert(k.clone(), format!("{:?}", val.value));
+                rpc_args.insert(k.clone(), serde_json::to_string(&val)?);
+                evaluated_args.insert(k.clone(), val);
             }
+
+            let pending_envelope =
+                build_pending_call_envelope(result_into, agent_id, goal_name, &evaluated_args);
+            store_call_result(&ctx, result_into, pending_envelope).await?;
 
             let (tx, rx) = tokio::sync::oneshot::channel();
             ctx.pending_calls
@@ -1579,10 +1700,11 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             let ctx_clone = ctx.clone();
             let agent_id_clone = agent_id.clone();
             let goal_name_clone = goal_name.clone();
+            let result_into_clone = result_into.clone();
+            let evaluated_args_clone = evaluated_args.clone();
 
             tokio::spawn(async move {
-                let res = async {
-                    // 2. Lookup agent in registry (Federated lookup)
+                let envelope_result: Result<AnnotatedValue> = async {
                     let mut lookup_res = None;
                     let registries = ctx_clone.registries.lock().unwrap().clone();
 
@@ -1610,8 +1732,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                         )
                     })?;
 
-                    // 3. Prepare sign
-                    let caller_id = "PrimaryOrchestrator".to_string(); // In a real system, this comes from context
+                    let caller_id = "PrimaryOrchestrator".to_string();
                     let payload = format!("{}:{}", goal_name_clone, caller_id);
                     let signature = ctx_clone
                         .identity
@@ -1634,7 +1755,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
 
                     let response = agent_client
                         .call_goal(CallRequest {
-                            goal_name: goal_name_clone,
+                            goal_name: goal_name_clone.clone(),
                             args: rpc_args,
                             caller_id,
                             signature,
@@ -1643,15 +1764,41 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                         .into_inner();
 
                     if response.success {
-                        serde_json::from_str::<AnnotatedValue>(&response.result_json).or_else(
-                            |_| Ok(AnnotatedValue::from(Value::Text(response.result_json))),
-                        )
+                        let result = serde_json::from_str::<AnnotatedValue>(&response.result_json)
+                            .or_else(|_| {
+                                Ok::<AnnotatedValue, serde_json::Error>(AnnotatedValue::from(
+                                    Value::Text(response.result_json.clone()),
+                                ))
+                            })?;
+                        Ok(build_completed_call_envelope(
+                            &result_into_clone,
+                            &agent_id_clone,
+                            &goal_name_clone,
+                            &evaluated_args_clone,
+                            result,
+                        ))
                     } else {
-                        Err(anyhow!("Remote execution failed: {}", response.result_json))
+                        Ok(build_failed_call_envelope(
+                            &result_into_clone,
+                            &agent_id_clone,
+                            &goal_name_clone,
+                            &evaluated_args_clone,
+                            &response.result_json,
+                        ))
                     }
                 }
                 .await;
-                let _ = tx.send(res);
+
+                let envelope = envelope_result.unwrap_or_else(|e| {
+                    build_failed_call_envelope(
+                        &result_into_clone,
+                        &agent_id_clone,
+                        &goal_name_clone,
+                        &evaluated_args_clone,
+                        &e.to_string(),
+                    )
+                });
+                let _ = tx.send(envelope);
             });
 
             Ok(())
@@ -1665,17 +1812,16 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 .remove(call_id)
                 .ok_or_else(|| anyhow!("No pending call found for ID '{}'", call_id))?;
 
-            let result = rx
+            let envelope = rx
                 .await
-                .map_err(|_| anyhow!("Call task for '{}' panicked or was dropped", call_id))??;
+                .map_err(|_| anyhow!("Call task for '{}' panicked or was dropped", call_id))?;
 
             println!(
-                "  [Runtime] AWAIT SUCCESS for '{}': {}",
+                "  [Runtime] AWAIT RESOLVED for '{}': {}",
                 call_id,
-                format_value_safe(&result)
+                format_value_safe(&envelope)
             );
-            ctx.set_variable(call_id.clone(), result, MemoryScope::Working)
-                .await?;
+            store_call_result(&ctx, call_id, envelope).await?;
             Ok(())
         }
     }
@@ -2530,6 +2676,129 @@ mod tests {
             eval_expression(&result_expr, &ctx).await.unwrap().value,
             Value::Text("done".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_pending_call_envelope_has_pending_status_and_null_result() {
+        let args = HashMap::from([(
+            "amount".to_string(),
+            AnnotatedValue::from(Value::Number(42.0)),
+        )]);
+
+        let envelope = build_pending_call_envelope("call_1", "AgentB", "pay", &args);
+        match envelope.value {
+            Value::Object(fields) => {
+                assert_eq!(
+                    fields.get("status").unwrap().value,
+                    Value::Text("pending".to_string())
+                );
+                assert_eq!(
+                    fields.get("call_id").unwrap().value,
+                    Value::Text("call_1".to_string())
+                );
+                assert_eq!(fields.get("result").unwrap().value, Value::Null);
+                match &fields.get("args").unwrap().value {
+                    Value::Object(arg_fields) => {
+                        assert_eq!(arg_fields.get("amount").unwrap().value, Value::Number(42.0));
+                    }
+                    other => panic!("expected args object, found {:?}", other),
+                }
+            }
+            other => panic!("expected pending envelope object, found {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_store_call_result_persists_envelope_and_result_alias() {
+        let ctx = Context::new();
+        let nested_result = AnnotatedValue::from(Value::Object(HashMap::from([(
+            "result".to_string(),
+            AnnotatedValue::from(Value::Text("ok".to_string())),
+        )])));
+        let envelope = build_completed_call_envelope(
+            "call_2",
+            "AgentB",
+            "pay",
+            &HashMap::new(),
+            nested_result.clone(),
+        );
+
+        store_call_result(&ctx, "call_2", envelope).await.unwrap();
+
+        let stored = ctx
+            .get_variable("call_2", MemoryScope::Working)
+            .await
+            .unwrap();
+        match stored.value {
+            Value::Object(fields) => {
+                assert_eq!(
+                    fields.get("status").unwrap().value,
+                    Value::Text("completed".to_string())
+                );
+            }
+            other => panic!("expected stored envelope object, found {:?}", other),
+        }
+
+        let alias = ctx
+            .get_variable("call_2.result", MemoryScope::Working)
+            .await
+            .unwrap();
+        assert_eq!(alias.value, nested_result.value);
+    }
+
+    #[tokio::test]
+    async fn test_await_stores_completed_call_envelope() {
+        let ctx = Context::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ctx.pending_calls
+            .lock()
+            .unwrap()
+            .insert("call_3".to_string(), rx);
+
+        let completed = build_completed_call_envelope(
+            "call_3",
+            "AgentB",
+            "pay",
+            &HashMap::new(),
+            AnnotatedValue::from(Value::Object(HashMap::from([(
+                "result".to_string(),
+                AnnotatedValue::from(Value::Text("done".to_string())),
+            )]))),
+        );
+
+        tx.send(completed).unwrap();
+
+        eval(
+            &Statement::Await {
+                call_id: "call_3".to_string(),
+            },
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let stored = ctx
+            .get_variable("call_3", MemoryScope::Working)
+            .await
+            .unwrap();
+        match stored.value {
+            Value::Object(fields) => {
+                assert_eq!(
+                    fields.get("status").unwrap().value,
+                    Value::Text("completed".to_string())
+                );
+                match &fields.get("result").unwrap().value {
+                    Value::Object(result_fields) => {
+                        assert_eq!(
+                            result_fields.get("result").unwrap().value,
+                            Value::Text("done".to_string())
+                        );
+                    }
+                    other => panic!("expected nested result object, found {:?}", other),
+                }
+            }
+            other => panic!("expected completed envelope object, found {:?}", other),
+        }
     }
 
     #[tokio::test]
