@@ -490,7 +490,8 @@ fn parse_parallel(input: &str) -> IResult<&str, Statement> {
         ),
         |(_, branches, pattern, result_into, deadline, _)| Statement::Parallel {
             pattern,
-            branches: vec![branches],
+            // Each top-level statement in a PARALLEL block becomes its own concurrent branch.
+            branches: branches.into_iter().map(|s| vec![s]).collect(),
             result_into: Some(result_into),
             deadline,
         },
@@ -1044,7 +1045,7 @@ fn parse_await(input: &str) -> IResult<&str, Statement> {
                 ws(delimited(char('{'), parse_variable_path, char('}'))),
             )),
         ),
-        |(call_id, _, result_into)| Statement::Await {
+        |(_, call_id, result_into)| Statement::Await {
             call_id: call_id.to_string(),
             result_into,
         },

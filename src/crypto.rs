@@ -1,3 +1,4 @@
+use ring::digest;
 use serde::{Deserialize, Serialize};
 use winter_crypto::{DefaultRandomCoin, MerkleTree, hashers::Blake3_256};
 use winterfell::{
@@ -187,11 +188,13 @@ pub struct StarkProof {
 }
 
 fn hash_claim(claim: &str) -> BaseElement {
-    let mut h: u128 = 0;
-    for b in claim.as_bytes() {
-        h = h.wrapping_add(*b as u128).wrapping_mul(31);
-    }
-    BaseElement::new(h)
+    // Use SHA-256 to produce a collision-resistant hash of the claim string,
+    // then fold it into a u64 to safely fit within BaseElement's field modulus.
+    let hash = digest::digest(&digest::SHA256, claim.as_bytes());
+    let bytes = hash.as_ref();
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(&bytes[..8]);
+    BaseElement::new(u64::from_be_bytes(arr) as u128)
 }
 
 pub fn generate_proof(n: usize, claim: &str) -> anyhow::Result<StarkProof> {

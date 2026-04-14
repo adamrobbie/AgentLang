@@ -67,7 +67,7 @@ pub struct Identity {
 
 impl Identity {
     pub fn generate() -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut bytes = [0u8; 32];
         rng.fill_bytes(&mut bytes);
         let signing_key = SigningKey::from_bytes(&bytes);
@@ -302,10 +302,13 @@ pub trait MemoryBackend: Send + Sync {
         session_key: &aead::LessSafeKey,
         memory: HashMap<String, AnnotatedValue>,
     ) -> Result<()>;
+    /// Perform a fuzzy search over `memory` for a key matching `query`.
+    /// Only results with a confidence score >= `threshold` (default 0.0) are returned.
     fn fuzzy_search(
         &self,
         query: &str,
         memory: &HashMap<String, AnnotatedValue>,
+        threshold: Option<f64>,
     ) -> Result<Option<AnnotatedValue>>;
 }
 
@@ -352,7 +355,7 @@ impl MemoryBackend for JsonFileBackend {
         for (k, v) in memory {
             if v.is_sensitive {
                 let mut nonce_bytes = [0u8; 12];
-                rand::thread_rng().fill_bytes(&mut nonce_bytes);
+                rand::rng().fill_bytes(&mut nonce_bytes);
                 let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
 
                 let mut in_out = serde_json::to_vec(&v)?;
@@ -380,13 +383,18 @@ impl MemoryBackend for JsonFileBackend {
         &self,
         query: &str,
         memory: &HashMap<String, AnnotatedValue>,
+        threshold: Option<f64>,
     ) -> Result<Option<AnnotatedValue>> {
-        // Prototype: Substring match. In Phase 9 production this would be pgvector.
+        // Prototype: substring key match. Production would use a vector similarity search.
+        let min_confidence = threshold.unwrap_or(0.0);
         for (k, v) in memory {
             if k.contains(query) {
-                let mut val = v.clone();
-                val.confidence = Some(0.85);
-                return Ok(Some(val));
+                let confidence = 0.85;
+                if confidence >= min_confidence {
+                    let mut val = v.clone();
+                    val.confidence = Some(confidence);
+                    return Ok(Some(val));
+                }
             }
         }
         Ok(None)
@@ -403,6 +411,10 @@ pub struct Context {
     pub long_term_backend: Arc<Box<dyn MemoryBackend>>,
     pub shared_backend: Arc<Box<dyn MemoryBackend>>,
     pub identity: Arc<Identity>,
+    /// The human-readable agent ID this context is registered under.
+    /// Defaults to a hex prefix of the verifying key; should be updated
+    /// after successful registry registration.
+    pub agent_id: Arc<Mutex<String>>,
     pub active_contracts: Arc<Mutex<HashMap<String, ContractInfo>>>,
     pub event_tx: broadcast::Sender<Event>,
     pub audit_chain: Arc<Mutex<AuditChain>>,
@@ -423,7 +435,8 @@ pub struct ContractInfo {
     pub capabilities: Vec<Permission>,
     pub budget: Option<f64>,
     pub requires_confirmation: bool,
-    pub expires: Option<f64>,
+    /// Absolute Unix timestamp (seconds) at which this contract expires, if any.
+    pub expires_at: Option<u64>,
 }
 
 impl Context {
@@ -443,11 +456,11 @@ impl Context {
             if existing_key.len() == 32 {
                 key_bytes.copy_from_slice(&existing_key);
             } else {
-                rand::thread_rng().fill_bytes(&mut key_bytes);
+                rand::rng().fill_bytes(&mut key_bytes);
                 let _ = fs::write(key_file, key_bytes);
             }
         } else {
-            rand::thread_rng().fill_bytes(&mut key_bytes);
+            rand::rng().fill_bytes(&mut key_bytes);
             let _ = fs::write(key_file, key_bytes);
         }
         let unbound_key = aead::UnboundKey::new(&aead::AES_256_GCM, &key_bytes).unwrap();
@@ -476,6 +489,10 @@ impl Context {
             let _ = fs::write(id_file, id.signing_key.to_bytes());
             id
         };
+
+        // Default agent ID derived from the verifying key so each instance has a
+        // stable unique identifier even before registry registration.
+        let default_agent_id = hex::encode(&identity.verifying_key.to_bytes()[..4]);
 
         let mut wasm_config = wasmtime::Config::new();
         wasm_config.consume_fuel(true);
@@ -509,6 +526,7 @@ impl Context {
                 },
             })),
             identity: Arc::new(identity),
+            agent_id: Arc::new(Mutex::new(default_agent_id)),
             active_contracts: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
             audit_chain: Arc::new(Mutex::new(AuditChain::new({
@@ -546,14 +564,14 @@ impl Context {
             MemoryScope::Working => self
                 .working_variables
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .get(name)
                 .cloned()
                 .ok_or_else(|| anyhow!("Working variable '{}' not found", name)),
             MemoryScope::Session => self
                 .session_variables
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .get(name)
                 .cloned()
                 .ok_or_else(|| anyhow!("Session variable '{}' not found", name)),
@@ -565,7 +583,11 @@ impl Context {
                     .ok_or_else(|| anyhow!("Long-term variable '{}' not found", name))
             }
             MemoryScope::Shared => {
-                let registries = self.registries.lock().unwrap().clone();
+                let registries = self
+                    .registries
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 for reg_addr in registries {
                     if let Ok(mut client) = RegistryServiceClient::connect(reg_addr).await
                         && let Ok(res) = client
@@ -590,17 +612,23 @@ impl Context {
     }
 
     pub fn check_contracts(&self, required_capability: &str) -> Result<()> {
-        let contracts = self.active_contracts.lock().unwrap();
+        let contracts = self.active_contracts.lock().unwrap_or_else(|e| e.into_inner());
         if contracts.is_empty() {
             return Ok(());
         }
 
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         let mut allowed = false;
         for (name, info) in contracts.iter() {
-            if let Some(expiry) = info.expires
-                && expiry <= 0.0
-            {
-                continue;
+            // Skip contracts that have passed their absolute expiry timestamp.
+            if let Some(expires_at) = info.expires_at {
+                if expires_at <= now {
+                    continue;
+                }
             }
 
             for perm in &info.capabilities {
@@ -637,7 +665,10 @@ impl Context {
         scope: MemoryScope,
     ) -> Result<()> {
         {
-            let mut audit = self.audit_chain.lock().unwrap();
+            let mut audit = self
+                .audit_chain
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             audit.append(format!(
                 "SET:{}:{:?}:{}",
                 name,
@@ -647,10 +678,16 @@ impl Context {
         }
         match scope {
             MemoryScope::Working => {
-                self.working_variables.lock().unwrap().insert(name, value);
+                self.working_variables
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(name, value);
             }
             MemoryScope::Session => {
-                self.session_variables.lock().unwrap().insert(name, value);
+                self.session_variables
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(name, value);
             }
             MemoryScope::LongTerm => {
                 let mut memory = self.long_term_backend.load(&self.session_key)?;
@@ -659,7 +696,11 @@ impl Context {
             }
             MemoryScope::Shared => {
                 let value_json = serde_json::to_vec(&value)?;
-                let registries = self.registries.lock().unwrap().clone();
+                let registries = self
+                    .registries
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 let mut success = false;
                 for reg_addr in registries {
                     if let Ok(mut client) = RegistryServiceClient::connect(reg_addr).await
@@ -1163,7 +1204,6 @@ fn classify_goal_failure(error: &anyhow::Error) -> GoalFailureType {
     }
 }
 
-#[allow(unused_variables)]
 #[async_recursion]
 pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
     match statement {
@@ -1178,31 +1218,34 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             wait,
             idempotent,
             audit_trail,
-            confirm_with,
-            timeout_confirmation,
+            confirm_with: _confirm_with,         // TODO: implement human-in-the-loop confirmation
+            timeout_confirmation: _timeout_confirmation, // TODO: implement confirmation timeout
             fallback,
         } => {
             println!("  [Runtime] Goal: {}", name);
-            ctx.goals.lock().unwrap().insert(
-                name.clone(),
-                GoalDefinition {
-                    body: body.clone(),
-                    outputs: outputs.clone(),
-                    result_into: result_into.clone(),
-                    retry: retry.map(|n| n as usize),
-                    on_fail: on_fail.clone(),
-                    deadline: *deadline,
-                    wait: *wait,
-                    idempotent: *idempotent,
-                    audit_trail: *audit_trail,
-                    confirm_with: confirm_with.clone(),
-                    timeout_confirmation: *timeout_confirmation,
-                    fallback: None,
-                },
-            );
+            ctx.goals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    name.clone(),
+                    GoalDefinition {
+                        body: body.clone(),
+                        outputs: outputs.clone(),
+                        result_into: result_into.clone(),
+                        retry: retry.map(|n| n as usize),
+                        on_fail: on_fail.clone(),
+                        deadline: *deadline,
+                        wait: *wait,
+                        idempotent: *idempotent,
+                        audit_trail: *audit_trail,
+                        confirm_with: None,
+                        timeout_confirmation: None,
+                        fallback: None,
+                    },
+                );
 
             if *idempotent {
-                let audit = ctx.audit_chain.lock().unwrap();
+                let audit = ctx.audit_chain.lock().unwrap_or_else(|e| e.into_inner());
                 if audit
                     .entries
                     .iter()
@@ -1257,7 +1300,10 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
 
                             store_goal_result(&ctx_clone, &name_clone, goal_result).await?;
                             if audit_enabled {
-                                let mut audit = ctx_clone.audit_chain.lock().unwrap();
+                                let mut audit = ctx_clone
+                                    .audit_chain
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
                                 audit.append(format!("GOAL_SUCCESS:{}", name_clone));
                             }
                             return Ok::<(), anyhow::Error>(());
@@ -1381,7 +1427,10 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                         _ => 60, // Default to 1 minute
                     };
 
-                    let mut timestamps = ctx.tool_call_timestamps.lock().unwrap();
+                    let mut timestamps = ctx
+                        .tool_call_timestamps
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
                     let calls = timestamps.entry(tool_name.clone()).or_default();
                     let now = std::time::Instant::now();
 
@@ -1450,7 +1499,10 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             // 4. Execute (Native or Mock)
             let execution_future = async {
                 let handler = {
-                    let handlers = ctx.tool_handlers.lock().unwrap();
+                    let handlers = ctx
+                        .tool_handlers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
                     handlers.get(tool_name).cloned()
                 };
 
@@ -1493,7 +1545,10 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 Ok(val) => {
                     // 5. Audit Trail for Side Effects
                     if tool.side_effect {
-                        let mut audit = ctx.audit_chain.lock().unwrap();
+                        let mut audit = ctx
+                            .audit_chain
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
                         audit.append(format!("TOOL_EXEC:{}:{:?}", tool_name, evaluated_args));
                     }
                     val
@@ -1521,11 +1576,19 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 let branch_index = i;
                 join_set.spawn(async move {
                     // Track variable changes in this branch
-                    let vars_before = ctx_clone.working_variables.lock().unwrap().clone();
+                    let vars_before = ctx_clone
+                        .working_variables
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
                     for stmt in &branch_clone {
                         eval(stmt, ctx_clone.clone()).await?;
                     }
-                    let vars_after = ctx_clone.working_variables.lock().unwrap().clone();
+                    let vars_after = ctx_clone
+                        .working_variables
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
                     let mut changes = HashMap::new();
                     for (k, v) in vars_after {
                         if vars_before.get(&k) != Some(&v) {
@@ -1566,6 +1629,8 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                     ParallelPattern::Race => {
                         while let Some(res) = join_set.join_next().await {
                             if let Ok(Ok((idx, changes))) = res {
+                                join_set.abort_all();
+                                while join_set.join_next().await.is_some() {}
                                 results.insert(
                                     "winner".to_string(),
                                     AnnotatedValue::from(Value::Number(idx as f64)),
@@ -1589,6 +1654,9 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                                 );
                                 success_count += 1;
                                 if success_count >= n {
+                                    // We have enough results; cancel remaining tasks.
+                                    join_set.abort_all();
+                                    while join_set.join_next().await.is_some() {}
                                     break;
                                 }
                             }
@@ -1645,6 +1713,11 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 rpc_args.insert(k.clone(), format!("{:?}", val.value));
             }
 
+            let caller_id = ctx
+                .agent_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             let ctx_clone = ctx.clone();
             let agent_id_clone = agent_id.clone();
             let goal_name_clone = goal_name.clone();
@@ -1652,7 +1725,11 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             tokio::spawn(async move {
                 let _ = async {
                     let mut lookup_res = None;
-                    let registries = ctx_clone.registries.lock().unwrap().clone();
+                    let registries = ctx_clone
+                        .registries
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
 
                     for reg_addr in registries {
                         if let Ok(mut reg_client) =
@@ -1673,7 +1750,6 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                     }
 
                     if let Some(lookup_data) = lookup_res {
-                        let caller_id = "PrimaryOrchestrator".to_string();
                         let payload = format!("{}:{}", goal_name_clone, caller_id);
                         let signature = ctx_clone
                             .identity
@@ -1745,7 +1821,10 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             Ok(())
         }
         Statement::Remember {
-            name, value, scope, ..
+            name,
+            value,
+            scope,
+            expires,
         } => {
             let val = eval_expression(value, &ctx).await?;
             if *scope == MemoryScope::Shared {
@@ -1755,6 +1834,44 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 )?;
             }
             ctx.set_variable(name.clone(), val, *scope).await?;
+
+            // Schedule automatic removal after the requested duration.
+            if let Some(expires_secs) = expires {
+                let ctx_clone = ctx.clone();
+                let name_clone = name.clone();
+                let scope_clone = *scope;
+                let delay = *expires_secs;
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+                    match scope_clone {
+                        MemoryScope::Working => {
+                            ctx_clone
+                                .working_variables
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&name_clone);
+                        }
+                        MemoryScope::Session => {
+                            ctx_clone
+                                .session_variables
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&name_clone);
+                        }
+                        MemoryScope::LongTerm => {
+                            if let Ok(mut memory) =
+                                ctx_clone.long_term_backend.load(&ctx_clone.session_key)
+                            {
+                                memory.remove(&name_clone);
+                                let _ = ctx_clone
+                                    .long_term_backend
+                                    .save(&ctx_clone.session_key, memory);
+                            }
+                        }
+                        MemoryScope::Shared => {} // Shared expiry is not supported via current registry protocol
+                    }
+                });
+            }
             Ok(())
         }
         Statement::Recall {
@@ -1763,21 +1880,32 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             scope,
             on_missing,
             fuzzy,
-            ..
+            threshold,
         } => {
             let result = if *fuzzy {
+                // Fuzzy search over Shared scope is not supported because the registry
+                // protocol only provides point lookups, not full key enumeration.
+                if *scope == MemoryScope::Shared {
+                    return Err(anyhow!(
+                        "Fuzzy RECALL is not supported for Shared scope; use exact RECALL instead"
+                    ));
+                }
                 let memory: HashMap<String, AnnotatedValue> = match scope {
-                    MemoryScope::Working => ctx.working_variables.lock().unwrap().clone(),
-                    MemoryScope::Session => ctx.session_variables.lock().unwrap().clone(),
+                    MemoryScope::Working => ctx
+                        .working_variables
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone(),
+                    MemoryScope::Session => ctx
+                        .session_variables
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone(),
                     MemoryScope::LongTerm => ctx.long_term_backend.load(&ctx.session_key)?,
-                    _ => HashMap::new(),
+                    MemoryScope::Shared => unreachable!(),
                 };
-                let backend = match scope {
-                    MemoryScope::LongTerm => ctx.long_term_backend.clone(),
-                    _ => ctx.long_term_backend.clone(), // Default to long_term's fuzzy logic for working/session
-                };
-                backend
-                    .fuzzy_search(name, &memory)?
+                ctx.long_term_backend
+                    .fuzzy_search(name, &memory, *threshold)?
                     .ok_or_else(|| anyhow!("Fuzzy match not found"))
             } else {
                 ctx.get_variable(name, *scope).await
@@ -1804,17 +1932,28 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
         Statement::Forget { name, scope } => {
             match scope {
                 MemoryScope::Working => {
-                    ctx.working_variables.lock().unwrap().remove(name);
+                    ctx.working_variables
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(name);
                 }
                 MemoryScope::Session => {
-                    ctx.session_variables.lock().unwrap().remove(name);
+                    ctx.session_variables
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(name);
                 }
                 MemoryScope::LongTerm => {
                     let mut memory = ctx.long_term_backend.load(&ctx.session_key)?;
                     memory.remove(name);
                     ctx.long_term_backend.save(&ctx.session_key, memory)?;
                 }
-                _ => return Err(anyhow!("Not implemented")),
+                MemoryScope::Shared => {
+                    return Err(anyhow!(
+                        "FORGET for Shared scope is not supported: \
+                         the registry protocol does not provide a delete operation"
+                    ));
+                }
             }
             Ok(())
         }
@@ -1827,16 +1966,28 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             requires_confirmation,
             expires,
         } => {
-            ctx.active_contracts.lock().unwrap().insert(
-                name.clone(),
-                ContractInfo {
-                    issued_by: issued_by.clone(),
-                    capabilities: capabilities.clone(),
-                    budget: *budget,
-                    requires_confirmation: *requires_confirmation,
-                    expires: *expires,
-                },
-            );
+            // Convert the duration-based `expires` field to an absolute Unix timestamp
+            // so that check_contracts can correctly compare against the current time.
+            let expires_at = expires.map(|duration_secs| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .saturating_add(duration_secs as u64)
+            });
+            ctx.active_contracts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    name.clone(),
+                    ContractInfo {
+                        issued_by: issued_by.clone(),
+                        capabilities: capabilities.clone(),
+                        budget: *budget,
+                        requires_confirmation: *requires_confirmation,
+                        expires_at,
+                    },
+                );
             Ok(())
         }
         Statement::Emit { event, data } => {
@@ -1896,7 +2047,10 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
 
             let mut state_repr = String::new();
             {
-                let vars = ctx.working_variables.lock().unwrap();
+                let vars = ctx
+                    .working_variables
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 let mut keys: Vec<_> = vars.keys().collect();
                 keys.sort();
                 for k in keys {
@@ -1916,7 +2070,10 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             }
 
             let proof = crypto::generate_proof(steps, claim)?;
-            ctx.proofs.lock().unwrap().insert(proof_name.clone(), proof);
+            ctx.proofs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(proof_name.clone(), proof);
             Ok(())
         }
         Statement::Reveal {
@@ -1926,7 +2083,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             result_into,
         } => {
             let proof = {
-                let proofs = ctx.proofs.lock().unwrap();
+                let proofs = ctx.proofs.lock().unwrap_or_else(|e| e.into_inner());
                 proofs
                     .get(proof_name)
                     .cloned()
@@ -2095,22 +2252,31 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             if let Some(path) = result_into {
                 ctx.pending_calls
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .insert(path.root.clone(), rx);
             }
 
+            let caller_id = ctx
+                .agent_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             let ctx_clone = ctx.clone();
             let agent_id_clone = agent_id.clone();
             let goal_name_clone = goal_name.clone();
             let timeout_val = *timeout;
-            let _signed_by_val = signed_by.clone();
+            let _signed_by_val = signed_by.clone(); // TODO: verify incoming signature against registered key
             let result_into_clone = call_id_str;
             let evaluated_args_clone = evaluated_args.clone();
 
             tokio::spawn(async move {
                 let res = async {
                     let mut lookup_res = None;
-                    let registries = ctx_clone.registries.lock().unwrap().clone();
+                    let registries = ctx_clone
+                        .registries
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
 
                     for reg_addr in registries {
                         if let Ok(mut reg_client) =
@@ -2137,7 +2303,6 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                         )
                     })?;
 
-                    let caller_id = "PrimaryOrchestrator".to_string();
                     let payload = format!("{}:{}", goal_name_clone, caller_id);
                     let signature = ctx_clone
                         .identity
@@ -2220,7 +2385,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             let rx = ctx
                 .pending_calls
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .remove(call_id)
                 .ok_or_else(|| anyhow!("No pending call found for ID '{}'", call_id))?;
 
@@ -2241,7 +2406,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             println!("  [Runtime] Registering TOOL: {}", def.name);
             ctx.tools
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(def.name.clone(), def.clone());
             Ok(())
         }
@@ -2254,7 +2419,7 @@ mod tests {
 
     #[test]
     fn test_audit_chain() {
-        let file_path = "test_audit.json".to_string();
+        let file_path = unique_test_path("test-audit");
         let _ = fs::remove_file(&file_path);
         let mut chain = AuditChain::new(file_path.clone());
         let h1 = chain.append("OP1".to_string());
