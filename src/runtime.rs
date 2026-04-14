@@ -612,7 +612,10 @@ impl Context {
     }
 
     pub fn check_contracts(&self, required_capability: &str) -> Result<()> {
-        let contracts = self.active_contracts.lock().unwrap_or_else(|e| e.into_inner());
+        let contracts = self
+            .active_contracts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if contracts.is_empty() {
             return Ok(());
         }
@@ -625,10 +628,10 @@ impl Context {
         let mut allowed = false;
         for (name, info) in contracts.iter() {
             // Skip contracts that have passed their absolute expiry timestamp.
-            if let Some(expires_at) = info.expires_at {
-                if expires_at <= now {
-                    continue;
-                }
+            if let Some(expires_at) = info.expires_at
+                && expires_at <= now
+            {
+                continue;
             }
 
             for perm in &info.capabilities {
@@ -665,10 +668,7 @@ impl Context {
         scope: MemoryScope,
     ) -> Result<()> {
         {
-            let mut audit = self
-                .audit_chain
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut audit = self.audit_chain.lock().unwrap_or_else(|e| e.into_inner());
             audit.append(format!(
                 "SET:{}:{:?}:{}",
                 name,
@@ -1218,33 +1218,30 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             wait,
             idempotent,
             audit_trail,
-            confirm_with: _confirm_with,         // TODO: implement human-in-the-loop confirmation
+            confirm_with: _confirm_with, // TODO: implement human-in-the-loop confirmation
             timeout_confirmation: _timeout_confirmation, // TODO: implement confirmation timeout
             fallback,
         } => {
             println!("  [Runtime] Goal: {}", name);
-            ctx.goals
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(
-                    name.clone(),
-                    GoalDefinition {
-                        body: body.clone(),
-                        outputs: outputs.clone(),
-                        result_into: result_into.clone(),
-                        retry: retry.map(|n| n as usize),
-                        on_fail: on_fail.clone(),
-                        deadline: *deadline,
-                        wait: *wait,
-                        idempotent: *idempotent,
-                        audit_trail: *audit_trail,
-                        // Preserve parsed values even though execution of these fields
-                        // is not yet implemented; keeps GoalDefinition consistent with AST.
-                        confirm_with: _confirm_with.clone(),
-                        timeout_confirmation: *_timeout_confirmation,
-                        fallback: None,
-                    },
-                );
+            ctx.goals.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                name.clone(),
+                GoalDefinition {
+                    body: body.clone(),
+                    outputs: outputs.clone(),
+                    result_into: result_into.clone(),
+                    retry: retry.map(|n| n as usize),
+                    on_fail: on_fail.clone(),
+                    deadline: *deadline,
+                    wait: *wait,
+                    idempotent: *idempotent,
+                    audit_trail: *audit_trail,
+                    // Preserve parsed values even though execution of these fields
+                    // is not yet implemented; keeps GoalDefinition consistent with AST.
+                    confirm_with: _confirm_with.clone(),
+                    timeout_confirmation: *_timeout_confirmation,
+                    fallback: None,
+                },
+            );
 
             if *idempotent {
                 let audit = ctx.audit_chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -1501,10 +1498,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             // 4. Execute (Native or Mock)
             let execution_future = async {
                 let handler = {
-                    let handlers = ctx
-                        .tool_handlers
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let handlers = ctx.tool_handlers.lock().unwrap_or_else(|e| e.into_inner());
                     handlers.get(tool_name).cloned()
                 };
 
@@ -1547,10 +1541,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 Ok(val) => {
                     // 5. Audit Trail for Side Effects
                     if tool.side_effect {
-                        let mut audit = ctx
-                            .audit_chain
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
+                        let mut audit = ctx.audit_chain.lock().unwrap_or_else(|e| e.into_inner());
                         audit.append(format!("TOOL_EXEC:{}:{:?}", tool_name, evaluated_args));
                     }
                     val
