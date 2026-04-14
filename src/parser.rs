@@ -1502,5 +1502,18 @@ mod tests {
         // Invalid keyword
         let input = "NOT_A_KEYWORD x = 1";
         assert!(parse_program(input).is_err() || parse_program(input).unwrap().1.is_empty());
+
+        // Malformed SET
+        assert!(parse_set("SET x 1").is_err());
+        
+        // Malformed IF
+        assert!(parse_if("IF true SET x = 1 END").is_ok());
+        assert!(parse_if("IF true SET x = 1").is_err());
+
+        // Malformed REMEMBER
+        assert!(parse_remember("REMEMBER key VALUE").is_err());
+
+        // Malformed RECALL
+        assert!(parse_recall("RECALL key").is_err());
     }
 }

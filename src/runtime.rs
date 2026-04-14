@@ -1282,7 +1282,12 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 };
 
                 if let Some(h) = handler {
-                    h(evaluated_args.clone())
+                    // Use spawn_blocking to ensure we don't freeze the executor
+                    // and allow timeouts to interrupt.
+                    let args_for_spawn = evaluated_args.clone();
+                    tokio::task::spawn_blocking(move || h(args_for_spawn))
+                        .await
+                        .map_err(|e| anyhow!("Tool execution panicked: {}", e))?
                 } else {
                     // Fallback: Mock result based on schema
                     let mut res_fields = HashMap::new();
@@ -2265,5 +2270,186 @@ mod tests {
         };
         let err = eval(&reveal_wrong, ctx.clone()).await.unwrap_err();
         assert!(err.to_string().contains("Proof was not generated for this claim"));
+    }
+
+    #[tokio::test]
+    async fn test_goal_retry_exhaustion() {
+        let _guard = bastion_test_guard().await;
+        ensure_bastion_started();
+        let ctx = Context::new();
+        let goal_stmt = Statement::Goal {
+            name: "fail_forever".to_string(),
+            body: vec![Statement::Recall {
+                name: "nonexistent".to_string(),
+                into_var: "x".to_string(),
+                scope: MemoryScope::Working,
+                on_missing: None,
+                fuzzy: false,
+                threshold: None,
+            }],
+            outputs: vec![],
+            result_into: None,
+            retry: Some(1),
+            on_fail: HashMap::new(),
+            deadline: None,
+            wait: None,
+            idempotent: false,
+            audit_trail: true,
+            confirm_with: None,
+            timeout_confirmation: None,
+            fallback: None,
+        };
+        let res = eval(&goal_stmt, ctx.clone()).await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_goal_idempotency() {
+        let _guard = bastion_test_guard().await;
+        ensure_bastion_started();
+        let ctx = Context::new();
+        let goal_name = "once".to_string();
+        
+        // Mock a success entry in audit log
+        {
+            let mut audit = ctx.audit_chain.lock().unwrap();
+            audit.append(format!("GOAL_SUCCESS:{}", goal_name));
+        }
+
+        let goal_stmt = Statement::Goal {
+            name: goal_name,
+            body: vec![Statement::Set { variable: "run".to_string(), value: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))) }],
+            outputs: vec![],
+            result_into: None,
+            retry: None,
+            on_fail: HashMap::new(),
+            deadline: None,
+            wait: None,
+            idempotent: true,
+            audit_trail: true,
+            confirm_with: None,
+            timeout_confirmation: None,
+            fallback: None,
+        };
+
+        eval(&goal_stmt, ctx.clone()).await.unwrap();
+        // Variable should NOT be set because it skipped
+        assert!(ctx.get_variable("run", MemoryScope::Working).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_tool_rate_limiting() {
+        let ctx = Context::new();
+        let tool_def = ToolDefinition {
+            name: "limited".to_string(),
+            description: None,
+            category: None,
+            version: None,
+            inputs: vec![],
+            outputs: vec![],
+            reversible: false,
+            side_effect: false,
+            rate_limit: Some("1/1m".to_string()),
+            timeout: None,
+        };
+        eval(&Statement::Tool(tool_def), ctx.clone()).await.unwrap();
+
+        let use_stmt = Statement::UseTool { tool_name: "limited".to_string(), args: HashMap::new(), result_into: None };
+        
+        // First call ok
+        eval(&use_stmt, ctx.clone()).await.unwrap();
+        // Second call fails
+        let err = eval(&use_stmt, ctx.clone()).await.unwrap_err();
+        assert!(err.to_string().contains("Rate limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_timeout() {
+        let ctx = Context::new();
+        {
+            let mut handlers = ctx.tool_handlers.lock().unwrap();
+            handlers.insert("slow".to_string(), Arc::new(|_| {
+                // Use a loop to simulate long work that doesn't yield if we're on a single thread
+                // but actually the runtime should be multi-threaded in tests by default.
+                // The issue is likely that timeout needs the future to yield.
+                std::thread::sleep(Duration::from_millis(500));
+                Ok(AnnotatedValue::from(Value::Null))
+            }));
+        }
+        let tool_def = ToolDefinition {
+            name: "slow".to_string(),
+            description: None,
+            category: None,
+            version: None,
+            inputs: vec![],
+            outputs: vec![],
+            reversible: false,
+            side_effect: false,
+            rate_limit: None,
+            timeout: Some(0.01), // Very short timeout
+        };
+        eval(&Statement::Tool(tool_def), ctx.clone()).await.unwrap();
+
+        let use_stmt = Statement::UseTool { tool_name: "slow".to_string(), args: HashMap::new(), result_into: None };
+        let err = eval(&use_stmt, ctx.clone()).await.unwrap_err();
+        assert!(err.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn test_set_variable_path_index_expansion() {
+        let ctx = Context::new();
+        ctx.set_variable("list".to_string(), AnnotatedValue::from(Value::List(vec![])), MemoryScope::Working).await.unwrap();
+        
+        let path = VariablePath {
+            root: "list".to_string(),
+            segments: vec![PathSegment::Index(2)],
+        };
+        ctx.set_variable_path(&path, AnnotatedValue::from(Value::Number(42.0)), MemoryScope::Working).await.unwrap();
+        
+        let val = ctx.get_variable("list", MemoryScope::Working).await.unwrap();
+        if let Value::List(items) = val.value {
+            assert_eq!(items.len(), 3);
+            assert_eq!(items[2].value, Value::Number(42.0));
+            assert_eq!(items[0].value, Value::Null);
+        } else { panic!("Expected list"); }
+    }
+
+    #[tokio::test]
+    async fn test_eval_expression_binary_op_errors() {
+        let ctx = Context::new();
+        let l = Expression::Literal(AnnotatedValue::from(Value::Text("a".to_string())));
+        let r = Expression::Literal(AnnotatedValue::from(Value::Number(1.0)));
+        
+        let expr = Expression::BinaryOp {
+            left: Box::new(l),
+            op: BinaryOperator::Add,
+            right: Box::new(r),
+        };
+        assert!(eval_expression(&expr, &ctx).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_delegate_execution_no_crash() {
+        let ctx = Context::new();
+        let stmt = Statement::Delegate {
+            agent_id: "nonexistent".to_string(),
+            goal_name: "test".to_string(),
+            args: HashMap::new(),
+        };
+        // Should return Ok(()) immediately as it's async fire-and-forget
+        assert!(eval(&stmt, ctx.clone()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_eval_expression_nested_path_errors() {
+        let ctx = Context::new();
+        ctx.set_variable("obj".to_string(), AnnotatedValue::from(Value::Number(1.0)), MemoryScope::Working).await.unwrap();
+        
+        let expr = Expression::VariableRef(VariablePath {
+            root: "obj".to_string(),
+            segments: vec![PathSegment::Field("any".to_string())],
+        });
+        assert!(eval_expression(&expr, &ctx).await.is_err());
     }
 }
