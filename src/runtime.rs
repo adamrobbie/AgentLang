@@ -3002,4 +3002,915 @@ mod tests {
         });
         assert!(eval_expression(&expr, &ctx).await.is_err());
     }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Additional runtime tests for improved coverage
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_remember_and_recall_working() {
+        let ctx = Context::new();
+
+        // REMEMBER in Working scope
+        let remember_stmt = Statement::Remember {
+            name: "city".to_string(),
+            value: Expression::Literal(AnnotatedValue::from(Value::Text("Paris".to_string()))),
+            scope: MemoryScope::Working,
+            expires: None,
+        };
+        eval(&remember_stmt, ctx.clone()).await.unwrap();
+
+        // RECALL from Working scope
+        let recall_stmt = Statement::Recall {
+            name: "city".to_string(),
+            into_var: "recalled_city".to_string(),
+            scope: MemoryScope::Working,
+            on_missing: None,
+            fuzzy: false,
+            threshold: None,
+        };
+        eval(&recall_stmt, ctx.clone()).await.unwrap();
+
+        let val = ctx
+            .get_variable("recalled_city", MemoryScope::Working)
+            .await
+            .unwrap();
+        assert_eq!(val.value, Value::Text("Paris".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_remember_and_recall_session() {
+        let ctx = Context::new();
+
+        let remember_stmt = Statement::Remember {
+            name: "token".to_string(),
+            value: Expression::Literal(AnnotatedValue::from(Value::Text("abc".to_string()))),
+            scope: MemoryScope::Session,
+            expires: None,
+        };
+        eval(&remember_stmt, ctx.clone()).await.unwrap();
+
+        let recall_stmt = Statement::Recall {
+            name: "token".to_string(),
+            into_var: "recalled_token".to_string(),
+            scope: MemoryScope::Session,
+            on_missing: None,
+            fuzzy: false,
+            threshold: None,
+        };
+        eval(&recall_stmt, ctx.clone()).await.unwrap();
+
+        let val = ctx
+            .get_variable("recalled_token", MemoryScope::Working)
+            .await
+            .unwrap();
+        assert_eq!(val.value, Value::Text("abc".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_recall_on_missing_handler() {
+        let ctx = Context::new();
+
+        // Key does not exist; on_missing should provide a default
+        let recall_stmt = Statement::Recall {
+            name: "nonexistent".to_string(),
+            into_var: "result".to_string(),
+            scope: MemoryScope::Working,
+            on_missing: Some(Expression::Literal(AnnotatedValue::from(Value::Text(
+                "default".to_string(),
+            )))),
+            fuzzy: false,
+            threshold: None,
+        };
+        eval(&recall_stmt, ctx.clone()).await.unwrap();
+
+        let val = ctx
+            .get_variable("result", MemoryScope::Working)
+            .await
+            .unwrap();
+        assert_eq!(val.value, Value::Text("default".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_recall_not_found_error() {
+        let ctx = Context::new();
+
+        let recall_stmt = Statement::Recall {
+            name: "missing_key".to_string(),
+            into_var: "x".to_string(),
+            scope: MemoryScope::Working,
+            on_missing: None,
+            fuzzy: false,
+            threshold: None,
+        };
+        let err = eval(&recall_stmt, ctx.clone()).await.unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_forget_working() {
+        let ctx = Context::new();
+        ctx.set_variable(
+            "tmp".to_string(),
+            AnnotatedValue::from(Value::Number(42.0)),
+            MemoryScope::Working,
+        )
+        .await
+        .unwrap();
+
+        let forget_stmt = Statement::Forget {
+            name: "tmp".to_string(),
+            scope: MemoryScope::Working,
+        };
+        eval(&forget_stmt, ctx.clone()).await.unwrap();
+
+        assert!(ctx.get_variable("tmp", MemoryScope::Working).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_forget_session() {
+        let ctx = Context::new();
+        ctx.set_variable(
+            "tok".to_string(),
+            AnnotatedValue::from(Value::Text("x".to_string())),
+            MemoryScope::Session,
+        )
+        .await
+        .unwrap();
+
+        let forget_stmt = Statement::Forget {
+            name: "tok".to_string(),
+            scope: MemoryScope::Session,
+        };
+        eval(&forget_stmt, ctx.clone()).await.unwrap();
+
+        assert!(ctx.get_variable("tok", MemoryScope::Session).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_forget_shared_returns_error() {
+        let ctx = Context::new();
+        let stmt = Statement::Forget {
+            name: "x".to_string(),
+            scope: MemoryScope::Shared,
+        };
+        assert!(eval(&stmt, ctx.clone()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_if_else_execution() {
+        let ctx = Context::new();
+
+        // True branch
+        let if_stmt = Statement::If {
+            condition: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))),
+            then_branch: vec![Statement::Set {
+                variable: "branch".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Text("then".to_string()))),
+            }],
+            else_branch: Some(vec![Statement::Set {
+                variable: "branch".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Text("else".to_string()))),
+            }]),
+        };
+        eval(&if_stmt, ctx.clone()).await.unwrap();
+        let val = ctx
+            .get_variable("branch", MemoryScope::Working)
+            .await
+            .unwrap();
+        assert_eq!(val.value, Value::Text("then".to_string()));
+
+        // False branch
+        let if_stmt_false = Statement::If {
+            condition: Expression::Literal(AnnotatedValue::from(Value::Boolean(false))),
+            then_branch: vec![Statement::Set {
+                variable: "branch".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Text("then".to_string()))),
+            }],
+            else_branch: Some(vec![Statement::Set {
+                variable: "branch".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Text("else".to_string()))),
+            }]),
+        };
+        eval(&if_stmt_false, ctx.clone()).await.unwrap();
+        let val2 = ctx
+            .get_variable("branch", MemoryScope::Working)
+            .await
+            .unwrap();
+        assert_eq!(val2.value, Value::Text("else".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_if_truthy_values() {
+        let ctx = Context::new();
+
+        // Number != 0 is truthy
+        let stmt = Statement::If {
+            condition: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+            then_branch: vec![Statement::Set {
+                variable: "r".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))),
+            }],
+            else_branch: None,
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+        assert_eq!(
+            ctx.get_variable("r", MemoryScope::Working)
+                .await
+                .unwrap()
+                .value,
+            Value::Boolean(true)
+        );
+
+        // Non-empty text is truthy
+        let stmt2 = Statement::If {
+            condition: Expression::Literal(AnnotatedValue::from(Value::Text("hello".to_string()))),
+            then_branch: vec![Statement::Set {
+                variable: "r2".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))),
+            }],
+            else_branch: None,
+        };
+        eval(&stmt2, ctx.clone()).await.unwrap();
+        assert_eq!(
+            ctx.get_variable("r2", MemoryScope::Working)
+                .await
+                .unwrap()
+                .value,
+            Value::Boolean(true)
+        );
+
+        // Null is falsy
+        let stmt3 = Statement::If {
+            condition: Expression::Literal(AnnotatedValue::from(Value::Null)),
+            then_branch: vec![Statement::Set {
+                variable: "r3".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))),
+            }],
+            else_branch: None,
+        };
+        eval(&stmt3, ctx.clone()).await.unwrap();
+        assert!(ctx.get_variable("r3", MemoryScope::Working).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_foreach_execution() {
+        let ctx = Context::new();
+        ctx.set_variable(
+            "sum".to_string(),
+            AnnotatedValue::from(Value::Number(0.0)),
+            MemoryScope::Working,
+        )
+        .await
+        .unwrap();
+
+        // FOREACH item IN [10 20 30] SET last = {item}
+        let stmt = Statement::ForEach {
+            item: "item".to_string(),
+            list: Expression::Literal(AnnotatedValue::from(Value::List(vec![
+                AnnotatedValue::from(Value::Number(10.0)),
+                AnnotatedValue::from(Value::Number(20.0)),
+                AnnotatedValue::from(Value::Number(30.0)),
+            ]))),
+            body: vec![Statement::Set {
+                variable: "last".to_string(),
+                value: Expression::VariableRef(VariablePath::root("item")),
+            }],
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        // After loop, "last" should equal the last element
+        let val = ctx
+            .get_variable("last", MemoryScope::Working)
+            .await
+            .unwrap();
+        assert_eq!(val.value, Value::Number(30.0));
+    }
+
+    #[tokio::test]
+    async fn test_foreach_non_list_error() {
+        let ctx = Context::new();
+        let stmt = Statement::ForEach {
+            item: "item".to_string(),
+            list: Expression::Literal(AnnotatedValue::from(Value::Text("not a list".to_string()))),
+            body: vec![],
+        };
+        assert!(eval(&stmt, ctx.clone()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_repeat_loop_execution() {
+        let ctx = Context::new();
+        ctx.set_variable(
+            "count".to_string(),
+            AnnotatedValue::from(Value::Number(0.0)),
+            MemoryScope::Working,
+        )
+        .await
+        .unwrap();
+
+        // REPEAT UNTIL {count} == 3  — runs body until count reaches 3
+        // We increment count each iteration via a SET
+        // Condition is checked first: loop runs while condition is false, stops when true.
+        let stmt = Statement::Repeat {
+            // Stop when count equals 2 (truthy comparison)
+            condition: Expression::BinaryOp {
+                left: Box::new(Expression::VariableRef(VariablePath::root("count"))),
+                op: BinaryOperator::Eq,
+                right: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                    2.0,
+                )))),
+            },
+            body: vec![Statement::Set {
+                variable: "count".to_string(),
+                value: Expression::BinaryOp {
+                    left: Box::new(Expression::VariableRef(VariablePath::root("count"))),
+                    op: BinaryOperator::Add,
+                    right: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                        1.0,
+                    )))),
+                },
+            }],
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let val = ctx
+            .get_variable("count", MemoryScope::Working)
+            .await
+            .unwrap();
+        assert_eq!(val.value, Value::Number(2.0));
+    }
+
+    #[tokio::test]
+    async fn test_contract_grant_and_check() {
+        let ctx = Context::new();
+
+        // Install a contract granting use of "search_flights"
+        let contract_stmt = Statement::Contract {
+            name: "search_contract".to_string(),
+            issued_by: "authority".to_string(),
+            capabilities: vec![Permission::CanUse("search_flights".to_string())],
+            budget: None,
+            requires_confirmation: false,
+            expires: None,
+        };
+        eval(&contract_stmt, ctx.clone()).await.unwrap();
+
+        // Should allow "search_flights"
+        assert!(ctx.check_contracts("search_flights").is_ok());
+        // Should deny other tools
+        assert!(ctx.check_contracts("delete_database").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_contract_wildcard_permission() {
+        let ctx = Context::new();
+
+        let contract_stmt = Statement::Contract {
+            name: "admin_contract".to_string(),
+            issued_by: "authority".to_string(),
+            capabilities: vec![Permission::CanUse("*".to_string())],
+            budget: None,
+            requires_confirmation: false,
+            expires: None,
+        };
+        eval(&contract_stmt, ctx.clone()).await.unwrap();
+
+        assert!(ctx.check_contracts("any_tool").is_ok());
+        assert!(ctx.check_contracts("another_tool").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_contract_explicit_deny() {
+        let ctx = Context::new();
+
+        let contract_stmt = Statement::Contract {
+            name: "restricted_contract".to_string(),
+            issued_by: "authority".to_string(),
+            capabilities: vec![
+                Permission::CanUse("*".to_string()),
+                Permission::CannotUse("dangerous_tool".to_string()),
+            ],
+            budget: None,
+            requires_confirmation: false,
+            expires: None,
+        };
+        eval(&contract_stmt, ctx.clone()).await.unwrap();
+
+        assert!(ctx.check_contracts("safe_tool").is_ok());
+        assert!(ctx.check_contracts("dangerous_tool").is_err());
+    }
+
+    #[test]
+    fn test_format_value_safe_redacts_sensitive() {
+        let mut val = AnnotatedValue::from(Value::Text("secret".to_string()));
+        val.is_sensitive = true;
+        assert_eq!(format_value_safe(&val), "[REDACTED]");
+    }
+
+    #[test]
+    fn test_format_value_safe_non_sensitive() {
+        let val = AnnotatedValue::from(Value::Number(42.0));
+        let output = format_value_safe(&val);
+        assert!(output.contains("42"));
+    }
+
+    #[test]
+    fn test_format_value_safe_list() {
+        let val = AnnotatedValue::from(Value::List(vec![
+            AnnotatedValue::from(Value::Number(1.0)),
+            AnnotatedValue::from(Value::Number(2.0)),
+        ]));
+        let output = format_value_safe(&val);
+        assert!(output.starts_with('['));
+    }
+
+    #[test]
+    fn test_format_value_safe_object() {
+        let mut fields = HashMap::new();
+        fields.insert("key".to_string(), AnnotatedValue::from(Value::Number(1.0)));
+        let val = AnnotatedValue::from(Value::Object(fields));
+        let output = format_value_safe(&val);
+        assert!(output.contains("key"));
+    }
+
+    #[tokio::test]
+    async fn test_binary_op_sub() {
+        let ctx = Context::new();
+        let expr = Expression::BinaryOp {
+            left: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                10.0,
+            )))),
+            op: BinaryOperator::Sub,
+            right: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                3.0,
+            )))),
+        };
+        assert_eq!(
+            eval_expression(&expr, &ctx).await.unwrap().value,
+            Value::Number(7.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_binary_op_eq() {
+        let ctx = Context::new();
+        let eq_true = Expression::BinaryOp {
+            left: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                5.0,
+            )))),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                5.0,
+            )))),
+        };
+        assert_eq!(
+            eval_expression(&eq_true, &ctx).await.unwrap().value,
+            Value::Boolean(true)
+        );
+
+        let eq_false = Expression::BinaryOp {
+            left: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                5.0,
+            )))),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                6.0,
+            )))),
+        };
+        assert_eq!(
+            eval_expression(&eq_false, &ctx).await.unwrap().value,
+            Value::Boolean(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_binary_op_gt_lt() {
+        let ctx = Context::new();
+
+        let gt_expr = Expression::BinaryOp {
+            left: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                10.0,
+            )))),
+            op: BinaryOperator::Gt,
+            right: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                5.0,
+            )))),
+        };
+        assert_eq!(
+            eval_expression(&gt_expr, &ctx).await.unwrap().value,
+            Value::Boolean(true)
+        );
+
+        let lt_expr = Expression::BinaryOp {
+            left: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                3.0,
+            )))),
+            op: BinaryOperator::Lt,
+            right: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                10.0,
+            )))),
+        };
+        assert_eq!(
+            eval_expression(&lt_expr, &ctx).await.unwrap().value,
+            Value::Boolean(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_binary_op_gt_lt_error_on_non_numbers() {
+        let ctx = Context::new();
+
+        let gt_err = Expression::BinaryOp {
+            left: Box::new(Expression::Literal(AnnotatedValue::from(Value::Text(
+                "a".to_string(),
+            )))),
+            op: BinaryOperator::Gt,
+            right: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                1.0,
+            )))),
+        };
+        assert!(eval_expression(&gt_err, &ctx).await.is_err());
+
+        let lt_err = Expression::BinaryOp {
+            left: Box::new(Expression::Literal(AnnotatedValue::from(Value::Text(
+                "a".to_string(),
+            )))),
+            op: BinaryOperator::Lt,
+            right: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                1.0,
+            )))),
+        };
+        assert!(eval_expression(&lt_err, &ctx).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_binary_op_eq_non_numbers() {
+        let ctx = Context::new();
+
+        // Text equality
+        let eq_text = Expression::BinaryOp {
+            left: Box::new(Expression::Literal(AnnotatedValue::from(Value::Text(
+                "hello".to_string(),
+            )))),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expression::Literal(AnnotatedValue::from(Value::Text(
+                "hello".to_string(),
+            )))),
+        };
+        assert_eq!(
+            eval_expression(&eq_text, &ctx).await.unwrap().value,
+            Value::Boolean(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_annotated_expression_eval() {
+        let ctx = Context::new();
+
+        // Sensitive annotation
+        let sens_expr = Expression::Annotated {
+            expr: Box::new(Expression::Literal(AnnotatedValue::from(Value::Text(
+                "secret".to_string(),
+            )))),
+            annotation: Annotation::Sensitive,
+        };
+        let result = eval_expression(&sens_expr, &ctx).await.unwrap();
+        assert!(result.is_sensitive);
+
+        // Uncertain annotation
+        let unc_expr = Expression::Annotated {
+            expr: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                1.0,
+            )))),
+            annotation: Annotation::Uncertain,
+        };
+        let result2 = eval_expression(&unc_expr, &ctx).await.unwrap();
+        assert!(result2.is_uncertain);
+
+        // Approximate annotation
+        let approx_expr = Expression::Annotated {
+            expr: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                1.0,
+            )))),
+            annotation: Annotation::Approximate,
+        };
+        let result3 = eval_expression(&approx_expr, &ctx).await.unwrap();
+        assert!(result3.is_approximate);
+    }
+
+    #[tokio::test]
+    async fn test_set_variable_session_scope() {
+        let ctx = Context::new();
+        ctx.set_variable(
+            "session_var".to_string(),
+            AnnotatedValue::from(Value::Text("hello".to_string())),
+            MemoryScope::Session,
+        )
+        .await
+        .unwrap();
+
+        let val = ctx
+            .get_variable("session_var", MemoryScope::Session)
+            .await
+            .unwrap();
+        assert_eq!(val.value, Value::Text("hello".to_string()));
+
+        // Should not be visible in Working scope
+        assert!(
+            ctx.get_variable("session_var", MemoryScope::Working)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_mock_no_handler() {
+        let ctx = Context::new();
+
+        // Register a tool with an output but no handler
+        let tool_def = ToolDefinition {
+            name: "mock_tool".to_string(),
+            description: None,
+            category: None,
+            version: None,
+            inputs: vec![],
+            outputs: vec![ToolField {
+                name: "result".to_string(),
+                type_hint: "number".to_string(),
+                required: true,
+                annotations: vec![],
+            }],
+            reversible: false,
+            side_effect: false,
+            rate_limit: None,
+            timeout: None,
+        };
+        eval(&Statement::Tool(tool_def), ctx.clone()).await.unwrap();
+
+        let use_stmt = Statement::UseTool {
+            tool_name: "mock_tool".to_string(),
+            args: HashMap::new(),
+            result_into: Some(VariablePath::root("res")),
+        };
+        eval(&use_stmt, ctx.clone()).await.unwrap();
+
+        let val = ctx.get_variable("res", MemoryScope::Working).await.unwrap();
+        if let Value::Object(fields) = val.value {
+            assert!(fields.contains_key("result"));
+            assert_eq!(fields["result"].value, Value::Number(1.0)); // mock number value
+        } else {
+            panic!("Expected object result from mock tool");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_type_mismatch() {
+        let ctx = Context::new();
+
+        let tool_def = ToolDefinition {
+            name: "typed_tool".to_string(),
+            description: None,
+            category: None,
+            version: None,
+            inputs: vec![ToolField {
+                name: "num".to_string(),
+                type_hint: "number".to_string(),
+                required: true,
+                annotations: vec![],
+            }],
+            outputs: vec![],
+            reversible: false,
+            side_effect: false,
+            rate_limit: None,
+            timeout: None,
+        };
+        eval(&Statement::Tool(tool_def), ctx.clone()).await.unwrap();
+
+        // Pass a text value where a number is expected
+        let mut args = HashMap::new();
+        args.insert(
+            "num".to_string(),
+            Expression::Literal(AnnotatedValue::from(Value::Text("bad".to_string()))),
+        );
+        let use_stmt = Statement::UseTool {
+            tool_name: "typed_tool".to_string(),
+            args,
+            result_into: None,
+        };
+        let err = eval(&use_stmt, ctx.clone()).await.unwrap_err();
+        assert!(err.to_string().contains("Type mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_text_type_mismatch() {
+        let ctx = Context::new();
+
+        let tool_def = ToolDefinition {
+            name: "text_tool".to_string(),
+            description: None,
+            category: None,
+            version: None,
+            inputs: vec![ToolField {
+                name: "msg".to_string(),
+                type_hint: "text".to_string(),
+                required: true,
+                annotations: vec![],
+            }],
+            outputs: vec![],
+            reversible: false,
+            side_effect: false,
+            rate_limit: None,
+            timeout: None,
+        };
+        eval(&Statement::Tool(tool_def), ctx.clone()).await.unwrap();
+
+        let mut args = HashMap::new();
+        args.insert(
+            "msg".to_string(),
+            Expression::Literal(AnnotatedValue::from(Value::Number(42.0))),
+        );
+        let use_stmt = Statement::UseTool {
+            tool_name: "text_tool".to_string(),
+            args,
+            result_into: None,
+        };
+        let err = eval(&use_stmt, ctx.clone()).await.unwrap_err();
+        assert!(err.to_string().contains("Type mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_side_effect_audit() {
+        let ctx = Context::new();
+
+        // Register a side-effect tool with a handler
+        {
+            let mut handlers = ctx.tool_handlers.lock().unwrap();
+            handlers.insert(
+                "side_effect_tool".to_string(),
+                Arc::new(|_| Ok(AnnotatedValue::from(Value::Null))),
+            );
+        }
+        let tool_def = ToolDefinition {
+            name: "side_effect_tool".to_string(),
+            description: None,
+            category: None,
+            version: None,
+            inputs: vec![],
+            outputs: vec![],
+            reversible: false,
+            side_effect: true,
+            rate_limit: None,
+            timeout: None,
+        };
+        eval(&Statement::Tool(tool_def), ctx.clone()).await.unwrap();
+
+        let use_stmt = Statement::UseTool {
+            tool_name: "side_effect_tool".to_string(),
+            args: HashMap::new(),
+            result_into: None,
+        };
+        eval(&use_stmt, ctx.clone()).await.unwrap();
+
+        // Verify that an audit entry was recorded for the tool execution
+        let audit = ctx.audit_chain.lock().unwrap();
+        assert!(audit.entries.iter().any(|e| e.op.starts_with("TOOL_EXEC:")));
+    }
+
+    #[tokio::test]
+    async fn test_goal_deadline_timeout() {
+        let _guard = bastion_test_guard().await;
+        ensure_bastion_started();
+        let ctx = Context::new();
+
+        // A goal that sleeps longer than its deadline should fail with a timeout error.
+        let goal_stmt = Statement::Goal {
+            name: "slow_goal".to_string(),
+            body: vec![Statement::Wait { duration: 10.0 }],
+            outputs: vec![],
+            result_into: None,
+            retry: None,
+            on_fail: HashMap::new(),
+            deadline: Some(0.01),
+            wait: None,
+            idempotent: false,
+            audit_trail: false,
+            confirm_with: None,
+            timeout_confirmation: None,
+            fallback: None,
+        };
+        let err = eval(&goal_stmt, ctx.clone()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("timed out"),
+            "Expected timeout error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parallel_gather_all() {
+        let _guard = bastion_test_guard().await;
+        ensure_bastion_started();
+        let ctx = Context::new();
+
+        let stmt = Statement::Parallel {
+            pattern: ParallelPattern::GatherAll,
+            branches: vec![
+                vec![Statement::Set {
+                    variable: "a".to_string(),
+                    value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+                }],
+                vec![Statement::Set {
+                    variable: "b".to_string(),
+                    value: Expression::Literal(AnnotatedValue::from(Value::Number(2.0))),
+                }],
+            ],
+            result_into: Some(VariablePath::root("res")),
+            deadline: None,
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+        let res = ctx.get_variable("res", MemoryScope::Working).await.unwrap();
+        if let Value::Object(branches) = res.value {
+            assert!(branches.contains_key("branch_0"));
+            assert!(branches.contains_key("branch_1"));
+        } else {
+            panic!("GatherAll result should be an object");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parallel_gather_min() {
+        let _guard = bastion_test_guard().await;
+        ensure_bastion_started();
+        let ctx = Context::new();
+
+        let stmt = Statement::Parallel {
+            pattern: ParallelPattern::GatherMin(1),
+            branches: vec![
+                vec![Statement::Set {
+                    variable: "x".to_string(),
+                    value: Expression::Literal(AnnotatedValue::from(Value::Number(10.0))),
+                }],
+                vec![Statement::Set {
+                    variable: "y".to_string(),
+                    value: Expression::Literal(AnnotatedValue::from(Value::Number(20.0))),
+                }],
+            ],
+            result_into: Some(VariablePath::root("res")),
+            deadline: None,
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+        let res = ctx.get_variable("res", MemoryScope::Working).await.unwrap();
+        if let Value::Object(branches) = res.value {
+            // At least one branch result should be present
+            assert!(!branches.is_empty());
+        } else {
+            panic!("GatherMin result should be an object");
+        }
+    }
+
+    #[test]
+    fn test_audit_chain_persistence_and_load() {
+        let file_path = unique_test_path("test-audit-persist");
+        let _ = fs::remove_file(&file_path);
+
+        // Write two entries
+        {
+            let mut chain = AuditChain::new(file_path.clone());
+            chain.append("OP_A".to_string());
+            chain.append("OP_B".to_string());
+        }
+
+        // Reload from disk and verify chain integrity
+        let reloaded = AuditChain::new(file_path.clone());
+        assert_eq!(reloaded.entries.len(), 2);
+        assert_eq!(reloaded.entries[0].op, "OP_A");
+        assert_eq!(reloaded.entries[1].op, "OP_B");
+
+        let _ = fs::remove_file(&file_path);
+    }
+
+    #[tokio::test]
+    async fn test_eval_expression_session_fallback() {
+        // eval_expression falls back to session scope when working scope misses
+        let ctx = Context::new();
+        ctx.set_variable(
+            "sess_var".to_string(),
+            AnnotatedValue::from(Value::Number(99.0)),
+            MemoryScope::Session,
+        )
+        .await
+        .unwrap();
+
+        let expr = Expression::VariableRef(VariablePath::root("sess_var"));
+        let val = eval_expression(&expr, &ctx).await.unwrap();
+        assert_eq!(val.value, Value::Number(99.0));
+    }
+
+    #[tokio::test]
+    async fn test_contract_no_active_contract() {
+        // Without any contracts, check_contracts should always pass (permissive default).
+        let ctx = Context::new();
+        assert!(ctx.check_contracts("any_tool").is_ok());
+    }
 }

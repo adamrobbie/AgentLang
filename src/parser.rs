@@ -471,7 +471,6 @@ fn parse_parallel(input: &str) -> IResult<&str, Statement> {
             tag("PARALLEL"),
             many0(parse_statement),
             alt((
-                map(tag("GATHER"), |_| ParallelPattern::Gather),
                 map(tag("GATHER_ALL"), |_| ParallelPattern::GatherAll),
                 map(preceded(tag("GATHER_MIN"), ws(parse_number)), |v| {
                     if let Value::Number(n) = v {
@@ -480,6 +479,7 @@ fn parse_parallel(input: &str) -> IResult<&str, Statement> {
                         ParallelPattern::GatherMin(1)
                     }
                 }),
+                map(tag("GATHER"), |_| ParallelPattern::Gather),
             )),
             ws(preceded(
                 tag("INTO"),
@@ -1553,5 +1553,515 @@ mod tests {
 
         // Malformed RECALL
         assert!(parse_recall("RECALL key").is_err());
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Parser tests for statements not previously covered
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_remember_basic() {
+        let input = "REMEMBER city VALUE \"London\" END";
+        if let Ok((
+            "",
+            Statement::Remember {
+                name,
+                scope,
+                expires,
+                ..
+            },
+        )) = parse_remember(input)
+        {
+            assert_eq!(name, "city");
+            assert_eq!(scope, MemoryScope::LongTerm); // default scope
+            assert!(expires.is_none());
+        } else {
+            panic!("Failed to parse REMEMBER");
+        }
+    }
+
+    #[test]
+    fn test_parse_remember_with_scope_and_expires() {
+        let input = "REMEMBER city VALUE \"London\" SCOPE working EXPIRES 30s END";
+        if let Ok((
+            "",
+            Statement::Remember {
+                name,
+                scope,
+                expires,
+                ..
+            },
+        )) = parse_remember(input)
+        {
+            assert_eq!(name, "city");
+            assert_eq!(scope, MemoryScope::Working);
+            assert_eq!(expires, Some(30.0));
+        } else {
+            panic!("Failed to parse REMEMBER with scope/expires");
+        }
+    }
+
+    #[test]
+    fn test_parse_forget() {
+        let input = "FORGET city END";
+        if let Ok(("", Statement::Forget { name, scope })) = parse_forget(input) {
+            assert_eq!(name, "city");
+            assert_eq!(scope, MemoryScope::LongTerm); // default
+        } else {
+            panic!("Failed to parse FORGET");
+        }
+    }
+
+    #[test]
+    fn test_parse_forget_with_scope() {
+        let input = "FORGET city SCOPE session END";
+        if let Ok(("", Statement::Forget { name, scope })) = parse_forget(input) {
+            assert_eq!(name, "city");
+            assert_eq!(scope, MemoryScope::Session);
+        } else {
+            panic!("Failed to parse FORGET with scope");
+        }
+    }
+
+    #[test]
+    fn test_parse_agent() {
+        let input = "AGENT planner ID abc123 REGISTRY registry.example SIGNED_BY authority.example TRUST_LEVEL verified END";
+        if let Ok((
+            "",
+            Statement::Agent {
+                name,
+                id,
+                registry,
+                signed_by,
+                trust_level,
+            },
+        )) = parse_agent(input)
+        {
+            assert_eq!(name, "planner");
+            assert_eq!(id, "abc123");
+            assert_eq!(registry, "registry.example");
+            assert_eq!(signed_by, "authority.example");
+            assert_eq!(trust_level, TrustLevel::Verified);
+        } else {
+            panic!("Failed to parse AGENT");
+        }
+    }
+
+    #[test]
+    fn test_parse_trust_levels() {
+        for (level_str, expected) in [
+            ("trusted", TrustLevel::Trusted),
+            ("sandboxed", TrustLevel::Sandboxed),
+            ("blocked", TrustLevel::Blocked),
+        ] {
+            let input = format!(
+                "AGENT a ID x REGISTRY r SIGNED_BY s TRUST_LEVEL {} END",
+                level_str
+            );
+            if let Ok(("", Statement::Agent { trust_level, .. })) = parse_agent(&input) {
+                assert_eq!(trust_level, expected);
+            } else {
+                panic!("Failed to parse TRUST_LEVEL {}", level_str);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_contract() {
+        let input = "CONTRACT admin_contract ISSUED_BY authority.example CAN USE search_flights BUDGET 100 END";
+        if let Ok((
+            "",
+            Statement::Contract {
+                name,
+                issued_by,
+                capabilities,
+                budget,
+                ..
+            },
+        )) = parse_contract(input)
+        {
+            assert_eq!(name, "admin_contract");
+            assert_eq!(issued_by, "authority.example");
+            assert_eq!(
+                capabilities,
+                vec![Permission::CanUse("search_flights".to_string())]
+            );
+            assert_eq!(budget, Some(100.0));
+        } else {
+            panic!("Failed to parse CONTRACT");
+        }
+    }
+
+    #[test]
+    fn test_parse_contract_cannot_use() {
+        let input = "CONTRACT restricted ISSUED_BY authority CANNOT USE admin END";
+        if let Ok(("", Statement::Contract { capabilities, .. })) = parse_contract(input) {
+            assert_eq!(
+                capabilities,
+                vec![Permission::CannotUse("admin".to_string())]
+            );
+        } else {
+            panic!("Failed to parse CANNOT USE in CONTRACT");
+        }
+    }
+
+    #[test]
+    fn test_parse_contract_requires_confirmation() {
+        let input = "CONTRACT c ISSUED_BY auth REQUIRES CONFIRMATION END";
+        if let Ok((
+            "",
+            Statement::Contract {
+                requires_confirmation,
+                ..
+            },
+        )) = parse_contract(input)
+        {
+            assert!(requires_confirmation);
+        } else {
+            panic!("Failed to parse REQUIRES CONFIRMATION in CONTRACT");
+        }
+    }
+
+    #[test]
+    fn test_parse_emit() {
+        let input = "EMIT alert DATA \"danger\"";
+        if let Ok((
+            "",
+            Statement::Emit {
+                event,
+                data: Some(data_expr),
+            },
+        )) = parse_emit(input)
+        {
+            assert_eq!(event, "alert");
+            assert_eq!(
+                data_expr,
+                Expression::Literal(AnnotatedValue::from(Value::Text("danger".to_string())))
+            );
+        } else {
+            panic!("Failed to parse EMIT");
+        }
+    }
+
+    #[test]
+    fn test_parse_on() {
+        let input = "ON alert SET x = 1 END";
+        if let Ok(("", Statement::On { event, handler })) = parse_on(input) {
+            assert_eq!(event, "alert");
+            assert_eq!(handler.len(), 1);
+        } else {
+            panic!("Failed to parse ON");
+        }
+    }
+
+    #[test]
+    fn test_parse_prove() {
+        let input = "PROVE { SET x = 1 } FOR \"balance_above_100\" AS proof1";
+        if let Ok((
+            "",
+            Statement::Prove {
+                statements,
+                claim,
+                proof_name,
+            },
+        )) = parse_prove(input)
+        {
+            assert_eq!(claim, "balance_above_100");
+            assert_eq!(proof_name, "proof1");
+            assert_eq!(statements.len(), 1);
+        } else {
+            panic!("Failed to parse PROVE");
+        }
+    }
+
+    #[test]
+    fn test_parse_reveal() {
+        let input = "REVEAL proof1 FOR \"balance_above_100\" INTO {result}";
+        if let Ok((
+            "",
+            Statement::Reveal {
+                proof_name,
+                claim,
+                to_agent,
+                result_into,
+            },
+        )) = parse_reveal(input)
+        {
+            assert_eq!(proof_name, "proof1");
+            assert_eq!(claim, "balance_above_100");
+            assert!(to_agent.is_none());
+            assert!(result_into.is_some());
+        } else {
+            panic!("Failed to parse REVEAL");
+        }
+    }
+
+    #[test]
+    fn test_parse_reveal_to_agent() {
+        let input = "REVEAL p FOR \"claim\" TO planner_agent INTO {res}";
+        if let Ok(("", Statement::Reveal { to_agent, .. })) = parse_reveal(input) {
+            assert_eq!(to_agent, Some("planner_agent".to_string()));
+        } else {
+            panic!("Failed to parse REVEAL with TO");
+        }
+    }
+
+    #[test]
+    fn test_parse_parallel_gather() {
+        let input = "PARALLEL SET x = 1 SET y = 2 GATHER INTO {res} END";
+        if let Ok((
+            "",
+            Statement::Parallel {
+                pattern,
+                branches,
+                result_into,
+                deadline,
+            },
+        )) = parse_parallel(input)
+        {
+            assert_eq!(pattern, ParallelPattern::Gather);
+            assert_eq!(branches.len(), 2);
+            assert!(result_into.is_some());
+            assert!(deadline.is_none());
+        } else {
+            panic!("Failed to parse PARALLEL GATHER");
+        }
+    }
+
+    #[test]
+    fn test_parse_parallel_gather_all() {
+        let input = "PARALLEL SET x = 1 GATHER_ALL INTO {res} END";
+        if let Ok(("", Statement::Parallel { pattern, .. })) = parse_parallel(input) {
+            assert_eq!(pattern, ParallelPattern::GatherAll);
+        } else {
+            panic!("Failed to parse PARALLEL GATHER_ALL");
+        }
+    }
+
+    #[test]
+    fn test_parse_parallel_gather_min() {
+        let input = "PARALLEL SET x = 1 SET y = 2 GATHER_MIN 1 INTO {res} END";
+        if let Ok(("", Statement::Parallel { pattern, .. })) = parse_parallel(input) {
+            assert_eq!(pattern, ParallelPattern::GatherMin(1));
+        } else {
+            panic!("Failed to parse PARALLEL GATHER_MIN");
+        }
+    }
+
+    #[test]
+    fn test_parse_race() {
+        let input = "RACE SET x = 1 SET y = 2 FIRST_INTO {res} END";
+        if let Ok((
+            "",
+            Statement::Parallel {
+                pattern,
+                branches,
+                result_into,
+                ..
+            },
+        )) = parse_race(input)
+        {
+            assert_eq!(pattern, ParallelPattern::Race);
+            // RACE wraps all stmts into a single branch
+            assert_eq!(branches.len(), 1);
+            assert_eq!(branches[0].len(), 2);
+            assert!(result_into.is_some());
+        } else {
+            panic!("Failed to parse RACE");
+        }
+    }
+
+    #[test]
+    fn test_parse_foreach() {
+        let input = "FOREACH item IN [1 2 3] SET x = {item} END";
+        if let Ok(("", Statement::ForEach { item, body, .. })) = parse_foreach(input) {
+            assert_eq!(item, "item");
+            assert_eq!(body.len(), 1);
+        } else {
+            panic!("Failed to parse FOREACH");
+        }
+    }
+
+    #[test]
+    fn test_parse_repeat() {
+        let input = "REPEAT UNTIL true SET x = 1 END";
+        if let Ok(("", Statement::Repeat { condition, body })) = parse_repeat(input) {
+            assert_eq!(
+                condition,
+                Expression::Literal(AnnotatedValue::from(Value::Boolean(true)))
+            );
+            assert_eq!(body.len(), 1);
+        } else {
+            panic!("Failed to parse REPEAT");
+        }
+    }
+
+    #[test]
+    fn test_parse_use_tool() {
+        let input = "USE add_numbers a 10 b 20 RESULT INTO {res} END";
+        if let Ok((
+            "",
+            Statement::UseTool {
+                tool_name,
+                args,
+                result_into,
+            },
+        )) = parse_use(input)
+        {
+            assert_eq!(tool_name, "add_numbers");
+            assert_eq!(args.len(), 2);
+            assert!(result_into.is_some());
+        } else {
+            panic!("Failed to parse USE");
+        }
+    }
+
+    #[test]
+    fn test_parse_delegate() {
+        let input = "DELEGATE \"planner\" GOAL \"search\" END";
+        if let Ok((
+            "",
+            Statement::Delegate {
+                agent_id,
+                goal_name,
+                args,
+            },
+        )) = parse_delegate(input)
+        {
+            assert_eq!(agent_id, "planner");
+            assert_eq!(goal_name, "search");
+            assert!(args.is_empty());
+        } else {
+            panic!("Failed to parse DELEGATE");
+        }
+    }
+
+    #[test]
+    fn test_parse_await() {
+        let input = "AWAIT {call_result} INTO {final}";
+        if let Ok((
+            "",
+            Statement::Await {
+                call_id,
+                result_into,
+            },
+        )) = parse_await(input)
+        {
+            assert_eq!(call_id, "call_result");
+            assert!(result_into.is_some());
+        } else {
+            panic!("Failed to parse AWAIT");
+        }
+    }
+
+    #[test]
+    fn test_parse_goal_with_options() {
+        let input = "GOAL retry_goal RETRY 3 DEADLINE 10s IDEMPOTENT SET x = 1 END";
+        if let Ok((
+            "",
+            Statement::Goal {
+                name,
+                retry,
+                deadline,
+                idempotent,
+                ..
+            },
+        )) = parse_goal(input)
+        {
+            assert_eq!(name, "retry_goal");
+            assert_eq!(retry, Some(3));
+            assert_eq!(deadline, Some(10.0));
+            assert!(idempotent);
+        } else {
+            panic!("Failed to parse GOAL with options");
+        }
+    }
+
+    #[test]
+    fn test_parse_goal_on_fail() {
+        let input = "GOAL g ON_FAIL[TIMEOUT] SET x = 1 END";
+        if let Ok(("", Statement::Goal { on_fail, .. })) = parse_goal(input) {
+            assert!(on_fail.contains_key(&GoalFailureType::Timeout));
+        } else {
+            panic!("Failed to parse GOAL ON_FAIL");
+        }
+    }
+
+    #[test]
+    fn test_parse_goal_audit_trail_false() {
+        let input = "GOAL g AUDIT_TRAIL false END";
+        if let Ok(("", Statement::Goal { audit_trail, .. })) = parse_goal(input) {
+            assert!(!audit_trail);
+        } else {
+            panic!("Failed to parse GOAL AUDIT_TRAIL false");
+        }
+    }
+
+    #[test]
+    fn test_parse_program_multi_statement() {
+        let input = "SET x = 1 SET y = 2 SET z = 3";
+        let result = parse_program(input);
+        assert!(result.is_ok());
+        let (_, stmts) = result.unwrap();
+        assert_eq!(stmts.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_duration_units() {
+        // Minutes
+        assert_eq!(parse_duration("2m"), Ok(("", 120.0)));
+        // Hours
+        assert_eq!(parse_duration("1h"), Ok(("", 3600.0)));
+        // Seconds
+        assert_eq!(parse_duration("30s"), Ok(("", 30.0)));
+    }
+
+    #[test]
+    fn test_parse_memory_scope_variants() {
+        assert_eq!(
+            parse_memory_scope("working"),
+            Ok(("", MemoryScope::Working))
+        );
+        assert_eq!(
+            parse_memory_scope("session"),
+            Ok(("", MemoryScope::Session))
+        );
+        assert_eq!(
+            parse_memory_scope("long_term"),
+            Ok(("", MemoryScope::LongTerm))
+        );
+        assert_eq!(parse_memory_scope("shared"), Ok(("", MemoryScope::Shared)));
+    }
+
+    #[test]
+    fn test_parse_binary_operators() {
+        assert_eq!(parse_binary_operator("=="), Ok(("", BinaryOperator::Eq)));
+        assert_eq!(parse_binary_operator(">"), Ok(("", BinaryOperator::Gt)));
+        assert_eq!(parse_binary_operator("<"), Ok(("", BinaryOperator::Lt)));
+        assert_eq!(parse_binary_operator("+"), Ok(("", BinaryOperator::Add)));
+        assert_eq!(parse_binary_operator("-"), Ok(("", BinaryOperator::Sub)));
+    }
+
+    #[test]
+    fn test_parse_recall_with_scope_and_on_missing() {
+        let input = "RECALL city INTO {c} SCOPE working ON_MISSING \"unknown\" END";
+        if let Ok((
+            "",
+            Statement::Recall {
+                name,
+                into_var,
+                scope,
+                on_missing,
+                ..
+            },
+        )) = parse_recall(input)
+        {
+            assert_eq!(name, "city");
+            assert_eq!(into_var, "c");
+            assert_eq!(scope, MemoryScope::Working);
+            assert!(on_missing.is_some());
+        } else {
+            panic!("Failed to parse RECALL with scope and on_missing");
+        }
     }
 }
