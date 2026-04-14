@@ -75,12 +75,12 @@ jobs:
             --all-features \
             --engine ptrace \
             --timeout 300 \
-            --test-threads 1 \
             --exclude-files "build.rs" \
             --out xml \
             --out html \
             --out lcov \
-            --output-dir target/tarpaulin
+            --output-dir target/tarpaulin \
+            -- --test-threads=1
 
       # ── Enforce minimum threshold (optional) ────────────────────────────────
       # Uncomment the block below (and update the percentage) once you have a
@@ -133,9 +133,12 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
 
           # Extract the overall line-rate from the Cobertura XML.
-          LINE_RATE=$(grep -m1 'line-rate' target/tarpaulin/cobertura.xml \
-            | sed 's/.*line-rate="\([0-9.]*\)".*/\1/' || echo "0")
-          PCT=$(awk "BEGIN { printf \"%.1f\", $LINE_RATE * 100 }")
+          if [ -f target/tarpaulin/cobertura.xml ]; then
+            LINE_RATE=$(grep -m1 'line-rate' target/tarpaulin/cobertura.xml \
+              | sed 's/.*line-rate="\([0-9.]*\)".*/\1/')
+          fi
+          LINE_RATE="${LINE_RATE:-0}"
+          PCT=$(awk "BEGIN { printf \"%.1f\", ${LINE_RATE} * 100 }")
 
           echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
           echo "| ------ | ----- |" >> "$GITHUB_STEP_SUMMARY"
