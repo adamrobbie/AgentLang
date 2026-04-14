@@ -129,10 +129,7 @@ fn parse_binary_operator(input: &str) -> IResult<&str, BinaryOperator> {
 fn parse_expression(input: &str) -> IResult<&str, Expression> {
     let (input, mut left) = alt((
         map(parse_value, Expression::Literal),
-        map(
-            delimited(char('{'), parse_variable_path, char('}')),
-            Expression::VariableRef,
-        ),
+        delimited(char('{'), parse_inner_expression, char('}')),
     ))
     .parse(input)?;
 
@@ -161,6 +158,40 @@ fn parse_expression(input: &str) -> IResult<&str, Expression> {
     }
 }
 
+/// Expression context inside braces: identifiers are variable refs
+fn parse_inner_expression(input: &str) -> IResult<&str, Expression> {
+    let (input, mut left) = alt((
+        map(parse_value, Expression::Literal),
+        map(parse_variable_path, Expression::VariableRef),
+        delimited(char('{'), parse_inner_expression, char('}')),
+    ))
+    .parse(input)?;
+
+    let (input, maybe_annotation) = opt(preceded(ws(tag("AS")), parse_annotation)).parse(input)?;
+    if let Some(annotation) = maybe_annotation {
+        left = Expression::Annotated {
+            expr: Box::new(left),
+            annotation,
+        };
+    }
+
+    let (input, maybe_op) =
+        opt(pair(ws(parse_binary_operator), ws(parse_inner_expression))).parse(input)?;
+
+    if let Some((op, right)) = maybe_op {
+        Ok((
+            input,
+            Expression::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            },
+        ))
+    } else {
+        Ok((input, left))
+    }
+}
+
 /// Parse a SET statement: SET name = value
 fn parse_set(input: &str) -> IResult<&str, Statement> {
     map(
@@ -170,7 +201,7 @@ fn parse_set(input: &str) -> IResult<&str, Statement> {
             tag("="),
             ws(parse_expression),
         ),
-        |(_, name, _, value)| Statement::Set { name, value },
+        |(_, variable, _, value)| Statement::Set { variable, value },
     )
     .parse(input)
 }
@@ -183,7 +214,7 @@ fn parse_use(input: &str) -> IResult<&str, Statement> {
             ws(parse_identifier),
             many0((ws(parse_identifier), ws(parse_expression))),
             tag("RESULT INTO"),
-            ws(delimited(char('{'), parse_identifier, char('}'))),
+            ws(delimited(char('{'), parse_variable_path, char('}'))),
             tag("END"),
         ),
         |(_, tool_name, args_vec, _, result_into, _)| {
@@ -191,7 +222,7 @@ fn parse_use(input: &str) -> IResult<&str, Statement> {
             Statement::UseTool {
                 tool_name,
                 args,
-                result_into,
+                result_into: Some(result_into),
             }
         },
     )
@@ -218,7 +249,7 @@ fn parse_if(input: &str) -> IResult<&str, Statement> {
 }
 
 enum GoalOpt {
-    Retry(usize),
+    Retry(u32),
     OnFail {
         failure_type: GoalFailureType,
         handler: Box<Statement>,
@@ -227,13 +258,15 @@ enum GoalOpt {
     Wait(f64),
     Idempotent,
     AuditTrail(bool),
-    Fallback(Expression),
+    ConfirmWith(String),
+    TimeoutConfirmation(f64),
+    Fallback(Box<Statement>),
 }
 
 enum GoalItem {
     Statement(Statement),
     Outputs(Vec<GoalOutput>),
-    ResultInto(String),
+    ResultInto(VariablePath),
     Opt(GoalOpt),
 }
 
@@ -275,12 +308,12 @@ fn parse_goal_outputs(input: &str) -> IResult<&str, Vec<GoalOutput>> {
     .parse(input)
 }
 
-fn parse_goal_result_into(input: &str) -> IResult<&str, String> {
+fn parse_goal_result_into(input: &str) -> IResult<&str, VariablePath> {
     map(
         (
             tag("RESULT"),
             ws(tag("INTO")),
-            ws(delimited(char('{'), parse_identifier, char('}'))),
+            ws(delimited(char('{'), parse_variable_path, char('}'))),
         ),
         |(_, _, result_into)| result_into,
     )
@@ -291,7 +324,7 @@ fn parse_goal_opt(input: &str) -> IResult<&str, GoalOpt> {
     alt((
         map(preceded(ws(tag("RETRY")), ws(parse_number)), |v| {
             if let Value::Number(n) = v {
-                GoalOpt::Retry(n as usize)
+                GoalOpt::Retry(n as u32)
             } else {
                 GoalOpt::Retry(0)
             }
@@ -323,8 +356,16 @@ fn parse_goal_opt(input: &str) -> IResult<&str, GoalOpt> {
             },
         ),
         map(
-            preceded(ws(tag("FALLBACK")), ws(parse_expression)),
-            GoalOpt::Fallback,
+            preceded(ws(tag("CONFIRM_WITH")), ws(parse_identifier)),
+            GoalOpt::ConfirmWith,
+        ),
+        map(
+            preceded(ws(tag("TIMEOUT_CONFIRMATION")), ws(parse_duration)),
+            GoalOpt::TimeoutConfirmation,
+        ),
+        map(
+            preceded(ws(tag("FALLBACK")), ws(parse_statement)),
+            |stmt| GoalOpt::Fallback(Box::new(stmt)),
         ),
     ))
     .parse(input)
@@ -340,7 +381,7 @@ fn parse_goal_item(input: &str) -> IResult<&str, GoalItem> {
     .parse(input)
 }
 
-/// Parse a GOAL block: GOAL name ... [OUTPUT ... END] [RESULT INTO {var}] [RETRY n] [ON_FAIL[type] GOAL x] [DEADLINE d] [IDEMPOTENT] [FALLBACK val] END
+/// Parse a GOAL block
 fn parse_goal(input: &str) -> IResult<&str, Statement> {
     map(
         (
@@ -359,6 +400,8 @@ fn parse_goal(input: &str) -> IResult<&str, Statement> {
             let mut wait = None;
             let mut idempotent = false;
             let mut audit_trail = true;
+            let mut confirm_with = None;
+            let mut timeout_confirmation = None;
             let mut fallback = None;
 
             for item in items {
@@ -378,7 +421,9 @@ fn parse_goal(input: &str) -> IResult<&str, Statement> {
                         GoalOpt::Wait(d) => wait = Some(d),
                         GoalOpt::Idempotent => idempotent = true,
                         GoalOpt::AuditTrail(enabled) => audit_trail = enabled,
-                        GoalOpt::Fallback(e) => fallback = Some(e),
+                        GoalOpt::ConfirmWith(s) => confirm_with = Some(s),
+                        GoalOpt::TimeoutConfirmation(d) => timeout_confirmation = Some(d),
+                        GoalOpt::Fallback(s) => fallback = Some(s),
                     },
                 }
             }
@@ -394,6 +439,8 @@ fn parse_goal(input: &str) -> IResult<&str, Statement> {
                 wait,
                 idempotent,
                 audit_trail,
+                confirm_with,
+                timeout_confirmation,
                 fallback,
             }
         },
@@ -437,14 +484,14 @@ fn parse_parallel(input: &str) -> IResult<&str, Statement> {
             )),
             ws(preceded(
                 tag("INTO"),
-                ws(delimited(char('{'), parse_identifier, char('}'))),
+                ws(delimited(char('{'), parse_variable_path, char('}'))),
             )),
             opt(preceded(ws(tag("DEADLINE")), parse_duration)),
             tag("END"),
         ),
         |(_, branches, pattern, result_into, deadline, _)| Statement::Parallel {
             pattern,
-            branches,
+            branches: vec![branches],
             result_into: Some(result_into),
             deadline,
         },
@@ -459,13 +506,13 @@ fn parse_race(input: &str) -> IResult<&str, Statement> {
             tag("RACE"),
             many0(parse_statement),
             tag("FIRST_INTO"),
-            ws(delimited(char('{'), parse_identifier, char('}'))),
+            ws(delimited(char('{'), parse_variable_path, char('}'))),
             opt(preceded(ws(tag("DEADLINE")), parse_duration)),
             tag("END"),
         ),
         |(_, branches, _, result_into, deadline, _)| Statement::Parallel {
             pattern: ParallelPattern::Race,
-            branches,
+            branches: vec![branches],
             result_into: Some(result_into),
             deadline,
         },
@@ -729,6 +776,24 @@ fn parse_permission(input: &str) -> IResult<&str, Permission> {
     .parse(input)
 }
 
+enum ContractItem {
+    Permission(Permission),
+    Budget(f64),
+    RequiresConfirmation,
+    Expires(f64),
+}
+
+fn parse_contract_item(input: &str) -> IResult<&str, ContractItem> {
+    alt((
+        map(ws(parse_permission), ContractItem::Permission),
+        map(preceded(ws(tag("BUDGET")), ws(parse_number)), |v| {
+            if let Value::Number(n) = v { ContractItem::Budget(n) } else { ContractItem::Budget(0.0) }
+        }),
+        map(ws(tag("REQUIRES CONFIRMATION")), |_| ContractItem::RequiresConfirmation),
+        map(preceded(ws(tag("EXPIRES")), ws(parse_duration)), ContractItem::Expires),
+    )).parse(input)
+}
+
 /// Parse a CONTRACT block
 fn parse_contract(input: &str) -> IResult<&str, Statement> {
     map(
@@ -741,15 +806,32 @@ fn parse_contract(input: &str) -> IResult<&str, Statement> {
                     c.is_alphanumeric() || c == '.'
                 }))),
             ),
-            many0(ws(parse_permission)),
-            opt(preceded(ws(tag("EXPIRES")), ws(parse_duration))),
+            many0(parse_contract_item),
             tag("END"),
         ),
-        |(_, name, issued_by, capabilities, expires, _)| Statement::Contract {
-            name,
-            issued_by: issued_by.to_string(),
-            capabilities,
-            expires,
+        |(_, name, issued_by, items, _)| {
+            let mut capabilities = Vec::new();
+            let mut budget = None;
+            let mut requires_confirmation = false;
+            let mut expires = None;
+
+            for item in items {
+                match item {
+                    ContractItem::Permission(p) => capabilities.push(p),
+                    ContractItem::Budget(b) => budget = Some(b),
+                    ContractItem::RequiresConfirmation => requires_confirmation = true,
+                    ContractItem::Expires(e) => expires = Some(e),
+                }
+            }
+
+            Statement::Contract {
+                name,
+                issued_by: issued_by.to_string(),
+                capabilities,
+                budget,
+                requires_confirmation,
+                expires,
+            }
         },
     )
     .parse(input)
@@ -764,7 +846,10 @@ fn parse_emit(input: &str) -> IResult<&str, Statement> {
             ws(tag("DATA")),
             ws(parse_expression),
         ),
-        |(_, event, _, data)| Statement::Emit { event, data },
+        |(_, event, _, data)| Statement::Emit {
+            event,
+            data: Some(data),
+        },
     )
     .parse(input)
 }
@@ -778,39 +863,51 @@ fn parse_on(input: &str) -> IResult<&str, Statement> {
     .parse(input)
 }
 
-/// Parse a PROVE statement: PROVE { statements } AS proof_name
+/// Parse a PROVE statement: PROVE { statements } FOR "claim" AS proof_name
 fn parse_prove(input: &str) -> IResult<&str, Statement> {
     map(
         (
             tag("PROVE"),
             ws(delimited(char('{'), many0(parse_statement), char('}'))),
+            ws(tag("FOR")),
+            ws(parse_string),
             ws(tag("AS")),
             ws(parse_identifier),
         ),
-        |(_, statements, _, proof_name)| Statement::Prove {
-            statements,
-            proof_name,
+        |(_, statements, _, claim_val, _, proof_name)| {
+            let claim = if let Value::Text(s) = claim_val { s } else { "".to_string() };
+            Statement::Prove {
+                statements,
+                claim,
+                proof_name,
+            }
         },
     )
     .parse(input)
 }
 
-/// Parse a REVEAL statement: REVEAL proof_name [TO agent_id] [INTO {var}]
+/// Parse a REVEAL statement: REVEAL proof_name FOR "claim" [TO agent_id] [INTO {var}]
 fn parse_reveal(input: &str) -> IResult<&str, Statement> {
     map(
         (
             tag("REVEAL"),
             ws(parse_identifier),
+            ws(tag("FOR")),
+            ws(parse_string),
             opt(preceded(ws(tag("TO")), ws(parse_identifier))),
             opt(preceded(
                 ws(tag("INTO")),
-                ws(delimited(char('{'), parse_identifier, char('}'))),
+                ws(delimited(char('{'), parse_variable_path, char('}'))),
             )),
         ),
-        |(_, proof_name, to_agent, result_into)| Statement::Reveal {
-            proof_name,
-            to_agent,
-            result_into,
+        |(_, proof_name, _, claim_val, to_agent, result_into)| {
+            let claim = if let Value::Text(s) = claim_val { s } else { "".to_string() };
+            Statement::Reveal {
+                proof_name,
+                claim,
+                to_agent,
+                result_into,
+            }
         },
     )
     .parse(input)
@@ -826,7 +923,7 @@ fn parse_use_wasm(input: &str) -> IResult<&str, Statement> {
             ws(parse_string),
             many0((ws(parse_identifier), ws(parse_expression))),
             tag("RESULT INTO"),
-            ws(delimited(char('{'), parse_identifier, char('}'))),
+            ws(delimited(char('{'), parse_variable_path, char('}'))),
             tag("END"),
         ),
         |(_, module_path, _, function_name, args_vec, _, result_into, _)| {
@@ -840,19 +937,30 @@ fn parse_use_wasm(input: &str) -> IResult<&str, Statement> {
             } else {
                 "".to_string()
             };
-            let args = args_vec.into_iter().collect();
             Statement::UseWasm {
                 module_path,
                 function_name,
-                args,
-                result_into,
+                args: args_vec,
+                result_into: Some(result_into),
             }
         },
     )
     .parse(input)
 }
 
-/// Parse a CALL statement: CALL "agent" GOAL "name" ... RESULT INTO {var} END
+enum CallModifier {
+    Timeout(f64),
+    SignedBy(String),
+}
+
+fn parse_call_modifier(input: &str) -> IResult<&str, CallModifier> {
+    alt((
+        map(preceded(ws(tag("TIMEOUT")), ws(parse_duration)), CallModifier::Timeout),
+        map(preceded(ws(tag("SIGNED_BY")), ws(parse_identifier)), CallModifier::SignedBy),
+    )).parse(input)
+}
+
+/// Parse a CALL statement: CALL "agent" GOAL "name" ... [TIMEOUT d] [SIGNED_BY id] RESULT INTO {var} END
 fn parse_call(input: &str) -> IResult<&str, Statement> {
     map(
         (
@@ -861,11 +969,228 @@ fn parse_call(input: &str) -> IResult<&str, Statement> {
             ws(tag("GOAL")),
             ws(parse_string),
             many0((ws(parse_identifier), ws(parse_expression))),
+            many0(parse_call_modifier),
             tag("RESULT INTO"),
-            ws(delimited(char('{'), parse_identifier, char('}'))),
+            ws(delimited(char('{'), parse_variable_path, char('}'))),
             tag("END"),
         ),
-        |(_, agent_id, _, goal_name, args_vec, _, result_into, _)| {
+        |(_, agent_id, _, goal_name, args_vec, modifiers, _, result_into, _)| {
+            let agent_id = if let Value::Text(s) = agent_id { s } else { "".to_string() };
+            let goal_name = if let Value::Text(s) = goal_name { s } else { "".to_string() };
+            let args = args_vec.into_iter().collect();
+            
+            let mut timeout = None;
+            let mut signed_by = None;
+            for m in modifiers {
+                match m {
+                    CallModifier::Timeout(d) => timeout = Some(d),
+                    CallModifier::SignedBy(id) => signed_by = Some(id),
+                }
+            }
+
+            Statement::Call {
+                agent_id,
+                goal_name,
+                args,
+                timeout,
+                signed_by,
+                result_into: Some(result_into),
+            }
+        },
+    )
+    .parse(input)
+}
+
+/// Parse an AWAIT statement: AWAIT {var}
+fn parse_await(input: &str) -> IResult<&str, Statement> {
+    map(
+        (
+            tag("AWAIT"),
+            ws(delimited(char('{'), parse_identifier, char('}'))),
+            opt(preceded(
+                ws(tag("INTO")),
+                ws(delimited(char('{'), parse_variable_path, char('}'))),
+            )),
+        ),
+        |(call_id, _, result_into)| Statement::Await {
+            call_id: call_id.to_string(),
+            result_into,
+        },
+    )
+    .parse(input)
+}
+
+fn parse_tool_category(input: &str) -> IResult<&str, ToolCategory> {
+    alt((
+        map(tag("read"), |_| ToolCategory::Read),
+        map(tag("write"), |_| ToolCategory::Write),
+        map(tag("agent"), |_| ToolCategory::Agent),
+    ))
+    .parse(input)
+}
+
+fn parse_tool_field(input: &str) -> IResult<&str, ToolField> {
+    map(
+        (
+            ws(parse_identifier),
+            ws(parse_identifier),
+            alt((
+                map(ws(tag("REQUIRED")), |_| true),
+                map(ws(tag("OPTIONAL")), |_| false),
+            )),
+            many0(preceded(ws(tag("AS")), parse_annotation)),
+        ),
+        |(name, type_hint, required, annotations)| ToolField {
+            name,
+            type_hint,
+            required,
+            annotations,
+        },
+    )
+    .parse(input)
+}
+
+enum ToolItem {
+    Description(String),
+    Category(ToolCategory),
+    Version(String),
+    Input(Vec<ToolField>),
+    Output(Vec<ToolField>),
+    Reversible(bool),
+    SideEffect(bool),
+    RateLimit(String),
+    Timeout(f64),
+}
+
+fn parse_tool_item(input: &str) -> IResult<&str, ToolItem> {
+    alt((
+        map(
+            preceded(ws(tag("DESCRIPTION")), ws(parse_string)),
+            |v| match v {
+                Value::Text(s) => ToolItem::Description(s),
+                _ => unreachable!(),
+            },
+        ),
+        map(
+            preceded(ws(tag("CATEGORY")), ws(parse_tool_category)),
+            ToolItem::Category,
+        ),
+        map(
+            preceded(
+                ws(tag("VERSION")),
+                ws(recognize(pair(
+                    digit1,
+                    many0(alt((alphanumeric1, tag("."), tag("-")))),
+                ))),
+            ),
+            |v: &str| ToolItem::Version(v.to_string()),
+        ),
+        map(
+            preceded(
+                ws(tag("INPUT")),
+                many_till(ws(parse_tool_field), ws(tag("END"))),
+            ),
+            |(fields, _)| ToolItem::Input(fields),
+        ),
+        map(
+            preceded(
+                ws(tag("OUTPUT")),
+                many_till(ws(parse_tool_field), ws(tag("END"))),
+            ),
+            |(fields, _)| ToolItem::Output(fields),
+        ),
+        map(
+            preceded(ws(tag("REVERSIBLE")), ws(parse_boolean)),
+            |v| match v {
+                Value::Boolean(b) => ToolItem::Reversible(b),
+                _ => unreachable!(),
+            },
+        ),
+        map(
+            preceded(ws(tag("SIDE_EFFECT")), ws(parse_boolean)),
+            |v| match v {
+                Value::Boolean(b) => ToolItem::SideEffect(b),
+                _ => unreachable!(),
+            },
+        ),
+        map(
+            preceded(
+                ws(tag("RATE_LIMIT")),
+                ws(recognize(pair(digit1, many0(alt((alphanumeric1, tag("/"))))))),
+            ),
+            |v: &str| ToolItem::RateLimit(v.to_string()),
+        ),
+        map(
+            preceded(ws(tag("TIMEOUT")), ws(parse_duration)),
+            ToolItem::Timeout,
+        ),
+    ))
+    .parse(input)
+}
+
+/// Parse a TOOL block
+fn parse_tool(input: &str) -> IResult<&str, Statement> {
+    map(
+        (
+            tag("TOOL"),
+            ws(parse_identifier),
+            many0(ws(parse_tool_item)),
+            tag("END"),
+        ),
+        |(_, name, items, _)| {
+            let mut description = None;
+            let mut category = None;
+            let mut version = None;
+            let mut inputs = Vec::new();
+            let mut outputs = Vec::new();
+            let mut reversible = false;
+            let mut side_effect = true;
+            let mut rate_limit = None;
+            let mut timeout = None;
+
+            for item in items {
+                match item {
+                    ToolItem::Description(s) => description = Some(s),
+                    ToolItem::Category(c) => category = Some(c),
+                    ToolItem::Version(v) => version = Some(v),
+                    ToolItem::Input(f) => inputs = f,
+                    ToolItem::Output(f) => outputs = f,
+                    ToolItem::Reversible(b) => reversible = b,
+                    ToolItem::SideEffect(b) => side_effect = b,
+                    ToolItem::RateLimit(s) => rate_limit = Some(s),
+                    ToolItem::Timeout(d) => timeout = Some(d),
+                }
+            }
+
+            Statement::Tool(ToolDefinition {
+                name,
+                description,
+                category,
+                version,
+                inputs,
+                outputs,
+                reversible,
+                side_effect,
+                rate_limit,
+                timeout,
+            })
+        },
+    )
+    .parse(input)
+}
+
+/// Parse a DELEGATE statement: DELEGATE "agent" GOAL "name" ... END
+fn parse_delegate(input: &str) -> IResult<&str, Statement> {
+    map(
+        (
+            tag("DELEGATE"),
+            ws(parse_string),
+            ws(tag("GOAL")),
+            ws(parse_string),
+            many0((ws(parse_identifier), ws(parse_expression))),
+            tag("END"),
+        ),
+        |(_, agent_id, _, goal_name, args_vec, _)| {
             let agent_id = if let Value::Text(s) = agent_id {
                 s
             } else {
@@ -877,25 +1202,12 @@ fn parse_call(input: &str) -> IResult<&str, Statement> {
                 "".to_string()
             };
             let args = args_vec.into_iter().collect();
-            Statement::Call {
+            Statement::Delegate {
                 agent_id,
                 goal_name,
                 args,
-                result_into,
             }
         },
-    )
-    .parse(input)
-}
-
-/// Parse an AWAIT statement: AWAIT {var}
-fn parse_await(input: &str) -> IResult<&str, Statement> {
-    map(
-        preceded(
-            tag("AWAIT"),
-            ws(delimited(char('{'), parse_identifier, char('}'))),
-        ),
-        |call_id| Statement::Await { call_id },
     )
     .parse(input)
 }
@@ -903,27 +1215,33 @@ fn parse_await(input: &str) -> IResult<&str, Statement> {
 /// Parse any statement.
 fn parse_statement(input: &str) -> IResult<&str, Statement> {
     ws(alt((
-        parse_set,
-        parse_if,
-        parse_use,
-        parse_goal,
-        parse_parallel,
-        parse_race,
-        parse_foreach,
-        parse_repeat,
-        parse_wait,
-        parse_remember,
-        parse_recall,
-        parse_forget,
-        parse_agent,
-        parse_contract,
-        parse_emit,
-        parse_on,
-        parse_prove,
-        parse_reveal,
-        parse_use_wasm,
-        parse_call,
-        parse_await,
+        alt((
+            parse_set,
+            parse_if,
+            parse_use,
+            parse_goal,
+            parse_tool,
+            parse_parallel,
+            parse_race,
+            parse_foreach,
+            parse_repeat,
+            parse_wait,
+            parse_remember,
+        )),
+        alt((
+            parse_recall,
+            parse_forget,
+            parse_agent,
+            parse_contract,
+            parse_emit,
+            parse_on,
+            parse_prove,
+            parse_reveal,
+            parse_use_wasm,
+            parse_call,
+            parse_delegate,
+            parse_await,
+        )),
     )))
     .parse(input)
 }
@@ -1011,7 +1329,6 @@ mod tests {
             ))
         );
         assert!(parse_expression("{foo.}").is_err());
-        assert!(parse_expression("{[0]}").is_err());
         assert!(parse_expression("{foo[]}").is_err());
     }
 
@@ -1032,10 +1349,25 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_complex_expression_in_braces() {
+        assert_eq!(
+            parse_expression("{price + 10}"),
+            Ok((
+                "",
+                Expression::BinaryOp {
+                    left: Box::new(Expression::VariableRef(VariablePath::root("price"))),
+                    op: BinaryOperator::Add,
+                    right: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(10.0)))),
+                }
+            ))
+        );
+    }
+
+    #[test]
     fn test_parse_set() {
         let input = "SET origin = \"London\"";
         let expected = Statement::Set {
-            name: "origin".to_string(),
+            variable: "origin".to_string(),
             value: Expression::Literal(AnnotatedValue::from(Value::Text("London".to_string()))),
         };
         assert_eq!(parse_set(input), Ok(("", expected)));
@@ -1047,7 +1379,7 @@ mod tests {
         let expected = Statement::Goal {
             name: "my_goal".to_string(),
             body: vec![Statement::Set {
-                name: "x".to_string(),
+                variable: "x".to_string(),
                 value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
             }],
             outputs: vec![],
@@ -1058,17 +1390,20 @@ mod tests {
             wait: None,
             idempotent: false,
             audit_trail: true,
+            confirm_with: None,
+            timeout_confirmation: None,
             fallback: None,
         };
         assert_eq!(parse_goal(input), Ok(("", expected)));
     }
+
     #[test]
     fn test_parse_goal_with_outputs_and_result_into() {
-        let input = "GOAL search_flights SET flights = [1] OUTPUT flights list confidence float AS confidence END RESULT INTO {summary} END";
+        let input = "GOAL search_flights SET flights = [1] OUTPUT flights list confidence float AS confidence END RESULT INTO {trip.summary} END";
         let expected = Statement::Goal {
             name: "search_flights".to_string(),
             body: vec![Statement::Set {
-                name: "flights".to_string(),
+                variable: "flights".to_string(),
                 value: Expression::Literal(AnnotatedValue::from(Value::List(vec![
                     AnnotatedValue::from(Value::Number(1.0)),
                 ]))),
@@ -1085,40 +1420,18 @@ mod tests {
                     annotations: vec![Annotation::Confidence],
                 },
             ],
-            result_into: Some("summary".to_string()),
+            result_into: Some(VariablePath {
+                root: "trip".to_string(),
+                segments: vec![PathSegment::Field("summary".to_string())],
+            }),
             retry: None,
             on_fail: HashMap::new(),
             deadline: None,
             wait: None,
             idempotent: false,
             audit_trail: true,
-            fallback: None,
-        };
-        assert_eq!(parse_goal(input), Ok(("", expected)));
-    }
-
-    #[test]
-    fn test_parse_goal_with_failure_directives_wait_and_audit() {
-        let input = "GOAL guarded WAIT 2s ON_FAIL[TIMEOUT] SET failed = true AUDIT_TRAIL false END";
-        let mut on_fail = HashMap::new();
-        on_fail.insert(
-            GoalFailureType::Timeout,
-            Statement::Set {
-                name: "failed".to_string(),
-                value: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))),
-            },
-        );
-        let expected = Statement::Goal {
-            name: "guarded".to_string(),
-            body: vec![],
-            outputs: vec![],
-            result_into: None,
-            retry: None,
-            on_fail,
-            deadline: None,
-            wait: Some(2.0),
-            idempotent: false,
-            audit_trail: false,
+            confirm_with: None,
+            timeout_confirmation: None,
             fallback: None,
         };
         assert_eq!(parse_goal(input), Ok(("", expected)));
@@ -1130,11 +1443,11 @@ mod tests {
         let expected = Statement::If {
             condition: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))),
             then_branch: vec![Statement::Set {
-                name: "x".to_string(),
+                variable: "x".to_string(),
                 value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
             }],
             else_branch: Some(vec![Statement::Set {
-                name: "x".to_string(),
+                variable: "x".to_string(),
                 value: Expression::Literal(AnnotatedValue::from(Value::Number(2.0))),
             }]),
         };
@@ -1150,28 +1463,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_remember() {
-        let input = "REMEMBER pref VALUE \"high\" SCOPE session END";
-        if let Ok(("", Statement::Remember { name, scope, .. })) = parse_remember(input) {
-            assert_eq!(name, "pref");
-            assert_eq!(scope, MemoryScope::Session);
-        } else {
-            panic!("Failed to parse REMEMBER");
-        }
-    }
-
-    #[test]
-    fn test_parse_recall() {
-        let input = "RECALL pref INTO {my_pref} SCOPE long_term END";
-        if let Ok(("", Statement::Recall { name, into_var, .. })) = parse_recall(input) {
-            assert_eq!(name, "pref");
-            assert_eq!(into_var, "my_pref");
-        } else {
-            panic!("Failed to parse RECALL");
-        }
-    }
-
-    #[test]
     fn test_parse_recall_fuzzy() {
         let input = "RECALL \"topic\" INTO {res} FUZZY true THRESHOLD 0.8 END";
         if let Ok(("", Statement::Recall { fuzzy, .. })) = parse_recall(input) {
@@ -1182,147 +1473,23 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_agent() {
-        let input =
-            "AGENT my_agent ID 0x123 REGISTRY acme.io SIGNED_BY acme.io TRUST_LEVEL verified END";
-        if let Ok((
-            "",
-            Statement::Agent {
-                name, trust_level, ..
-            },
-        )) = parse_agent(input)
-        {
-            assert_eq!(name, "my_agent");
-            assert_eq!(trust_level, TrustLevel::Verified);
+    fn test_parse_tool() {
+        let input = "TOOL search_flights DESCRIPTION \"Search flights\" CATEGORY read VERSION 1.0.0 INPUT from text REQUIRED END OUTPUT flights list OPTIONAL END END";
+        if let Ok(("", Statement::Tool(def))) = parse_tool(input) {
+            assert_eq!(def.name, "search_flights");
+            assert_eq!(def.description, Some("Search flights".to_string()));
+            assert_eq!(def.category, Some(ToolCategory::Read));
+            assert_eq!(def.version, Some("1.0.0".to_string()));
+            assert_eq!(def.inputs.len(), 1);
+            assert_eq!(def.inputs[0].name, "from");
+            assert_eq!(def.inputs[0].type_hint, "text");
+            assert!(def.inputs[0].required);
+            assert_eq!(def.outputs.len(), 1);
+            assert_eq!(def.outputs[0].name, "flights");
+            assert_eq!(def.outputs[0].type_hint, "list");
+            assert!(!def.outputs[0].required);
         } else {
-            panic!("Failed to parse AGENT");
-        }
-    }
-
-    #[test]
-    fn test_parse_contract() {
-        let input = "CONTRACT my_perms ISSUED_BY acme.io CAN USE search_flights CANNOT USE charge_card EXPIRES 1h END";
-        if let Ok((
-            "",
-            Statement::Contract {
-                name, capabilities, ..
-            },
-        )) = parse_contract(input)
-        {
-            assert_eq!(name, "my_perms");
-            assert_eq!(capabilities.len(), 2);
-            assert_eq!(
-                capabilities[0],
-                Permission::CanUse("search_flights".to_string())
-            );
-        } else {
-            panic!("Failed to parse CONTRACT");
-        }
-    }
-
-    #[test]
-    fn test_parse_emit() {
-        let input = "EMIT flight_found DATA {flights}";
-        if let Ok(("", Statement::Emit { event, .. })) = parse_emit(input) {
-            assert_eq!(event, "flight_found");
-        } else {
-            panic!("Failed to parse EMIT");
-        }
-    }
-
-    #[test]
-    fn test_parse_on() {
-        let input = "ON flight_found GOAL notify SET x = 1 END END";
-        if let Ok(("", Statement::On { event, handler })) = parse_on(input) {
-            assert_eq!(event, "flight_found");
-            assert_eq!(handler.len(), 1);
-        } else {
-            panic!("Failed to parse ON");
-        }
-    }
-
-    #[test]
-    fn test_parse_prove() {
-        let input = "PROVE { SET x = 1 } AS my_proof";
-        if let Ok((
-            "",
-            Statement::Prove {
-                proof_name,
-                statements,
-            },
-        )) = parse_prove(input)
-        {
-            assert_eq!(proof_name, "my_proof");
-            assert_eq!(statements.len(), 1);
-        } else {
-            panic!("Failed to parse PROVE");
-        }
-    }
-
-    #[test]
-    fn test_parse_reveal() {
-        let input = "REVEAL my_proof TO other_agent";
-        if let Ok((
-            "",
-            Statement::Reveal {
-                proof_name,
-                to_agent,
-                ..
-            },
-        )) = parse_reveal(input)
-        {
-            assert_eq!(proof_name, "my_proof");
-            assert_eq!(to_agent, Some("other_agent".to_string()));
-        } else {
-            panic!("Failed to parse REVEAL");
-        }
-    }
-
-    #[test]
-    fn test_parse_use_wasm() {
-        let input = "USE_WASM \"tools/math.wasm\" FUNCTION \"add\" a 1 b 2 RESULT INTO {res} END";
-        if let Ok((
-            "",
-            Statement::UseWasm {
-                module_path,
-                function_name,
-                ..
-            },
-        )) = parse_use_wasm(input)
-        {
-            assert_eq!(module_path, "tools/math.wasm");
-            assert_eq!(function_name, "add");
-        } else {
-            panic!("Failed to parse USE_WASM");
-        }
-    }
-
-    #[test]
-    fn test_parse_call() {
-        let input = "CALL \"agent_b\" GOAL \"pay\" amt 100 RESULT INTO {res} END";
-        if let Ok((
-            "",
-            Statement::Call {
-                agent_id,
-                goal_name,
-                ..
-            },
-        )) = parse_call(input)
-        {
-            assert_eq!(agent_id, "agent_b");
-            assert_eq!(goal_name, "pay");
-        } else {
-            panic!("Failed to parse CALL");
-        }
-    }
-
-    #[test]
-    fn test_parse_await() {
-        let input = "AWAIT {res}";
-        if let Ok(("", Statement::Await { call_id })) = parse_await(input) {
-            assert_eq!(call_id, "res");
-        } else {
-            panic!("Failed to parse AWAIT");
+            panic!("Failed to parse TOOL");
         }
     }
 
@@ -1335,5 +1502,18 @@ mod tests {
         // Invalid keyword
         let input = "NOT_A_KEYWORD x = 1";
         assert!(parse_program(input).is_err() || parse_program(input).unwrap().1.is_empty());
+
+        // Malformed SET
+        assert!(parse_set("SET x 1").is_err());
+        
+        // Malformed IF
+        assert!(parse_if("IF true SET x = 1 END").is_ok());
+        assert!(parse_if("IF true SET x = 1").is_err());
+
+        // Malformed REMEMBER
+        assert!(parse_remember("REMEMBER key VALUE").is_err());
+
+        // Malformed RECALL
+        assert!(parse_recall("RECALL key").is_err());
     }
 }

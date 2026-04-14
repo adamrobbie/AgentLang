@@ -1,48 +1,51 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Statement {
     Set {
-        name: String,
+        variable: String,
         value: Expression,
+    },
+    UseTool {
+        tool_name: String,
+        args: HashMap<String, Expression>,
+        result_into: Option<VariablePath>,
+    },
+    Tool(ToolDefinition),
+    Goal {
+        name: String,
+        body: Vec<Statement>,
+        outputs: Vec<GoalOutput>,
+        result_into: Option<VariablePath>,
+        retry: Option<u32>,
+        on_fail: HashMap<GoalFailureType, Statement>,
+        deadline: Option<f64>,
+        wait: Option<f64>,
+        idempotent: bool,
+        audit_trail: bool,
+        confirm_with: Option<String>,
+        timeout_confirmation: Option<f64>,
+        fallback: Option<Box<Statement>>,
+    },
+    Parallel {
+        branches: Vec<Vec<Statement>>,
+        result_into: Option<VariablePath>,
+        deadline: Option<f64>,
+        pattern: ParallelPattern,
     },
     If {
         condition: Expression,
         then_branch: Vec<Statement>,
         else_branch: Option<Vec<Statement>>,
     },
-    UseTool {
-        tool_name: String,
-        args: HashMap<String, Expression>,
-        result_into: String,
-    },
-    Goal {
-        name: String,
-        body: Vec<Statement>,
-        outputs: Vec<GoalOutput>,
-        result_into: Option<String>,
-        retry: Option<usize>,
-        on_fail: HashMap<GoalFailureType, Statement>,
-        deadline: Option<f64>,
-        wait: Option<f64>,
-        idempotent: bool,
-        audit_trail: bool,
-        fallback: Option<Expression>,
-    },
-    Parallel {
-        pattern: ParallelPattern,
-        branches: Vec<Statement>,
-        result_into: Option<String>,
-        deadline: Option<f64>,
-    },
-    Repeat {
-        condition: Expression,
-        body: Vec<Statement>,
-    },
     ForEach {
         item: String,
         list: Expression,
+        body: Vec<Statement>,
+    },
+    Repeat {
+        condition: Expression,
         body: Vec<Statement>,
     },
     Wait {
@@ -77,11 +80,13 @@ pub enum Statement {
         name: String,
         issued_by: String,
         capabilities: Vec<Permission>,
+        budget: Option<f64>,
+        requires_confirmation: bool,
         expires: Option<f64>,
     },
     Emit {
         event: String,
-        data: Expression,
+        data: Option<Expression>,
     },
     On {
         event: String,
@@ -89,49 +94,38 @@ pub enum Statement {
     },
     Prove {
         statements: Vec<Statement>,
+        claim: String,
         proof_name: String,
     },
     Reveal {
         proof_name: String,
+        claim: String,
         to_agent: Option<String>,
-        result_into: Option<String>,
+        result_into: Option<VariablePath>,
     },
     UseWasm {
         module_path: String,
         function_name: String,
-        args: HashMap<String, Expression>,
-        result_into: String,
+        args: Vec<(String, Expression)>,
+        result_into: Option<VariablePath>,
     },
     Call {
         agent_id: String,
         goal_name: String,
         args: HashMap<String, Expression>,
-        result_into: String,
+        timeout: Option<f64>,
+        signed_by: Option<String>,
+        result_into: Option<VariablePath>,
+    },
+    Delegate {
+        agent_id: String,
+        goal_name: String,
+        args: HashMap<String, Expression>,
     },
     Await {
-        call_id: String, // Simplified for now as result_into var
+        call_id: String,
+        result_into: Option<VariablePath>,
     },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct GoalOutput {
-    pub name: String,
-    pub type_name: String,
-    pub annotations: Vec<Annotation>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct GoalDefinition {
-    pub body: Vec<Statement>,
-    pub outputs: Vec<GoalOutput>,
-    pub result_into: Option<String>,
-    pub retry: Option<usize>,
-    pub on_fail: HashMap<GoalFailureType, Statement>,
-    pub deadline: Option<f64>,
-    pub wait: Option<f64>,
-    pub idempotent: bool,
-    pub audit_trail: bool,
-    pub fallback: Option<Expression>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -145,20 +139,66 @@ pub enum GoalFailureType {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum TrustLevel {
-    Verified,
-    Trusted,
-    Sandboxed,
-    Blocked,
+pub struct GoalOutput {
+    pub name: String,
+    pub type_name: String,
+    pub annotations: Vec<Annotation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ToolCategory {
+    Read,
+    Write,
+    Agent,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum Permission {
-    CanUse(String),
-    CannotUse(String),
+pub struct ToolField {
+    pub name: String,
+    pub type_hint: String,
+    pub required: bool,
+    pub annotations: Vec<Annotation>,
 }
 
-#[derive(Debug, Clone, PartialEq, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: Option<String>,
+    pub category: Option<ToolCategory>,
+    pub version: Option<String>,
+    pub inputs: Vec<ToolField>,
+    pub outputs: Vec<ToolField>,
+    pub reversible: bool,
+    pub side_effect: bool,
+    pub rate_limit: Option<String>,
+    pub timeout: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GoalDefinition {
+    pub body: Vec<Statement>,
+    pub outputs: Vec<GoalOutput>,
+    pub result_into: Option<VariablePath>,
+    pub retry: Option<usize>,
+    pub on_fail: HashMap<GoalFailureType, Statement>,
+    pub deadline: Option<f64>,
+    pub wait: Option<f64>,
+    pub idempotent: bool,
+    pub audit_trail: bool,
+    pub confirm_with: Option<String>,
+    pub timeout_confirmation: Option<f64>,
+    pub fallback: Option<Expression>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParallelPattern {
+    Gather,
+    GatherAll,
+    GatherMin(usize),
+    Race,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MemoryScope {
     Working,
     Session,
@@ -166,51 +206,57 @@ pub enum MemoryScope {
     Shared,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum ParallelPattern {
-    Gather,
-    Race,
-    GatherMin(usize),
-    GatherAll,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrustLevel {
+    Verified,
+    Trusted,
+    Sandboxed,
+    Blocked,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Permission {
+    CanUse(String),
+    CannotUse(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VariablePath {
     pub root: String,
     pub segments: Vec<PathSegment>,
 }
 
 impl VariablePath {
-    pub fn root(name: impl Into<String>) -> Self {
+    pub fn root(name: &str) -> Self {
         Self {
-            root: name.into(),
+            root: name.to_string(),
             segments: Vec::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PathSegment {
     Field(String),
     Index(usize),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Expression {
     Literal(AnnotatedValue),
     VariableRef(VariablePath),
-    Annotated {
-        expr: Box<Expression>,
-        annotation: Annotation,
-    },
     BinaryOp {
         left: Box<Expression>,
         op: BinaryOperator,
         right: Box<Expression>,
     },
+    Annotated {
+        expr: Box<Expression>,
+        annotation: Annotation,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BinaryOperator {
     Eq,
     Gt,
@@ -219,7 +265,7 @@ pub enum BinaryOperator {
     Sub,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Annotation {
     Confidence,
     Sensitive,

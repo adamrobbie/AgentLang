@@ -3,6 +3,10 @@
 **A purpose-built language for LLM-powered agents.**  
 *Written by agents. Executed by runtimes. Trusted by design.*
 
+[![CI](https://github.com/adamrobbie/AgentLang/actions/workflows/ci.yml/badge.svg)](https://github.com/adamrobbie/AgentLang/actions/workflows/ci.yml)
+[![Coverage](https://github.com/adamrobbie/AgentLang/actions/workflows/coverage.yml/badge.svg)](https://github.com/adamrobbie/AgentLang/actions/workflows/coverage.yml)
+[![codecov](https://codecov.io/gh/adamrobbie/AgentLang/graph/badge.svg)](https://codecov.io/gh/adamrobbie/AgentLang)
+
 ---
 
 ## 🚀 Overview
