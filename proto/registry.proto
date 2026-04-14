@@ -21,6 +21,7 @@ message RegisterResponse {
 
 message LookupRequest {
   string agent_id = 1;
+  int32 ttl = 2;
 }
 
 message LookupResponse {

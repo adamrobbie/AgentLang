@@ -16,11 +16,12 @@ use winterfell::{
 pub struct PublicInputs {
     pub col0_last: BaseElement,
     pub col1_last: BaseElement,
+    pub claim_hash: BaseElement,
 }
 
 impl ToElements<BaseElement> for PublicInputs {
     fn to_elements(&self) -> Vec<BaseElement> {
-        vec![self.col0_last, self.col1_last]
+        vec![self.col0_last, self.col1_last, self.claim_hash]
     }
 }
 
@@ -53,6 +54,9 @@ impl Air for FibAir {
             Assertion::single(1, 0, BaseElement::ONE),
             Assertion::single(0, last_step, self.pub_inputs.col0_last),
             Assertion::single(1, last_step, self.pub_inputs.col1_last),
+            // The claim_hash is a public input that we assert is correct.
+            // In a more complex AIR, this would be tied to the trace.
+            // For this prototype, we just verify it matches the public input.
         ]
     }
 
@@ -79,11 +83,15 @@ impl Air for FibAir {
 
 pub struct FibProver {
     options: ProofOptions,
+    claim_hash: BaseElement,
 }
 
 impl FibProver {
-    pub fn new(options: ProofOptions) -> Self {
-        Self { options }
+    pub fn new(options: ProofOptions, claim_hash: BaseElement) -> Self {
+        Self {
+            options,
+            claim_hash,
+        }
     }
 
     pub fn build_trace(&self, n: usize) -> TraceTable<BaseElement> {
@@ -122,6 +130,7 @@ impl Prover for FibProver {
         PublicInputs {
             col0_last: trace.get(0, last_step),
             col1_last: trace.get(1, last_step),
+            claim_hash: self.claim_hash,
         }
     }
 
@@ -173,10 +182,19 @@ pub struct StarkProof {
     pub proof: Vec<u8>,
     pub col0_last: u64,
     pub col1_last: u64,
+    pub claim_hash: u64,
     pub num_steps: usize,
 }
 
-pub fn generate_proof(n: usize) -> anyhow::Result<StarkProof> {
+fn hash_claim(claim: &str) -> BaseElement {
+    let mut h: u128 = 0;
+    for b in claim.as_bytes() {
+        h = h.wrapping_add(*b as u128).wrapping_mul(31);
+    }
+    BaseElement::new(h)
+}
+
+pub fn generate_proof(n: usize, claim: &str) -> anyhow::Result<StarkProof> {
     let options = ProofOptions::new(
         32,
         8,
@@ -188,7 +206,8 @@ pub fn generate_proof(n: usize) -> anyhow::Result<StarkProof> {
         BatchingMethod::Linear,
     );
 
-    let prover = FibProver::new(options);
+    let claim_hash = hash_claim(claim);
+    let prover = FibProver::new(options, claim_hash);
     let trace = prover.build_trace(n);
     let pub_inputs = prover.get_pub_inputs(&trace);
 
@@ -200,17 +219,24 @@ pub fn generate_proof(n: usize) -> anyhow::Result<StarkProof> {
         proof: proof.to_bytes(),
         col0_last: pub_inputs.col0_last.as_int() as u64,
         col1_last: pub_inputs.col1_last.as_int() as u64,
+        claim_hash: pub_inputs.claim_hash.as_int() as u64,
         num_steps: n,
     })
 }
 
-pub fn verify_proof(proof_data: &StarkProof) -> anyhow::Result<()> {
+pub fn verify_proof(proof_data: &StarkProof, claim: &str) -> anyhow::Result<()> {
+    let expected_claim_hash = hash_claim(claim);
+    if proof_data.claim_hash != expected_claim_hash.as_int() as u64 {
+        return Err(anyhow::anyhow!("Proof was not generated for this claim"));
+    }
+
     let proof = Proof::from_bytes(&proof_data.proof)
         .map_err(|e| anyhow::anyhow!("Failed to parse STARK proof: {}", e))?;
 
     let pub_inputs = PublicInputs {
         col0_last: BaseElement::new(proof_data.col0_last as u128),
         col1_last: BaseElement::new(proof_data.col1_last as u128),
+        claim_hash: expected_claim_hash,
     };
     let min_opts = AcceptableOptions::MinConjecturedSecurity(95);
 
@@ -229,25 +255,31 @@ mod tests {
 
     #[test]
     fn test_generate_and_verify_proof_success() {
-        let proof_data = generate_proof(64).unwrap();
-        assert!(verify_proof(&proof_data).is_ok());
+        let proof_data = generate_proof(64, "my_claim").unwrap();
+        assert!(verify_proof(&proof_data, "my_claim").is_ok());
     }
 
     #[test]
     fn test_verify_proof_invalid_inputs() {
-        let mut proof_data = generate_proof(64).unwrap();
+        let mut proof_data = generate_proof(64, "my_claim").unwrap();
         // Tamper with public inputs
         proof_data.col0_last += 1;
-        assert!(verify_proof(&proof_data).is_err());
+        assert!(verify_proof(&proof_data, "my_claim").is_err());
+    }
+
+    #[test]
+    fn test_verify_proof_invalid_claim() {
+        let proof_data = generate_proof(64, "correct_claim").unwrap();
+        assert!(verify_proof(&proof_data, "wrong_claim").is_err());
     }
 
     #[test]
     fn test_verify_proof_invalid_proof() {
-        let mut proof_data = generate_proof(64).unwrap();
+        let mut proof_data = generate_proof(64, "my_claim").unwrap();
         // Tamper with proof bytes
         if let Some(byte) = proof_data.proof.get_mut(100) {
             *byte ^= 0xFF;
         }
-        assert!(verify_proof(&proof_data).is_err());
+        assert!(verify_proof(&proof_data, "my_claim").is_err());
     }
 }
