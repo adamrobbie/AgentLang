@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
 
         // Inform the context of its registered identity so outgoing RPC calls sign
         // with the correct caller_id rather than a hardcoded placeholder.
-        *ctx_b.agent_id.lock().unwrap() = agent_id;
+        *ctx_b.agent_id.lock().unwrap_or_else(|e| e.into_inner()) = agent_id;
     }
 
     // 4. Start Primary Orchestrator
@@ -194,7 +194,7 @@ async fn main() -> Result<()> {
 
         // Update the context so that outgoing CALL/DELEGATE operations use the
         // registered ID when signing requests instead of a stale default.
-        *ctx.agent_id.lock().unwrap() = agent_id;
+        *ctx.agent_id.lock().unwrap_or_else(|e| e.into_inner()) = agent_id;
     }
 
     // Integrated demonstration

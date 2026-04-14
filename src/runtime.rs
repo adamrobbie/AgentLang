@@ -1238,8 +1238,10 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                         wait: *wait,
                         idempotent: *idempotent,
                         audit_trail: *audit_trail,
-                        confirm_with: None,
-                        timeout_confirmation: None,
+                        // Preserve parsed values even though execution of these fields
+                        // is not yet implemented; keeps GoalDefinition consistent with AST.
+                        confirm_with: _confirm_with.clone(),
+                        timeout_confirmation: *_timeout_confirmation,
                         fallback: None,
                     },
                 );
@@ -1630,7 +1632,6 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                         while let Some(res) = join_set.join_next().await {
                             if let Ok(Ok((idx, changes))) = res {
                                 join_set.abort_all();
-                                while join_set.join_next().await.is_some() {}
                                 results.insert(
                                     "winner".to_string(),
                                     AnnotatedValue::from(Value::Number(idx as f64)),
@@ -1656,7 +1657,6 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                                 if success_count >= n {
                                     // We have enough results; cancel remaining tasks.
                                     join_set.abort_all();
-                                    while join_set.join_next().await.is_some() {}
                                     break;
                                 }
                             }
