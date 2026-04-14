@@ -1,15 +1,11 @@
-use AgentLang::*;
 use AgentLang::ast;
-use AgentLang::runtime;
 use AgentLang::parser;
-use anyhow::Result;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use tonic::transport::Server;
-use AgentLang::registry_rpc::registry_service_server::RegistryServiceServer;
-use AgentLang::agent_rpc::agent_service_server::AgentServiceServer;
 use AgentLang::registry_rpc::RegisterRequest;
+use AgentLang::runtime;
+use AgentLang::*;
+use anyhow::Result;
 use ed25519_dalek::Signer;
+use std::collections::HashMap;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -78,10 +74,11 @@ async fn main() -> Result<()> {
             .to_bytes()
             .to_vec();
 
-        let mut client = AgentLang::registry_rpc::registry_service_client::RegistryServiceClient::connect(
-            registry_addr.to_string(),
-        )
-        .await?;
+        let mut client =
+            AgentLang::registry_rpc::registry_service_client::RegistryServiceClient::connect(
+                registry_addr.to_string(),
+            )
+            .await?;
         client
             .register_agent(RegisterRequest {
                 agent_id,
@@ -96,32 +93,65 @@ async fn main() -> Result<()> {
     let ctx = runtime::Context::new();
     {
         let mut handlers = ctx.tool_handlers.lock().unwrap();
-        handlers.insert("search_flights".to_string(), std::sync::Arc::new(|args| {
-            let query = args.get("query").map(|v| format!("{:?}", v.value)).unwrap_or_default();
-            println!("  [Native Tool] search_flights executed with query: {}", query);
-            
-            let mut flight = HashMap::new();
-            flight.insert("id".to_string(), ast::AnnotatedValue::from(ast::Value::Text("FL-456".to_string())));
-            flight.insert("price".to_string(), ast::AnnotatedValue::from(ast::Value::Number(299.0)));
-            
-            let mut result = HashMap::new();
-            result.insert("flights".to_string(), ast::AnnotatedValue::from(ast::Value::List(vec![ast::AnnotatedValue::from(ast::Value::Object(flight))])));
-            Ok(ast::AnnotatedValue::from(ast::Value::Object(result)))
-        }));
+        handlers.insert(
+            "search_flights".to_string(),
+            std::sync::Arc::new(|args| {
+                let query = args
+                    .get("query")
+                    .map(|v| format!("{:?}", v.value))
+                    .unwrap_or_default();
+                println!(
+                    "  [Native Tool] search_flights executed with query: {}",
+                    query
+                );
+
+                let mut flight = HashMap::new();
+                flight.insert(
+                    "id".to_string(),
+                    ast::AnnotatedValue::from(ast::Value::Text("FL-456".to_string())),
+                );
+                flight.insert(
+                    "price".to_string(),
+                    ast::AnnotatedValue::from(ast::Value::Number(299.0)),
+                );
+
+                let mut result = HashMap::new();
+                result.insert(
+                    "flights".to_string(),
+                    ast::AnnotatedValue::from(ast::Value::List(vec![ast::AnnotatedValue::from(
+                        ast::Value::Object(flight),
+                    )])),
+                );
+                Ok(ast::AnnotatedValue::from(ast::Value::Object(result)))
+            }),
+        );
 
         let mut tools = ctx.tools.lock().unwrap();
-        tools.insert("search_flights".to_string(), ast::ToolDefinition {
-            name: "search_flights".to_string(),
-            description: Some("Search for flights".to_string()),
-            category: Some(ast::ToolCategory::Read),
-            version: Some("1.0.0".to_string()),
-            inputs: vec![ast::ToolField { name: "query".to_string(), type_hint: "text".to_string(), required: true, annotations: vec![] }],
-            outputs: vec![ast::ToolField { name: "flights".to_string(), type_hint: "list".to_string(), required: true, annotations: vec![] }],
-            reversible: false,
-            side_effect: false,
-            rate_limit: None,
-            timeout: Some(5.0),
-        });
+        tools.insert(
+            "search_flights".to_string(),
+            ast::ToolDefinition {
+                name: "search_flights".to_string(),
+                description: Some("Search for flights".to_string()),
+                category: Some(ast::ToolCategory::Read),
+                version: Some("1.0.0".to_string()),
+                inputs: vec![ast::ToolField {
+                    name: "query".to_string(),
+                    type_hint: "text".to_string(),
+                    required: true,
+                    annotations: vec![],
+                }],
+                outputs: vec![ast::ToolField {
+                    name: "flights".to_string(),
+                    type_hint: "list".to_string(),
+                    required: true,
+                    annotations: vec![],
+                }],
+                reversible: false,
+                side_effect: false,
+                rate_limit: None,
+                timeout: Some(5.0),
+            },
+        );
     }
     let service_a = MyAgentService {
         ctx: ctx.clone(),
@@ -144,10 +174,11 @@ async fn main() -> Result<()> {
             .to_bytes()
             .to_vec();
 
-        let mut client = AgentLang::registry_rpc::registry_service_client::RegistryServiceClient::connect(
-            registry_addr.to_string(),
-        )
-        .await?;
+        let mut client =
+            AgentLang::registry_rpc::registry_service_client::RegistryServiceClient::connect(
+                registry_addr.to_string(),
+            )
+            .await?;
         client
             .register_agent(RegisterRequest {
                 agent_id,

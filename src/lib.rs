@@ -1,13 +1,14 @@
+#![allow(non_snake_case)]
 pub mod ast;
 pub mod crypto;
 pub mod parser;
 pub mod runtime;
 
 use anyhow::Result;
-use tonic::{Request, Response, Status, transport::Server};
+use ed25519_dalek::{Verifier, VerifyingKey};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use ed25519_dalek::{Signer, Verifier, VerifyingKey};
+use tonic::{Request, Response, Status, transport::Server};
 
 pub mod agent_rpc {
     tonic::include_proto!("agent");
@@ -19,8 +20,8 @@ pub mod registry_rpc {
 
 use agent_rpc::agent_service_server::{AgentService, AgentServiceServer};
 use agent_rpc::{CallRequest, CallResponse};
-use registry_rpc::registry_service_server::{RegistryService, RegistryServiceServer};
 use registry_rpc::registry_service_client::RegistryServiceClient;
+use registry_rpc::registry_service_server::{RegistryService, RegistryServiceServer};
 use registry_rpc::{
     GetSharedRequest, GetSharedResponse, LookupRequest, LookupResponse, PutSharedRequest,
     PutSharedResponse, RegisterRequest, RegisterResponse,
@@ -42,6 +43,12 @@ impl MyRegistryService {
             shared_state: Arc::new(Mutex::new(HashMap::new())),
             peer_registries: Vec::new(),
         }
+    }
+}
+
+impl Default for MyRegistryService {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -90,7 +97,7 @@ impl RegistryService for MyRegistryService {
         request: Request<LookupRequest>,
     ) -> Result<Response<LookupResponse>, Status> {
         let req = request.into_inner();
-        
+
         {
             let agents = self.agents.lock().unwrap();
             if let Some((endpoint, pub_key)) = agents.get(&req.agent_id) {
@@ -113,7 +120,10 @@ impl RegistryService for MyRegistryService {
                     if let Ok(res) = client.lookup_agent(federated_req).await {
                         let res: LookupResponse = res.into_inner();
                         if res.found {
-                            println!("  [Registry] Federated lookup SUCCESS for '{}' via peer {}", req.agent_id, peer);
+                            println!(
+                                "  [Registry] Federated lookup SUCCESS for '{}' via peer {}",
+                                req.agent_id, peer
+                            );
                             return Ok(Response::new(res));
                         }
                     }
@@ -179,9 +189,7 @@ impl AgentService for MyAgentService {
 
         let mut lookup_res = None;
         for reg_addr in &self.registries {
-            if let Ok(mut client) =
-                RegistryServiceClient::connect(reg_addr.clone())
-                .await
+            if let Ok(mut client) = RegistryServiceClient::connect(reg_addr.clone()).await
                 && let Ok(res) = client
                     .lookup_agent(LookupRequest {
                         agent_id: req.caller_id.clone(),
@@ -261,7 +269,7 @@ impl AgentService for MyAgentService {
                 audit_trail: goal_definition.audit_trail,
                 confirm_with: goal_definition.confirm_with,
                 timeout_confirmation: goal_definition.timeout_confirmation,
-                fallback: None, 
+                fallback: None,
             };
 
             if let Err(e) = runtime::eval(&goal_stmt, isolated_ctx.clone()).await {
@@ -311,41 +319,70 @@ pub async fn start_agent(service: MyAgentService, addr: std::net::SocketAddr) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::Signer;
     use tonic::Request;
 
     #[tokio::test]
     async fn test_registry_local_ops() {
         let registry = MyRegistryService::new();
-        
+
         // 1. Register
         let ctx = runtime::Context::new();
         let agent_id = "agent1".to_string();
         let endpoint = "http://localhost:1".to_string();
         let payload = format!("{}:{}", agent_id, endpoint);
-        let signature = ctx.identity.signing_key.sign(payload.as_bytes()).to_bytes().to_vec();
-        
+        let signature = ctx
+            .identity
+            .signing_key
+            .sign(payload.as_bytes())
+            .to_bytes()
+            .to_vec();
+
         let reg_req = RegisterRequest {
             agent_id: agent_id.clone(),
             endpoint: endpoint.clone(),
             public_key: ctx.identity.verifying_key.to_bytes().to_vec(),
             signature,
         };
-        
-        let res = registry.register_agent(Request::new(reg_req)).await.unwrap().into_inner();
+
+        let res = registry
+            .register_agent(Request::new(reg_req))
+            .await
+            .unwrap()
+            .into_inner();
         assert!(res.success);
-        
+
         // 2. Lookup
-        let lookup_req = LookupRequest { agent_id: agent_id.clone(), ttl: 0 };
-        let res = registry.lookup_agent(Request::new(lookup_req)).await.unwrap().into_inner();
+        let lookup_req = LookupRequest {
+            agent_id: agent_id.clone(),
+            ttl: 0,
+        };
+        let res = registry
+            .lookup_agent(Request::new(lookup_req))
+            .await
+            .unwrap()
+            .into_inner();
         assert!(res.found);
         assert_eq!(res.endpoint, endpoint);
-        
+
         // 3. Shared State
-        let put_req = PutSharedRequest { key: "k1".to_string(), value_json: b"v1".to_vec() };
-        registry.put_shared_state(Request::new(put_req)).await.unwrap();
-        
-        let get_req = GetSharedRequest { key: "k1".to_string() };
-        let res = registry.get_shared_state(Request::new(get_req)).await.unwrap().into_inner();
+        let put_req = PutSharedRequest {
+            key: "k1".to_string(),
+            value_json: b"v1".to_vec(),
+        };
+        registry
+            .put_shared_state(Request::new(put_req))
+            .await
+            .unwrap();
+
+        let get_req = GetSharedRequest {
+            key: "k1".to_string(),
+        };
+        let res = registry
+            .get_shared_state(Request::new(get_req))
+            .await
+            .unwrap()
+            .into_inner();
         assert!(res.found);
         assert_eq!(res.value_json, b"v1");
     }
@@ -353,15 +390,18 @@ mod tests {
     #[tokio::test]
     async fn test_agent_service_call_not_found() {
         let ctx = runtime::Context::new();
-        let service = MyAgentService { ctx, registries: Vec::new() };
-        
+        let service = MyAgentService {
+            ctx,
+            registries: Vec::new(),
+        };
+
         let req = CallRequest {
             goal_name: "missing".to_string(),
             args: HashMap::new(),
             caller_id: "caller".to_string(),
             signature: Vec::new(),
         };
-        
+
         // This should fail because the caller isn't in any registry
         let res = service.call_goal(Request::new(req)).await;
         assert!(res.is_err());
@@ -372,18 +412,23 @@ mod tests {
     async fn test_federated_lookup_logic() {
         let mut reg1 = MyRegistryService::new();
         let reg2 = MyRegistryService::new();
-        
+
         // Mock reg2 addr
         let addr2 = "http://[::1]:50099".to_string();
         reg1.peer_registries.push(addr2.clone());
-        
+
         // 1. Register agent in reg2
         let ctx = runtime::Context::new();
         let agent_id = "target_agent".to_string();
         let endpoint = "http://localhost:99".to_string();
         let payload = format!("{}:{}", agent_id, endpoint);
-        let signature = ctx.identity.signing_key.sign(payload.as_bytes()).to_bytes().to_vec();
-        
+        let signature = ctx
+            .identity
+            .signing_key
+            .sign(payload.as_bytes())
+            .to_bytes()
+            .to_vec();
+
         let reg_req = RegisterRequest {
             agent_id: agent_id.clone(),
             endpoint: endpoint.clone(),
@@ -400,9 +445,16 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // 3. Lookup via reg1 (should federate to reg2)
-        let lookup_req = LookupRequest { agent_id: agent_id.clone(), ttl: 3 };
-        let res = reg1.lookup_agent(Request::new(lookup_req)).await.unwrap().into_inner();
-        
+        let lookup_req = LookupRequest {
+            agent_id: agent_id.clone(),
+            ttl: 3,
+        };
+        let res = reg1
+            .lookup_agent(Request::new(lookup_req))
+            .await
+            .unwrap()
+            .into_inner();
+
         assert!(res.found);
         assert_eq!(res.endpoint, endpoint);
     }
@@ -410,25 +462,37 @@ mod tests {
     #[tokio::test]
     async fn test_registry_error_paths() {
         let registry = MyRegistryService::new();
-        
+
         // 1. Invalid Public Key Length
-        let mut reg_req = RegisterRequest::default();
-        reg_req.public_key = vec![0u8; 10]; // Too short
+        let reg_req = RegisterRequest {
+            public_key: vec![0u8; 10], // Too short
+            ..Default::default()
+        };
         let res = registry.register_agent(Request::new(reg_req)).await;
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().code(), Status::invalid_argument("").code());
 
         // 2. Invalid Signature
-        let mut reg_req = RegisterRequest::default();
-        reg_req.public_key = vec![0u8; 32];
-        reg_req.signature = vec![0u8; 64];
+        let ctx_test = runtime::Context::new();
+        let valid_pub_key = ctx_test.identity.verifying_key.to_bytes().to_vec();
+        let reg_req = RegisterRequest {
+            public_key: valid_pub_key,
+            signature: vec![0u8; 64], // Wrong signature for this key
+            ..Default::default()
+        };
         let res = registry.register_agent(Request::new(reg_req)).await;
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().code(), Status::unauthenticated("").code());
 
         // 3. Shared State Not Found
-        let get_req = GetSharedRequest { key: "missing".to_string() };
-        let res = registry.get_shared_state(Request::new(get_req)).await.unwrap().into_inner();
+        let get_req = GetSharedRequest {
+            key: "missing".to_string(),
+        };
+        let res = registry
+            .get_shared_state(Request::new(get_req))
+            .await
+            .unwrap()
+            .into_inner();
         assert!(!res.found);
     }
 
@@ -438,35 +502,46 @@ mod tests {
         // Register a goal
         {
             let mut goals = ctx.goals.lock().unwrap();
-            goals.insert("hello".to_string(), ast::GoalDefinition {
-                body: vec![],
-                outputs: vec![],
-                result_into: None,
-                retry: None,
-                on_fail: HashMap::new(),
-                deadline: None,
-                wait: None,
-                idempotent: false,
-                audit_trail: false,
-                confirm_with: None,
-                timeout_confirmation: None,
-                fallback: None,
-            });
+            goals.insert(
+                "hello".to_string(),
+                ast::GoalDefinition {
+                    body: vec![],
+                    outputs: vec![],
+                    result_into: None,
+                    retry: None,
+                    on_fail: HashMap::new(),
+                    deadline: None,
+                    wait: None,
+                    idempotent: false,
+                    audit_trail: false,
+                    confirm_with: None,
+                    timeout_confirmation: None,
+                    fallback: None,
+                },
+            );
         }
-        
+
         let registry = MyRegistryService::new();
         // Register the caller in the registry
         let caller_id = "caller".to_string();
         let endpoint = "http://localhost:1".to_string();
         let payload = format!("{}:{}", caller_id, endpoint);
-        let signature = ctx.identity.signing_key.sign(payload.as_bytes()).to_bytes().to_vec();
-        
-        registry.register_agent(Request::new(RegisterRequest {
-            agent_id: caller_id.clone(),
-            endpoint,
-            public_key: ctx.identity.verifying_key.to_bytes().to_vec(),
-            signature,
-        })).await.unwrap();
+        let signature = ctx
+            .identity
+            .signing_key
+            .sign(payload.as_bytes())
+            .to_bytes()
+            .to_vec();
+
+        registry
+            .register_agent(Request::new(RegisterRequest {
+                agent_id: caller_id.clone(),
+                endpoint,
+                public_key: ctx.identity.verifying_key.to_bytes().to_vec(),
+                signature,
+            }))
+            .await
+            .unwrap();
 
         // Start registry server so the service can verify the caller
         let reg_addr = "http://[::1]:50111".to_string();
@@ -476,12 +551,20 @@ mod tests {
         });
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let service = MyAgentService { ctx: ctx.clone(), registries: vec![reg_addr] };
-        
+        let service = MyAgentService {
+            ctx: ctx.clone(),
+            registries: vec![reg_addr],
+        };
+
         // Prepare signed call
         let goal_name = "hello".to_string();
         let call_payload = format!("{}:{}", goal_name, caller_id);
-        let call_signature = ctx.identity.signing_key.sign(call_payload.as_bytes()).to_bytes().to_vec();
+        let call_signature = ctx
+            .identity
+            .signing_key
+            .sign(call_payload.as_bytes())
+            .to_bytes()
+            .to_vec();
 
         let req = CallRequest {
             goal_name,
@@ -489,8 +572,12 @@ mod tests {
             caller_id,
             signature: call_signature,
         };
-        
-        let res = service.call_goal(Request::new(req)).await.unwrap().into_inner();
+
+        let res = service
+            .call_goal(Request::new(req))
+            .await
+            .unwrap()
+            .into_inner();
         assert!(res.success);
     }
 }
