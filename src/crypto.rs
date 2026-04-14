@@ -88,7 +88,10 @@ pub struct FibProver {
 
 impl FibProver {
     pub fn new(options: ProofOptions, claim_hash: BaseElement) -> Self {
-        Self { options, claim_hash }
+        Self {
+            options,
+            claim_hash,
+        }
     }
 
     pub fn build_trace(&self, n: usize) -> TraceTable<BaseElement> {

@@ -264,7 +264,7 @@ enum GoalOpt {
 }
 
 enum GoalItem {
-    Statement(Statement),
+    Statement(Box<Statement>),
     Outputs(Vec<GoalOutput>),
     ResultInto(VariablePath),
     Opt(GoalOpt),
@@ -363,10 +363,9 @@ fn parse_goal_opt(input: &str) -> IResult<&str, GoalOpt> {
             preceded(ws(tag("TIMEOUT_CONFIRMATION")), ws(parse_duration)),
             GoalOpt::TimeoutConfirmation,
         ),
-        map(
-            preceded(ws(tag("FALLBACK")), ws(parse_statement)),
-            |stmt| GoalOpt::Fallback(Box::new(stmt)),
-        ),
+        map(preceded(ws(tag("FALLBACK")), ws(parse_statement)), |stmt| {
+            GoalOpt::Fallback(Box::new(stmt))
+        }),
     ))
     .parse(input)
 }
@@ -376,7 +375,7 @@ fn parse_goal_item(input: &str) -> IResult<&str, GoalItem> {
         map(parse_goal_outputs, GoalItem::Outputs),
         map(parse_goal_result_into, GoalItem::ResultInto),
         map(parse_goal_opt, GoalItem::Opt),
-        map(parse_statement, GoalItem::Statement),
+        map(parse_statement, |s| GoalItem::Statement(Box::new(s))),
     ))
     .parse(input)
 }
@@ -406,7 +405,7 @@ fn parse_goal(input: &str) -> IResult<&str, Statement> {
 
             for item in items {
                 match item {
-                    GoalItem::Statement(stmt) => body.push(stmt),
+                    GoalItem::Statement(stmt) => body.push(*stmt),
                     GoalItem::Outputs(parsed_outputs) => outputs = parsed_outputs,
                     GoalItem::ResultInto(target) => result_into = Some(target),
                     GoalItem::Opt(opt) => match opt {
@@ -787,11 +786,21 @@ fn parse_contract_item(input: &str) -> IResult<&str, ContractItem> {
     alt((
         map(ws(parse_permission), ContractItem::Permission),
         map(preceded(ws(tag("BUDGET")), ws(parse_number)), |v| {
-            if let Value::Number(n) = v { ContractItem::Budget(n) } else { ContractItem::Budget(0.0) }
+            if let Value::Number(n) = v {
+                ContractItem::Budget(n)
+            } else {
+                ContractItem::Budget(0.0)
+            }
         }),
-        map(ws(tag("REQUIRES CONFIRMATION")), |_| ContractItem::RequiresConfirmation),
-        map(preceded(ws(tag("EXPIRES")), ws(parse_duration)), ContractItem::Expires),
-    )).parse(input)
+        map(ws(tag("REQUIRES CONFIRMATION")), |_| {
+            ContractItem::RequiresConfirmation
+        }),
+        map(
+            preceded(ws(tag("EXPIRES")), ws(parse_duration)),
+            ContractItem::Expires,
+        ),
+    ))
+    .parse(input)
 }
 
 /// Parse a CONTRACT block
@@ -875,7 +884,11 @@ fn parse_prove(input: &str) -> IResult<&str, Statement> {
             ws(parse_identifier),
         ),
         |(_, statements, _, claim_val, _, proof_name)| {
-            let claim = if let Value::Text(s) = claim_val { s } else { "".to_string() };
+            let claim = if let Value::Text(s) = claim_val {
+                s
+            } else {
+                "".to_string()
+            };
             Statement::Prove {
                 statements,
                 claim,
@@ -901,7 +914,11 @@ fn parse_reveal(input: &str) -> IResult<&str, Statement> {
             )),
         ),
         |(_, proof_name, _, claim_val, to_agent, result_into)| {
-            let claim = if let Value::Text(s) = claim_val { s } else { "".to_string() };
+            let claim = if let Value::Text(s) = claim_val {
+                s
+            } else {
+                "".to_string()
+            };
             Statement::Reveal {
                 proof_name,
                 claim,
@@ -955,9 +972,16 @@ enum CallModifier {
 
 fn parse_call_modifier(input: &str) -> IResult<&str, CallModifier> {
     alt((
-        map(preceded(ws(tag("TIMEOUT")), ws(parse_duration)), CallModifier::Timeout),
-        map(preceded(ws(tag("SIGNED_BY")), ws(parse_identifier)), CallModifier::SignedBy),
-    )).parse(input)
+        map(
+            preceded(ws(tag("TIMEOUT")), ws(parse_duration)),
+            CallModifier::Timeout,
+        ),
+        map(
+            preceded(ws(tag("SIGNED_BY")), ws(parse_identifier)),
+            CallModifier::SignedBy,
+        ),
+    ))
+    .parse(input)
 }
 
 /// Parse a CALL statement: CALL "agent" GOAL "name" ... [TIMEOUT d] [SIGNED_BY id] RESULT INTO {var} END
@@ -975,10 +999,18 @@ fn parse_call(input: &str) -> IResult<&str, Statement> {
             tag("END"),
         ),
         |(_, agent_id, _, goal_name, args_vec, modifiers, _, result_into, _)| {
-            let agent_id = if let Value::Text(s) = agent_id { s } else { "".to_string() };
-            let goal_name = if let Value::Text(s) = goal_name { s } else { "".to_string() };
+            let agent_id = if let Value::Text(s) = agent_id {
+                s
+            } else {
+                "".to_string()
+            };
+            let goal_name = if let Value::Text(s) = goal_name {
+                s
+            } else {
+                "".to_string()
+            };
             let args = args_vec.into_iter().collect();
-            
+
             let mut timeout = None;
             let mut signed_by = None;
             for m in modifiers {
@@ -1116,7 +1148,10 @@ fn parse_tool_item(input: &str) -> IResult<&str, ToolItem> {
         map(
             preceded(
                 ws(tag("RATE_LIMIT")),
-                ws(recognize(pair(digit1, many0(alt((alphanumeric1, tag("/"))))))),
+                ws(recognize(pair(
+                    digit1,
+                    many0(alt((alphanumeric1, tag("/")))),
+                ))),
             ),
             |v: &str| ToolItem::RateLimit(v.to_string()),
         ),
@@ -1357,7 +1392,9 @@ mod tests {
                 Expression::BinaryOp {
                     left: Box::new(Expression::VariableRef(VariablePath::root("price"))),
                     op: BinaryOperator::Add,
-                    right: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(10.0)))),
+                    right: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                        10.0
+                    )))),
                 }
             ))
         );
@@ -1505,7 +1542,7 @@ mod tests {
 
         // Malformed SET
         assert!(parse_set("SET x 1").is_err());
-        
+
         // Malformed IF
         assert!(parse_if("IF true SET x = 1 END").is_ok());
         assert!(parse_if("IF true SET x = 1").is_err());

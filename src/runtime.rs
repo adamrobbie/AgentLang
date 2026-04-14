@@ -285,7 +285,10 @@ fn ensure_value_safe_for_irreversible_action(value: &AnnotatedValue, action: &st
     if contains_uncertain_content(value) {
         return Err(anyhow!(AgentError {
             failure_type: GoalFailureType::Permission,
-            message: format!("Verification required: Attempted to {} uncertain data", action),
+            message: format!(
+                "Verification required: Attempted to {} uncertain data",
+                action
+            ),
         }));
     }
 
@@ -294,8 +297,16 @@ fn ensure_value_safe_for_irreversible_action(value: &AnnotatedValue, action: &st
 
 pub trait MemoryBackend: Send + Sync {
     fn load(&self, session_key: &aead::LessSafeKey) -> Result<HashMap<String, AnnotatedValue>>;
-    fn save(&self, session_key: &aead::LessSafeKey, memory: HashMap<String, AnnotatedValue>) -> Result<()>;
-    fn fuzzy_search(&self, query: &str, memory: &HashMap<String, AnnotatedValue>) -> Result<Option<AnnotatedValue>>;
+    fn save(
+        &self,
+        session_key: &aead::LessSafeKey,
+        memory: HashMap<String, AnnotatedValue>,
+    ) -> Result<()>;
+    fn fuzzy_search(
+        &self,
+        query: &str,
+        memory: &HashMap<String, AnnotatedValue>,
+    ) -> Result<Option<AnnotatedValue>>;
 }
 
 pub struct JsonFileBackend {
@@ -332,7 +343,11 @@ impl MemoryBackend for JsonFileBackend {
         }
     }
 
-    fn save(&self, session_key: &aead::LessSafeKey, memory: HashMap<String, AnnotatedValue>) -> Result<()> {
+    fn save(
+        &self,
+        session_key: &aead::LessSafeKey,
+        memory: HashMap<String, AnnotatedValue>,
+    ) -> Result<()> {
         let mut stored = HashMap::new();
         for (k, v) in memory {
             if v.is_sensitive {
@@ -361,7 +376,11 @@ impl MemoryBackend for JsonFileBackend {
         Ok(())
     }
 
-    fn fuzzy_search(&self, query: &str, memory: &HashMap<String, AnnotatedValue>) -> Result<Option<AnnotatedValue>> {
+    fn fuzzy_search(
+        &self,
+        query: &str,
+        memory: &HashMap<String, AnnotatedValue>,
+    ) -> Result<Option<AnnotatedValue>> {
         // Prototype: Substring match. In Phase 9 production this would be pgvector.
         for (k, v) in memory {
             if k.contains(query) {
@@ -373,6 +392,9 @@ impl MemoryBackend for JsonFileBackend {
         Ok(None)
     }
 }
+
+type ToolHandlerFn =
+    Arc<dyn Fn(HashMap<String, AnnotatedValue>) -> Result<AnnotatedValue> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Context {
@@ -389,7 +411,7 @@ pub struct Context {
     pub proofs: Arc<Mutex<HashMap<String, crypto::StarkProof>>>,
     pub goals: Arc<Mutex<HashMap<String, GoalDefinition>>>,
     pub tools: Arc<Mutex<HashMap<String, ToolDefinition>>>,
-    pub tool_handlers: Arc<Mutex<HashMap<String, Arc<dyn Fn(HashMap<String, AnnotatedValue>) -> Result<AnnotatedValue> + Send + Sync>>>>,
+    pub tool_handlers: Arc<Mutex<HashMap<String, ToolHandlerFn>>>,
     pub tool_call_timestamps: Arc<Mutex<HashMap<String, Vec<std::time::Instant>>>>,
     pub registries: Arc<Mutex<Vec<String>>>,
     pub pending_calls: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Receiver<AnnotatedValue>>>>,
@@ -464,14 +486,26 @@ impl Context {
             session_variables: Arc::new(Mutex::new(HashMap::new())),
             long_term_backend: Arc::new(Box::new(JsonFileBackend {
                 file_path: {
-                    #[cfg(test)] { unique_test_path("memory") }
-                    #[cfg(not(test))] { "memory.json".to_string() }
+                    #[cfg(test)]
+                    {
+                        unique_test_path("memory")
+                    }
+                    #[cfg(not(test))]
+                    {
+                        "memory.json".to_string()
+                    }
                 },
             })),
             shared_backend: Arc::new(Box::new(JsonFileBackend {
                 file_path: {
-                    #[cfg(test)] { unique_test_path("shared-memory") }
-                    #[cfg(not(test))] { "shared_memory.json".to_string() }
+                    #[cfg(test)]
+                    {
+                        unique_test_path("shared-memory")
+                    }
+                    #[cfg(not(test))]
+                    {
+                        "shared_memory.json".to_string()
+                    }
                 },
             })),
             identity: Arc::new(identity),
@@ -498,7 +532,15 @@ impl Context {
             pending_calls: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+}
 
+impl Default for Context {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Context {
     pub async fn get_variable(&self, name: &str, scope: MemoryScope) -> Result<AnnotatedValue> {
         match scope {
             MemoryScope::Working => self
@@ -555,10 +597,10 @@ impl Context {
 
         let mut allowed = false;
         for (name, info) in contracts.iter() {
-            if let Some(expiry) = info.expires {
-                if expiry <= 0.0 {
-                    continue;
-                }
+            if let Some(expiry) = info.expires
+                && expiry <= 0.0
+            {
+                continue;
             }
 
             for perm in &info.capabilities {
@@ -929,7 +971,8 @@ fn resolve_path(value: &AnnotatedValue, path: &VariablePath) -> Result<Annotated
                 // Support virtual metadata fields
                 match field.as_str() {
                     "confidence" => {
-                        current = AnnotatedValue::from(Value::Number(current.confidence.unwrap_or(1.0)));
+                        current =
+                            AnnotatedValue::from(Value::Number(current.confidence.unwrap_or(1.0)));
                         continue;
                     }
                     "sensitive" => {
@@ -1316,40 +1359,45 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             // 1. Lookup Tool Definition
             let tool = {
                 let tools = ctx.tools.lock().unwrap();
-                tools.get(tool_name).cloned().ok_or_else(|| anyhow!(AgentError {
-                    failure_type: GoalFailureType::ToolFail,
-                    message: format!("Tool '{}' not found in registry", tool_name),
-                }))?
+                tools.get(tool_name).cloned().ok_or_else(|| {
+                    anyhow!(AgentError {
+                        failure_type: GoalFailureType::ToolFail,
+                        message: format!("Tool '{}' not found in registry", tool_name),
+                    })
+                })?
             };
 
             // 2. Rate Limiting
             if let Some(ref limit_str) = tool.rate_limit {
                 // Simple implementation: "N/period" (e.g., "10/1m")
                 let parts: Vec<&str> = limit_str.split('/').collect();
-                if parts.len() == 2 {
-                    if let Ok(max_calls) = parts[0].parse::<usize>() {
-                        let period_secs = match parts[1] {
-                            "1s" => 1,
-                            "1m" => 60,
-                            "1h" => 3600,
-                            _ => 60, // Default to 1 minute
-                        };
-                        
-                        let mut timestamps = ctx.tool_call_timestamps.lock().unwrap();
-                        let calls = timestamps.entry(tool_name.clone()).or_insert_with(|| Vec::new());
-                        let now = std::time::Instant::now();
-                        
-                        // Clean up old timestamps
-                        calls.retain(|t| now.duration_since(*t).as_secs() < period_secs);
-                        
-                        if calls.len() >= max_calls {
-                            return Err(anyhow!(AgentError {
-                                failure_type: GoalFailureType::ToolFail,
-                                message: format!("Rate limit exceeded for tool '{}': {}", tool_name, limit_str),
-                            }));
-                        }
-                        calls.push(now);
+                if parts.len() == 2
+                    && let Ok(max_calls) = parts[0].parse::<usize>()
+                {
+                    let period_secs = match parts[1] {
+                        "1s" => 1,
+                        "1m" => 60,
+                        "1h" => 3600,
+                        _ => 60, // Default to 1 minute
+                    };
+
+                    let mut timestamps = ctx.tool_call_timestamps.lock().unwrap();
+                    let calls = timestamps.entry(tool_name.clone()).or_default();
+                    let now = std::time::Instant::now();
+
+                    // Clean up old timestamps
+                    calls.retain(|t| now.duration_since(*t).as_secs() < period_secs);
+
+                    if calls.len() >= max_calls {
+                        return Err(anyhow!(AgentError {
+                            failure_type: GoalFailureType::ToolFail,
+                            message: format!(
+                                "Rate limit exceeded for tool '{}': {}",
+                                tool_name, limit_str
+                            ),
+                        }));
                     }
+                    calls.push(now);
                 }
             }
 
@@ -1363,7 +1411,10 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 if input_field.required && !evaluated_args.contains_key(&input_field.name) {
                     return Err(anyhow!(AgentError {
                         failure_type: GoalFailureType::ToolFail,
-                        message: format!("Missing required input '{}' for tool '{}'", input_field.name, tool_name),
+                        message: format!(
+                            "Missing required input '{}' for tool '{}'",
+                            input_field.name, tool_name
+                        ),
                     }));
                 }
                 // Basic type hint validation (prototype)
@@ -1373,7 +1424,10 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                             if !matches!(arg_val.value, Value::Number(_)) {
                                 return Err(anyhow!(AgentError {
                                     failure_type: GoalFailureType::ToolFail,
-                                    message: format!("Type mismatch for '{}': expected number, found {:?}", input_field.name, arg_val.value),
+                                    message: format!(
+                                        "Type mismatch for '{}': expected number, found {:?}",
+                                        input_field.name, arg_val.value
+                                    ),
                                 }));
                             }
                         }
@@ -1381,7 +1435,10 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                             if !matches!(arg_val.value, Value::Text(_)) {
                                 return Err(anyhow!(AgentError {
                                     failure_type: GoalFailureType::ToolFail,
-                                    message: format!("Type mismatch for '{}': expected text, found {:?}", input_field.name, arg_val.value),
+                                    message: format!(
+                                        "Type mismatch for '{}': expected text, found {:?}",
+                                        input_field.name, arg_val.value
+                                    ),
                                 }));
                             }
                         }
@@ -1413,7 +1470,8 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                             "boolean" => Value::Boolean(true),
                             _ => Value::Text(format!("Mock result for {}", output_field.name)),
                         };
-                        res_fields.insert(output_field.name.clone(), AnnotatedValue::from(mock_val));
+                        res_fields
+                            .insert(output_field.name.clone(), AnnotatedValue::from(mock_val));
                     }
                     Ok(AnnotatedValue::from(Value::Object(res_fields)))
                 }
@@ -1445,7 +1503,8 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
 
             // 6. Assign result
             if let Some(path) = result_into {
-                ctx.set_variable_path(path, final_val, MemoryScope::Working).await?;
+                ctx.set_variable_path(path, final_val, MemoryScope::Working)
+                    .await?;
             }
             Ok(())
         }
@@ -1473,7 +1532,10 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                             changes.insert(k, v);
                         }
                     }
-                    Ok::<(usize, HashMap<String, AnnotatedValue>), anyhow::Error>((branch_index, changes))
+                    Ok::<(usize, HashMap<String, AnnotatedValue>), anyhow::Error>((
+                        branch_index,
+                        changes,
+                    ))
                 });
             }
 
@@ -1486,7 +1548,10 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                         while let Some(res) = join_set.join_next().await {
                             match res? {
                                 Ok((idx, changes)) => {
-                                    results.insert(format!("branch_{}", idx), AnnotatedValue::from(Value::Object(changes)));
+                                    results.insert(
+                                        format!("branch_{}", idx),
+                                        AnnotatedValue::from(Value::Object(changes)),
+                                    );
                                 }
                                 Err(e) => branch_errors.push(e),
                             }
@@ -1494,13 +1559,21 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                         if pattern_clone == ParallelPattern::Gather && !branch_errors.is_empty() {
                             return Err(branch_errors.remove(0));
                         }
-                        Ok::<AnnotatedValue, anyhow::Error>(AnnotatedValue::from(Value::Object(results)))
+                        Ok::<AnnotatedValue, anyhow::Error>(AnnotatedValue::from(Value::Object(
+                            results,
+                        )))
                     }
                     ParallelPattern::Race => {
                         while let Some(res) = join_set.join_next().await {
                             if let Ok(Ok((idx, changes))) = res {
-                                results.insert("winner".to_string(), AnnotatedValue::from(Value::Number(idx as f64)));
-                                results.insert("data".to_string(), AnnotatedValue::from(Value::Object(changes)));
+                                results.insert(
+                                    "winner".to_string(),
+                                    AnnotatedValue::from(Value::Number(idx as f64)),
+                                );
+                                results.insert(
+                                    "data".to_string(),
+                                    AnnotatedValue::from(Value::Object(changes)),
+                                );
                                 return Ok(AnnotatedValue::from(Value::Object(results)));
                             }
                         }
@@ -1510,7 +1583,10 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                         let mut success_count = 0;
                         while let Some(res) = join_set.join_next().await {
                             if let Ok(Ok((idx, changes))) = res {
-                                results.insert(format!("branch_{}", idx), AnnotatedValue::from(Value::Object(changes)));
+                                results.insert(
+                                    format!("branch_{}", idx),
+                                    AnnotatedValue::from(Value::Object(changes)),
+                                );
                                 success_count += 1;
                                 if success_count >= n {
                                     break;
@@ -1518,7 +1594,10 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                             }
                         }
                         if success_count < n {
-                            return Err(anyhow!("GATHER_MIN failed: only {} branches succeeded", success_count));
+                            return Err(anyhow!(
+                                "GATHER_MIN failed: only {} branches succeeded",
+                                success_count
+                            ));
                         }
                         Ok(AnnotatedValue::from(Value::Object(results)))
                     }
@@ -1537,7 +1616,8 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             match result {
                 Ok(agg_val) => {
                     if let Some(path) = result_into {
-                        ctx.set_variable_path(path, agg_val, MemoryScope::Working).await?;
+                        ctx.set_variable_path(path, agg_val, MemoryScope::Working)
+                            .await?;
                     }
                     Ok(())
                 }
@@ -1550,12 +1630,18 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             args,
         } => {
             ctx.check_contracts(goal_name)?;
-            println!("  [Runtime] DELEGATING goal '{}' to agent '{}'", goal_name, agent_id);
-            
+            println!(
+                "  [Runtime] DELEGATING goal '{}' to agent '{}'",
+                goal_name, agent_id
+            );
+
             let mut rpc_args = HashMap::new();
             for (k, expr) in args {
                 let val = eval_expression(expr, &ctx).await?;
-                ensure_value_safe_for_irreversible_action(&val, &format!("delegate argument '{}' to agent '{}'", k, agent_id))?;
+                ensure_value_safe_for_irreversible_action(
+                    &val,
+                    &format!("delegate argument '{}' to agent '{}'", k, agent_id),
+                )?;
                 rpc_args.insert(k.clone(), format!("{:?}", val.value));
             }
 
@@ -1569,11 +1655,14 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                     let registries = ctx_clone.registries.lock().unwrap().clone();
 
                     for reg_addr in registries {
-                        if let Ok(mut reg_client) = RegistryServiceClient::connect(reg_addr.clone()).await
-                            && let Ok(res) = reg_client.lookup_agent(LookupRequest {
-                                agent_id: agent_id_clone.clone(),
-                                ttl: 3,
-                            }).await
+                        if let Ok(mut reg_client) =
+                            RegistryServiceClient::connect(reg_addr.clone()).await
+                            && let Ok(res) = reg_client
+                                .lookup_agent(LookupRequest {
+                                    agent_id: agent_id_clone.clone(),
+                                    ttl: 3,
+                                })
+                                .await
                         {
                             let res = res.into_inner();
                             if res.found {
@@ -1586,18 +1675,28 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                     if let Some(lookup_data) = lookup_res {
                         let caller_id = "PrimaryOrchestrator".to_string();
                         let payload = format!("{}:{}", goal_name_clone, caller_id);
-                        let signature = ctx_clone.identity.signing_key.sign(payload.as_bytes()).to_bytes().to_vec();
+                        let signature = ctx_clone
+                            .identity
+                            .signing_key
+                            .sign(payload.as_bytes())
+                            .to_bytes()
+                            .to_vec();
 
-                        if let Ok(mut agent_client) = AgentServiceClient::connect(lookup_data.endpoint.clone()).await {
-                            let _ = agent_client.call_goal(CallRequest {
-                                goal_name: goal_name_clone,
-                                args: rpc_args,
-                                caller_id,
-                                signature,
-                            }).await;
+                        if let Ok(mut agent_client) =
+                            AgentServiceClient::connect(lookup_data.endpoint.clone()).await
+                        {
+                            let _ = agent_client
+                                .call_goal(CallRequest {
+                                    goal_name: goal_name_clone,
+                                    args: rpc_args,
+                                    caller_id,
+                                    signature,
+                                })
+                                .await;
                         }
                     }
-                }.await;
+                }
+                .await;
             });
 
             Ok(())
@@ -1677,7 +1776,9 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                     MemoryScope::LongTerm => ctx.long_term_backend.clone(),
                     _ => ctx.long_term_backend.clone(), // Default to long_term's fuzzy logic for working/session
                 };
-                backend.fuzzy_search(name, &memory)?.ok_or_else(|| anyhow!("Fuzzy match not found"))
+                backend
+                    .fuzzy_search(name, &memory)?
+                    .ok_or_else(|| anyhow!("Fuzzy match not found"))
             } else {
                 ctx.get_variable(name, *scope).await
             };
@@ -1768,7 +1869,13 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                         // Inject event payload
                         let mut event_obj = HashMap::new();
                         event_obj.insert("payload".to_string(), ev.data);
-                        let _ = ctx_clone.set_variable("event".to_string(), AnnotatedValue::from(Value::Object(event_obj)), MemoryScope::Working).await;
+                        let _ = ctx_clone
+                            .set_variable(
+                                "event".to_string(),
+                                AnnotatedValue::from(Value::Object(event_obj)),
+                                MemoryScope::Working,
+                            )
+                            .await;
 
                         for stmt in &handler_clone {
                             let _ = eval(stmt, ctx_clone.clone()).await;
@@ -1802,7 +1909,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             let hash_bytes = hash.as_ref();
             let mut steps =
                 32 + (u32::from_be_bytes(hash_bytes[0..4].try_into().unwrap()) % 64) as usize;
-            
+
             // Winterfell requires power-of-two trace length
             if !steps.is_power_of_two() {
                 steps = steps.next_power_of_two();
@@ -1829,8 +1936,10 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             crypto::verify_proof(&proof, claim)?;
 
             if let Some(path) = result_into {
-                let reveal_val =
-                    AnnotatedValue::from(Value::Text(format!("Unlocked via proof {} for claim {}", proof_name, claim)));
+                let reveal_val = AnnotatedValue::from(Value::Text(format!(
+                    "Unlocked via proof {} for claim {}",
+                    proof_name, claim
+                )));
                 ctx.set_variable_path(path, reveal_val, MemoryScope::Working)
                     .await?;
             }
@@ -1962,6 +2071,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
         } => {
             ctx.check_contracts(goal_name)?;
             let mut rpc_args = HashMap::new();
+            let mut evaluated_args: HashMap<String, AnnotatedValue> = HashMap::new();
             for (k, expr) in args {
                 let val = eval_expression(expr, &ctx).await?;
                 ensure_value_safe_for_irreversible_action(
@@ -1972,13 +2082,21 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 evaluated_args.insert(k.clone(), val);
             }
 
+            let call_id_str = result_into
+                .as_ref()
+                .map(|p| p.root.clone())
+                .unwrap_or_else(|| agent_id.clone());
+
             let pending_envelope =
-                build_pending_call_envelope(result_into, agent_id, goal_name, &evaluated_args);
-            store_call_result(&ctx, result_into, pending_envelope).await?;
+                build_pending_call_envelope(&call_id_str, agent_id, goal_name, &evaluated_args);
+            store_call_result(&ctx, &call_id_str, pending_envelope).await?;
 
             let (tx, rx) = tokio::sync::oneshot::channel();
             if let Some(path) = result_into {
-                ctx.pending_calls.lock().unwrap().insert(path.root.clone(), rx);
+                ctx.pending_calls
+                    .lock()
+                    .unwrap()
+                    .insert(path.root.clone(), rx);
             }
 
             let ctx_clone = ctx.clone();
@@ -1986,6 +2104,8 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             let goal_name_clone = goal_name.clone();
             let timeout_val = *timeout;
             let _signed_by_val = signed_by.clone();
+            let result_into_clone = call_id_str;
+            let evaluated_args_clone = evaluated_args.clone();
 
             tokio::spawn(async move {
                 let res = async {
@@ -2027,24 +2147,27 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                         .to_vec();
 
                     let mut agent_client =
-                        AgentServiceClient::connect(lookup_data.endpoint.clone())
-                            .await?;
+                        AgentServiceClient::connect(lookup_data.endpoint.clone()).await?;
 
-                    let rpc_call = agent_client
-                        .call_goal(CallRequest {
-                            goal_name: goal_name_clone.clone(),
-                            args: rpc_args,
-                            caller_id,
-                            signature,
-                        });
+                    let rpc_call = agent_client.call_goal(CallRequest {
+                        goal_name: goal_name_clone.clone(),
+                        args: rpc_args,
+                        caller_id,
+                        signature,
+                    });
 
                     let response = if let Some(d) = timeout_val {
                         match tokio::time::timeout(Duration::from_secs_f64(d), rpc_call).await {
                             Ok(res) => res?.into_inner(),
-                            Err(_) => return Err(anyhow!(AgentError {
-                                failure_type: GoalFailureType::Timeout,
-                                message: format!("Call to '{}' timed out after {}s", agent_id_clone, d),
-                            })),
+                            Err(_) => {
+                                return Err(anyhow!(AgentError {
+                                    failure_type: GoalFailureType::Timeout,
+                                    message: format!(
+                                        "Call to '{}' timed out after {}s",
+                                        agent_id_clone, d
+                                    ),
+                                }));
+                            }
                         }
                     } else {
                         rpc_call.await?.into_inner()
@@ -2076,7 +2199,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 }
                 .await;
 
-                let envelope = envelope_result.unwrap_or_else(|e| {
+                let envelope = res.unwrap_or_else(|e| {
                     build_failed_call_envelope(
                         &result_into_clone,
                         &agent_id_clone,
@@ -2106,16 +2229,20 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 .map_err(|_| anyhow!("Call task for '{}' panicked or was dropped", call_id))?;
 
             if let Some(path) = result_into {
-                ctx.set_variable_path(path, result, MemoryScope::Working)
+                ctx.set_variable_path(path, envelope, MemoryScope::Working)
                     .await?;
             } else {
-                ctx.set_variable(call_id.clone(), result, MemoryScope::Working).await?;
+                ctx.set_variable(call_id.clone(), envelope, MemoryScope::Working)
+                    .await?;
             }
             Ok(())
         }
         Statement::Tool(def) => {
             println!("  [Runtime] Registering TOOL: {}", def.name);
-            ctx.tools.lock().unwrap().insert(def.name.clone(), def.clone());
+            ctx.tools
+                .lock()
+                .unwrap()
+                .insert(def.name.clone(), def.clone());
             Ok(())
         }
     }
@@ -2124,10 +2251,6 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn init_bastion() {
-        ensure_bastion_started();
-    }
 
     #[test]
     fn test_audit_chain() {
@@ -2149,11 +2272,23 @@ mod tests {
             root: "trip".to_string(),
             segments: vec![PathSegment::Field("city".to_string())],
         };
-        ctx.set_variable_path(&path, AnnotatedValue::from(Value::Text("London".to_string())), MemoryScope::Working).await.unwrap();
-        
-        let val = ctx.get_variable("trip", MemoryScope::Working).await.unwrap();
+        ctx.set_variable_path(
+            &path,
+            AnnotatedValue::from(Value::Text("London".to_string())),
+            MemoryScope::Working,
+        )
+        .await
+        .unwrap();
+
+        let val = ctx
+            .get_variable("trip", MemoryScope::Working)
+            .await
+            .unwrap();
         if let Value::Object(fields) = val.value {
-            assert_eq!(fields.get("city").unwrap().value, Value::Text("London".to_string()));
+            assert_eq!(
+                fields.get("city").unwrap().value,
+                Value::Text("London".to_string())
+            );
         } else {
             panic!("Expected object");
         }
@@ -2162,16 +2297,31 @@ mod tests {
     #[tokio::test]
     async fn test_eval_expression_complex_braces() {
         let ctx = Context::new();
-        ctx.set_variable("a".to_string(), AnnotatedValue::from(Value::Number(10.0)), MemoryScope::Working).await.unwrap();
-        ctx.set_variable("b".to_string(), AnnotatedValue::from(Value::Number(20.0)), MemoryScope::Working).await.unwrap();
-        
+        ctx.set_variable(
+            "a".to_string(),
+            AnnotatedValue::from(Value::Number(10.0)),
+            MemoryScope::Working,
+        )
+        .await
+        .unwrap();
+        ctx.set_variable(
+            "b".to_string(),
+            AnnotatedValue::from(Value::Number(20.0)),
+            MemoryScope::Working,
+        )
+        .await
+        .unwrap();
+
         let expr = Expression::BinaryOp {
             left: Box::new(Expression::VariableRef(VariablePath::root("a"))),
             op: BinaryOperator::Add,
             right: Box::new(Expression::VariableRef(VariablePath::root("b"))),
         };
-        
-        assert_eq!(eval_expression(&expr, &ctx).await.unwrap().value, Value::Number(30.0));
+
+        assert_eq!(
+            eval_expression(&expr, &ctx).await.unwrap().value,
+            Value::Number(30.0)
+        );
     }
 
     #[tokio::test]
@@ -2188,13 +2338,15 @@ mod tests {
             }],
         };
         eval(&on_stmt, ctx.clone()).await.unwrap();
-        
+
         let emit_stmt = Statement::Emit {
             event: "test_evt".to_string(),
-            data: Some(Expression::Literal(AnnotatedValue::from(Value::Text("hello".to_string())))),
+            data: Some(Expression::Literal(AnnotatedValue::from(Value::Text(
+                "hello".to_string(),
+            )))),
         };
         eval(&emit_stmt, ctx.clone()).await.unwrap();
-        
+
         sleep(Duration::from_millis(200)).await;
         let res = ctx.get_variable("res", MemoryScope::Working).await.unwrap();
         assert_eq!(res.value, Value::Text("hello".to_string()));
@@ -2206,19 +2358,27 @@ mod tests {
         let mut val = AnnotatedValue::from(Value::Number(100.0));
         val.confidence = Some(0.85);
         val.is_sensitive = true;
-        ctx.set_variable("price".to_string(), val, MemoryScope::Working).await.unwrap();
+        ctx.set_variable("price".to_string(), val, MemoryScope::Working)
+            .await
+            .unwrap();
 
         let expr_conf = Expression::VariableRef(VariablePath {
             root: "price".to_string(),
             segments: vec![PathSegment::Field("confidence".to_string())],
         });
-        assert_eq!(eval_expression(&expr_conf, &ctx).await.unwrap().value, Value::Number(0.85));
+        assert_eq!(
+            eval_expression(&expr_conf, &ctx).await.unwrap().value,
+            Value::Number(0.85)
+        );
 
         let expr_sens = Expression::VariableRef(VariablePath {
             root: "price".to_string(),
             segments: vec![PathSegment::Field("sensitive".to_string())],
         });
-        assert_eq!(eval_expression(&expr_sens, &ctx).await.unwrap().value, Value::Boolean(true));
+        assert_eq!(
+            eval_expression(&expr_sens, &ctx).await.unwrap().value,
+            Value::Boolean(true)
+        );
     }
 
     #[tokio::test]
@@ -2226,12 +2386,17 @@ mod tests {
         let _guard = bastion_test_guard().await;
         ensure_bastion_started();
         let ctx = Context::new();
-        
+
         let mut on_fail = HashMap::new();
-        on_fail.insert(GoalFailureType::Permission, Statement::Set {
-            variable: "failed".to_string(),
-            value: Expression::Literal(AnnotatedValue::from(Value::Text("permission_denied".to_string()))),
-        });
+        on_fail.insert(
+            GoalFailureType::Permission,
+            Statement::Set {
+                variable: "failed".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Text(
+                    "permission_denied".to_string(),
+                ))),
+            },
+        );
 
         // This goal should trigger a Permission error due to uncertain data in EMIT
         let goal_stmt = Statement::Goal {
@@ -2240,14 +2405,18 @@ mod tests {
                 Statement::Set {
                     variable: "uncertain_data".to_string(),
                     value: Expression::Annotated {
-                        expr: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(1.0)))),
+                        expr: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                            1.0,
+                        )))),
                         annotation: Annotation::Uncertain,
                     },
                 },
                 Statement::Emit {
                     event: "dangerous".to_string(),
-                    data: Some(Expression::VariableRef(VariablePath::root("uncertain_data"))),
-                }
+                    data: Some(Expression::VariableRef(VariablePath::root(
+                        "uncertain_data",
+                    ))),
+                },
             ],
             outputs: vec![],
             result_into: None,
@@ -2263,26 +2432,32 @@ mod tests {
         };
 
         eval(&goal_stmt, ctx.clone()).await.unwrap();
-        let res = ctx.get_variable("failed", MemoryScope::Working).await.unwrap();
+        let res = ctx
+            .get_variable("failed", MemoryScope::Working)
+            .await
+            .unwrap();
         assert_eq!(res.value, Value::Text("permission_denied".to_string()));
     }
 
     #[tokio::test]
     async fn test_real_tool_system() {
         let ctx = Context::new();
-        
+
         // 1. Register a tool handler
         {
             let mut handlers = ctx.tool_handlers.lock().unwrap();
-            handlers.insert("add_numbers".to_string(), Arc::new(|args| {
-                let a = args.get("a").unwrap().value.clone();
-                let b = args.get("b").unwrap().value.clone();
-                if let (Value::Number(nv_a), Value::Number(nv_b)) = (a, b) {
-                    Ok(AnnotatedValue::from(Value::Number(nv_a + nv_b)))
-                } else {
-                    Err(anyhow!("Invalid types"))
-                }
-            }));
+            handlers.insert(
+                "add_numbers".to_string(),
+                Arc::new(|args| {
+                    let a = args.get("a").unwrap().value.clone();
+                    let b = args.get("b").unwrap().value.clone();
+                    if let (Value::Number(nv_a), Value::Number(nv_b)) = (a, b) {
+                        Ok(AnnotatedValue::from(Value::Number(nv_a + nv_b)))
+                    } else {
+                        Err(anyhow!("Invalid types"))
+                    }
+                }),
+            );
         }
 
         // 2. Execute TOOL declaration
@@ -2292,12 +2467,25 @@ mod tests {
             category: Some(ToolCategory::Read),
             version: Some("1.0.0".to_string()),
             inputs: vec![
-                ToolField { name: "a".to_string(), type_hint: "number".to_string(), required: true, annotations: vec![] },
-                ToolField { name: "b".to_string(), type_hint: "number".to_string(), required: true, annotations: vec![] },
+                ToolField {
+                    name: "a".to_string(),
+                    type_hint: "number".to_string(),
+                    required: true,
+                    annotations: vec![],
+                },
+                ToolField {
+                    name: "b".to_string(),
+                    type_hint: "number".to_string(),
+                    required: true,
+                    annotations: vec![],
+                },
             ],
-            outputs: vec![
-                ToolField { name: "result".to_string(), type_hint: "number".to_string(), required: true, annotations: vec![] },
-            ],
+            outputs: vec![ToolField {
+                name: "result".to_string(),
+                type_hint: "number".to_string(),
+                required: true,
+                annotations: vec![],
+            }],
             reversible: false,
             side_effect: false,
             rate_limit: None,
@@ -2307,9 +2495,15 @@ mod tests {
 
         // 3. Use the tool
         let mut args = HashMap::new();
-        args.insert("a".to_string(), Expression::Literal(AnnotatedValue::from(Value::Number(10.0))));
-        args.insert("b".to_string(), Expression::Literal(AnnotatedValue::from(Value::Number(20.0))));
-        
+        args.insert(
+            "a".to_string(),
+            Expression::Literal(AnnotatedValue::from(Value::Number(10.0))),
+        );
+        args.insert(
+            "b".to_string(),
+            Expression::Literal(AnnotatedValue::from(Value::Number(20.0))),
+        );
+
         let use_stmt = Statement::UseTool {
             tool_name: "add_numbers".to_string(),
             args,
@@ -2335,12 +2529,18 @@ mod tests {
         let _guard = bastion_test_guard().await;
         ensure_bastion_started();
         let ctx = Context::new();
-        
+
         let stmt = Statement::Parallel {
             pattern: ParallelPattern::Gather,
             branches: vec![
-                vec![Statement::Set { variable: "x".to_string(), value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))) }],
-                vec![Statement::Set { variable: "y".to_string(), value: Expression::Literal(AnnotatedValue::from(Value::Number(2.0))) }],
+                vec![Statement::Set {
+                    variable: "x".to_string(),
+                    value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+                }],
+                vec![Statement::Set {
+                    variable: "y".to_string(),
+                    value: Expression::Literal(AnnotatedValue::from(Value::Number(2.0))),
+                }],
             ],
             result_into: Some(VariablePath::root("res")),
             deadline: None,
@@ -2353,7 +2553,9 @@ mod tests {
             assert!(branches.contains_key("branch_1"));
             if let Value::Object(ref branch_0) = branches.get("branch_0").unwrap().value {
                 assert_eq!(branch_0.get("x").unwrap().value, Value::Number(1.0));
-            } else { panic!("branch_0 should be an object"); }
+            } else {
+                panic!("branch_0 should be an object");
+            }
         } else {
             panic!("Parallel result should be an object, found {:?}", res.value);
         }
@@ -2364,12 +2566,13 @@ mod tests {
         let _guard = bastion_test_guard().await;
         ensure_bastion_started();
         let ctx = Context::new();
-        
+
         let stmt = Statement::Parallel {
             pattern: ParallelPattern::Race,
-            branches: vec![
-                vec![Statement::Set { variable: "x".to_string(), value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))) }],
-            ],
+            branches: vec![vec![Statement::Set {
+                variable: "x".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+            }]],
             result_into: Some(VariablePath::root("res")),
             deadline: None,
         };
@@ -2387,7 +2590,7 @@ mod tests {
     #[tokio::test]
     async fn test_semantic_proof_binding() {
         let ctx = Context::new();
-        
+
         let prove_stmt = Statement::Prove {
             statements: vec![Statement::Set {
                 variable: "x".to_string(),
@@ -2406,7 +2609,11 @@ mod tests {
             result_into: Some(VariablePath::root("res_ok")),
         };
         eval(&reveal_correct, ctx.clone()).await.unwrap();
-        assert!(ctx.get_variable("res_ok", MemoryScope::Working).await.is_ok());
+        assert!(
+            ctx.get_variable("res_ok", MemoryScope::Working)
+                .await
+                .is_ok()
+        );
 
         // 2. Reveal with wrong claim (should fail)
         let reveal_wrong = Statement::Reveal {
@@ -2416,7 +2623,10 @@ mod tests {
             result_into: Some(VariablePath::root("res_fail")),
         };
         let err = eval(&reveal_wrong, ctx.clone()).await.unwrap_err();
-        assert!(err.to_string().contains("Proof was not generated for this claim"));
+        assert!(
+            err.to_string()
+                .contains("Proof was not generated for this claim")
+        );
     }
 
     #[tokio::test]
@@ -2457,7 +2667,7 @@ mod tests {
         ensure_bastion_started();
         let ctx = Context::new();
         let goal_name = "once".to_string();
-        
+
         // Mock a success entry in audit log
         {
             let mut audit = ctx.audit_chain.lock().unwrap();
@@ -2466,7 +2676,10 @@ mod tests {
 
         let goal_stmt = Statement::Goal {
             name: goal_name,
-            body: vec![Statement::Set { variable: "run".to_string(), value: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))) }],
+            body: vec![Statement::Set {
+                variable: "run".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))),
+            }],
             outputs: vec![],
             result_into: None,
             retry: None,
@@ -2502,8 +2715,12 @@ mod tests {
         };
         eval(&Statement::Tool(tool_def), ctx.clone()).await.unwrap();
 
-        let use_stmt = Statement::UseTool { tool_name: "limited".to_string(), args: HashMap::new(), result_into: None };
-        
+        let use_stmt = Statement::UseTool {
+            tool_name: "limited".to_string(),
+            args: HashMap::new(),
+            result_into: None,
+        };
+
         // First call ok
         eval(&use_stmt, ctx.clone()).await.unwrap();
         // Second call fails
@@ -2516,13 +2733,16 @@ mod tests {
         let ctx = Context::new();
         {
             let mut handlers = ctx.tool_handlers.lock().unwrap();
-            handlers.insert("slow".to_string(), Arc::new(|_| {
-                // Use a loop to simulate long work that doesn't yield if we're on a single thread
-                // but actually the runtime should be multi-threaded in tests by default.
-                // The issue is likely that timeout needs the future to yield.
-                std::thread::sleep(Duration::from_millis(500));
-                Ok(AnnotatedValue::from(Value::Null))
-            }));
+            handlers.insert(
+                "slow".to_string(),
+                Arc::new(|_| {
+                    // Use a loop to simulate long work that doesn't yield if we're on a single thread
+                    // but actually the runtime should be multi-threaded in tests by default.
+                    // The issue is likely that timeout needs the future to yield.
+                    std::thread::sleep(Duration::from_millis(500));
+                    Ok(AnnotatedValue::from(Value::Null))
+                }),
+            );
         }
         let tool_def = ToolDefinition {
             name: "slow".to_string(),
@@ -2538,7 +2758,11 @@ mod tests {
         };
         eval(&Statement::Tool(tool_def), ctx.clone()).await.unwrap();
 
-        let use_stmt = Statement::UseTool { tool_name: "slow".to_string(), args: HashMap::new(), result_into: None };
+        let use_stmt = Statement::UseTool {
+            tool_name: "slow".to_string(),
+            args: HashMap::new(),
+            result_into: None,
+        };
         let err = eval(&use_stmt, ctx.clone()).await.unwrap_err();
         assert!(err.to_string().contains("timed out"));
     }
@@ -2546,20 +2770,37 @@ mod tests {
     #[tokio::test]
     async fn test_set_variable_path_index_expansion() {
         let ctx = Context::new();
-        ctx.set_variable("list".to_string(), AnnotatedValue::from(Value::List(vec![])), MemoryScope::Working).await.unwrap();
-        
+        ctx.set_variable(
+            "list".to_string(),
+            AnnotatedValue::from(Value::List(vec![])),
+            MemoryScope::Working,
+        )
+        .await
+        .unwrap();
+
         let path = VariablePath {
             root: "list".to_string(),
             segments: vec![PathSegment::Index(2)],
         };
-        ctx.set_variable_path(&path, AnnotatedValue::from(Value::Number(42.0)), MemoryScope::Working).await.unwrap();
-        
-        let val = ctx.get_variable("list", MemoryScope::Working).await.unwrap();
+        ctx.set_variable_path(
+            &path,
+            AnnotatedValue::from(Value::Number(42.0)),
+            MemoryScope::Working,
+        )
+        .await
+        .unwrap();
+
+        let val = ctx
+            .get_variable("list", MemoryScope::Working)
+            .await
+            .unwrap();
         if let Value::List(items) = val.value {
             assert_eq!(items.len(), 3);
             assert_eq!(items[2].value, Value::Number(42.0));
             assert_eq!(items[0].value, Value::Null);
-        } else { panic!("Expected list"); }
+        } else {
+            panic!("Expected list");
+        }
     }
 
     #[tokio::test]
@@ -2567,7 +2808,7 @@ mod tests {
         let ctx = Context::new();
         let l = Expression::Literal(AnnotatedValue::from(Value::Text("a".to_string())));
         let r = Expression::Literal(AnnotatedValue::from(Value::Number(1.0)));
-        
+
         let expr = Expression::BinaryOp {
             left: Box::new(l),
             op: BinaryOperator::Add,
@@ -2591,8 +2832,14 @@ mod tests {
     #[tokio::test]
     async fn test_eval_expression_nested_path_errors() {
         let ctx = Context::new();
-        ctx.set_variable("obj".to_string(), AnnotatedValue::from(Value::Number(1.0)), MemoryScope::Working).await.unwrap();
-        
+        ctx.set_variable(
+            "obj".to_string(),
+            AnnotatedValue::from(Value::Number(1.0)),
+            MemoryScope::Working,
+        )
+        .await
+        .unwrap();
+
         let expr = Expression::VariableRef(VariablePath {
             root: "obj".to_string(),
             segments: vec![PathSegment::Field("any".to_string())],
