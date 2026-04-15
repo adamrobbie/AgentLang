@@ -580,4 +580,260 @@ mod tests {
             .into_inner();
         assert!(res.success);
     }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Coverage-boosting lib tests
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_registry_service_default() {
+        let reg = MyRegistryService::default();
+        assert!(reg.agents.lock().unwrap().is_empty());
+        assert!(reg.shared_state.lock().unwrap().is_empty());
+        assert!(reg.peer_registries.is_empty());
+    }
+
+    /// call_goal with numeric, boolean, and text args covers the arg-parsing
+    /// branches (lines 238-256 in lib.rs).
+    #[tokio::test]
+    async fn test_agent_service_call_with_typed_args() {
+        let ctx = runtime::Context::new();
+        {
+            let mut goals = ctx.goals.lock().unwrap();
+            goals.insert(
+                "echo_goal".to_string(),
+                ast::GoalDefinition {
+                    body: vec![],
+                    outputs: vec![],
+                    result_into: None,
+                    retry: None,
+                    on_fail: HashMap::new(),
+                    deadline: None,
+                    wait: None,
+                    idempotent: false,
+                    audit_trail: false,
+                    confirm_with: None,
+                    timeout_confirmation: None,
+                    fallback: None,
+                },
+            );
+        }
+
+        let registry = MyRegistryService::new();
+        let caller_ctx = runtime::Context::new();
+        let caller_id = "caller2".to_string();
+        let endpoint = "http://localhost:2".to_string();
+        let payload = format!("{}:{}", caller_id, endpoint);
+        let signature = caller_ctx
+            .identity
+            .signing_key
+            .sign(payload.as_bytes())
+            .to_bytes()
+            .to_vec();
+
+        registry
+            .register_agent(Request::new(RegisterRequest {
+                agent_id: caller_id.clone(),
+                endpoint,
+                public_key: caller_ctx.identity.verifying_key.to_bytes().to_vec(),
+                signature,
+            }))
+            .await
+            .unwrap();
+
+        let reg_addr = "http://[::1]:50112".to_string();
+        let socket_addr: std::net::SocketAddr = "[::1]:50112".parse().unwrap();
+        tokio::spawn(async move {
+            let _ = start_registry(registry, socket_addr).await;
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let service = MyAgentService {
+            ctx: ctx.clone(),
+            registries: vec![reg_addr],
+        };
+
+        let goal_name = "echo_goal".to_string();
+        let call_payload = format!("{}:{}", goal_name, caller_id);
+        let call_signature = caller_ctx
+            .identity
+            .signing_key
+            .sign(call_payload.as_bytes())
+            .to_bytes()
+            .to_vec();
+
+        // Pass three args: a number, a bool, and a string
+        let mut args = HashMap::new();
+        args.insert("num_arg".to_string(), "3.14".to_string());
+        args.insert("bool_arg".to_string(), "true".to_string());
+        args.insert("text_arg".to_string(), "\"hello\"".to_string());
+
+        let req = CallRequest {
+            goal_name: goal_name.clone(),
+            args,
+            caller_id,
+            signature: call_signature,
+        };
+
+        let res = service
+            .call_goal(Request::new(req))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(res.success);
+    }
+
+    /// Goal body that fails should return success=false with an error payload.
+    #[tokio::test]
+    async fn test_agent_service_goal_body_fails() {
+        let ctx = runtime::Context::new();
+        {
+            let mut goals = ctx.goals.lock().unwrap();
+            goals.insert(
+                "bad_goal".to_string(),
+                ast::GoalDefinition {
+                    body: vec![
+                        // RECALL a non-existent key with no on_missing → will error
+                        ast::Statement::Recall {
+                            name: "nonexistent_key_xyz".to_string(),
+                            into_var: "x".to_string(),
+                            scope: ast::MemoryScope::Working,
+                            on_missing: None,
+                            fuzzy: false,
+                            threshold: None,
+                        },
+                    ],
+                    outputs: vec![],
+                    result_into: None,
+                    retry: None,
+                    on_fail: HashMap::new(),
+                    deadline: None,
+                    wait: None,
+                    idempotent: false,
+                    audit_trail: false,
+                    confirm_with: None,
+                    timeout_confirmation: None,
+                    fallback: None,
+                },
+            );
+        }
+
+        let registry = MyRegistryService::new();
+        let caller_ctx = runtime::Context::new();
+        let caller_id = "caller3".to_string();
+        let endpoint = "http://localhost:3".to_string();
+        let payload = format!("{}:{}", caller_id, endpoint);
+        let signature = caller_ctx
+            .identity
+            .signing_key
+            .sign(payload.as_bytes())
+            .to_bytes()
+            .to_vec();
+
+        registry
+            .register_agent(Request::new(RegisterRequest {
+                agent_id: caller_id.clone(),
+                endpoint,
+                public_key: caller_ctx.identity.verifying_key.to_bytes().to_vec(),
+                signature,
+            }))
+            .await
+            .unwrap();
+
+        let reg_addr = "http://[::1]:50113".to_string();
+        let socket_addr: std::net::SocketAddr = "[::1]:50113".parse().unwrap();
+        tokio::spawn(async move {
+            let _ = start_registry(registry, socket_addr).await;
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let service = MyAgentService {
+            ctx: ctx.clone(),
+            registries: vec![reg_addr],
+        };
+
+        let goal_name = "bad_goal".to_string();
+        let call_payload = format!("{}:{}", goal_name, caller_id);
+        let call_signature = caller_ctx
+            .identity
+            .signing_key
+            .sign(call_payload.as_bytes())
+            .to_bytes()
+            .to_vec();
+
+        let req = CallRequest {
+            goal_name,
+            args: HashMap::new(),
+            caller_id,
+            signature: call_signature,
+        };
+
+        let res = service
+            .call_goal(Request::new(req))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!res.success);
+        assert!(res.result_json.contains("error"));
+    }
+
+    /// Caller is found in registry but goal is not registered → Status::not_found
+    #[tokio::test]
+    async fn test_agent_service_goal_not_found() {
+        let ctx = runtime::Context::new(); // no goals registered
+
+        let registry = MyRegistryService::new();
+        let caller_ctx = runtime::Context::new();
+        let caller_id = "caller4".to_string();
+        let endpoint = "http://localhost:4".to_string();
+        let payload = format!("{}:{}", caller_id, endpoint);
+        let signature = caller_ctx
+            .identity
+            .signing_key
+            .sign(payload.as_bytes())
+            .to_bytes()
+            .to_vec();
+
+        registry
+            .register_agent(Request::new(RegisterRequest {
+                agent_id: caller_id.clone(),
+                endpoint,
+                public_key: caller_ctx.identity.verifying_key.to_bytes().to_vec(),
+                signature,
+            }))
+            .await
+            .unwrap();
+
+        let reg_addr = "http://[::1]:50114".to_string();
+        let socket_addr: std::net::SocketAddr = "[::1]:50114".parse().unwrap();
+        tokio::spawn(async move {
+            let _ = start_registry(registry, socket_addr).await;
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let service = MyAgentService {
+            ctx: ctx.clone(),
+            registries: vec![reg_addr],
+        };
+
+        let goal_name = "missing_goal".to_string();
+        let call_payload = format!("{}:{}", goal_name, caller_id);
+        let call_signature = caller_ctx
+            .identity
+            .signing_key
+            .sign(call_payload.as_bytes())
+            .to_bytes()
+            .to_vec();
+
+        let req = CallRequest {
+            goal_name,
+            args: HashMap::new(),
+            caller_id,
+            signature: call_signature,
+        };
+
+        let res = service.call_goal(Request::new(req)).await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().code(), tonic::Code::NotFound);
+    }
 }

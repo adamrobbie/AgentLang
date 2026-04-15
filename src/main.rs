@@ -81,12 +81,16 @@ async fn main() -> Result<()> {
             .await?;
         client
             .register_agent(RegisterRequest {
-                agent_id,
+                agent_id: agent_id.clone(),
                 endpoint,
                 public_key: ctx_b.identity.verifying_key.to_bytes().to_vec(),
                 signature,
             })
             .await?;
+
+        // Inform the context of its registered identity so outgoing RPC calls sign
+        // with the correct caller_id rather than a hardcoded placeholder.
+        *ctx_b.agent_id.lock().unwrap_or_else(|e| e.into_inner()) = agent_id;
     }
 
     // 4. Start Primary Orchestrator
@@ -181,12 +185,16 @@ async fn main() -> Result<()> {
             .await?;
         client
             .register_agent(RegisterRequest {
-                agent_id,
+                agent_id: agent_id.clone(),
                 endpoint,
                 public_key: ctx.identity.verifying_key.to_bytes().to_vec(),
                 signature,
             })
             .await?;
+
+        // Update the context so that outgoing CALL/DELEGATE operations use the
+        // registered ID when signing requests instead of a stale default.
+        *ctx.agent_id.lock().unwrap_or_else(|e| e.into_inner()) = agent_id;
     }
 
     // Integrated demonstration

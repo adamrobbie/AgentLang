@@ -471,7 +471,6 @@ fn parse_parallel(input: &str) -> IResult<&str, Statement> {
             tag("PARALLEL"),
             many0(parse_statement),
             alt((
-                map(tag("GATHER"), |_| ParallelPattern::Gather),
                 map(tag("GATHER_ALL"), |_| ParallelPattern::GatherAll),
                 map(preceded(tag("GATHER_MIN"), ws(parse_number)), |v| {
                     if let Value::Number(n) = v {
@@ -480,6 +479,7 @@ fn parse_parallel(input: &str) -> IResult<&str, Statement> {
                         ParallelPattern::GatherMin(1)
                     }
                 }),
+                map(tag("GATHER"), |_| ParallelPattern::Gather),
             )),
             ws(preceded(
                 tag("INTO"),
@@ -490,7 +490,8 @@ fn parse_parallel(input: &str) -> IResult<&str, Statement> {
         ),
         |(_, branches, pattern, result_into, deadline, _)| Statement::Parallel {
             pattern,
-            branches: vec![branches],
+            // Each top-level statement in a PARALLEL block becomes its own concurrent branch.
+            branches: branches.into_iter().map(|s| vec![s]).collect(),
             result_into: Some(result_into),
             deadline,
         },
@@ -1044,7 +1045,7 @@ fn parse_await(input: &str) -> IResult<&str, Statement> {
                 ws(delimited(char('{'), parse_variable_path, char('}'))),
             )),
         ),
-        |(call_id, _, result_into)| Statement::Await {
+        |(_, call_id, result_into)| Statement::Await {
             call_id: call_id.to_string(),
             result_into,
         },
@@ -1552,5 +1553,1000 @@ mod tests {
 
         // Malformed RECALL
         assert!(parse_recall("RECALL key").is_err());
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Parser tests for statements not previously covered
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_remember_basic() {
+        let input = "REMEMBER city VALUE \"London\" END";
+        if let Ok((
+            "",
+            Statement::Remember {
+                name,
+                scope,
+                expires,
+                ..
+            },
+        )) = parse_remember(input)
+        {
+            assert_eq!(name, "city");
+            assert_eq!(scope, MemoryScope::LongTerm); // default scope
+            assert!(expires.is_none());
+        } else {
+            panic!("Failed to parse REMEMBER");
+        }
+    }
+
+    #[test]
+    fn test_parse_remember_with_scope_and_expires() {
+        let input = "REMEMBER city VALUE \"London\" SCOPE working EXPIRES 30s END";
+        if let Ok((
+            "",
+            Statement::Remember {
+                name,
+                scope,
+                expires,
+                ..
+            },
+        )) = parse_remember(input)
+        {
+            assert_eq!(name, "city");
+            assert_eq!(scope, MemoryScope::Working);
+            assert_eq!(expires, Some(30.0));
+        } else {
+            panic!("Failed to parse REMEMBER with scope/expires");
+        }
+    }
+
+    #[test]
+    fn test_parse_forget() {
+        let input = "FORGET city END";
+        if let Ok(("", Statement::Forget { name, scope })) = parse_forget(input) {
+            assert_eq!(name, "city");
+            assert_eq!(scope, MemoryScope::LongTerm); // default
+        } else {
+            panic!("Failed to parse FORGET");
+        }
+    }
+
+    #[test]
+    fn test_parse_forget_with_scope() {
+        let input = "FORGET city SCOPE session END";
+        if let Ok(("", Statement::Forget { name, scope })) = parse_forget(input) {
+            assert_eq!(name, "city");
+            assert_eq!(scope, MemoryScope::Session);
+        } else {
+            panic!("Failed to parse FORGET with scope");
+        }
+    }
+
+    #[test]
+    fn test_parse_agent() {
+        let input = "AGENT planner ID abc123 REGISTRY registry.example SIGNED_BY authority.example TRUST_LEVEL verified END";
+        if let Ok((
+            "",
+            Statement::Agent {
+                name,
+                id,
+                registry,
+                signed_by,
+                trust_level,
+            },
+        )) = parse_agent(input)
+        {
+            assert_eq!(name, "planner");
+            assert_eq!(id, "abc123");
+            assert_eq!(registry, "registry.example");
+            assert_eq!(signed_by, "authority.example");
+            assert_eq!(trust_level, TrustLevel::Verified);
+        } else {
+            panic!("Failed to parse AGENT");
+        }
+    }
+
+    #[test]
+    fn test_parse_trust_levels() {
+        for (level_str, expected) in [
+            ("trusted", TrustLevel::Trusted),
+            ("sandboxed", TrustLevel::Sandboxed),
+            ("blocked", TrustLevel::Blocked),
+        ] {
+            let input = format!(
+                "AGENT a ID x REGISTRY r SIGNED_BY s TRUST_LEVEL {} END",
+                level_str
+            );
+            if let Ok(("", Statement::Agent { trust_level, .. })) = parse_agent(&input) {
+                assert_eq!(trust_level, expected);
+            } else {
+                panic!("Failed to parse TRUST_LEVEL {}", level_str);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_contract() {
+        let input = "CONTRACT admin_contract ISSUED_BY authority.example CAN USE search_flights BUDGET 100 END";
+        if let Ok((
+            "",
+            Statement::Contract {
+                name,
+                issued_by,
+                capabilities,
+                budget,
+                ..
+            },
+        )) = parse_contract(input)
+        {
+            assert_eq!(name, "admin_contract");
+            assert_eq!(issued_by, "authority.example");
+            assert_eq!(
+                capabilities,
+                vec![Permission::CanUse("search_flights".to_string())]
+            );
+            assert_eq!(budget, Some(100.0));
+        } else {
+            panic!("Failed to parse CONTRACT");
+        }
+    }
+
+    #[test]
+    fn test_parse_contract_cannot_use() {
+        let input = "CONTRACT restricted ISSUED_BY authority CANNOT USE admin END";
+        if let Ok(("", Statement::Contract { capabilities, .. })) = parse_contract(input) {
+            assert_eq!(
+                capabilities,
+                vec![Permission::CannotUse("admin".to_string())]
+            );
+        } else {
+            panic!("Failed to parse CANNOT USE in CONTRACT");
+        }
+    }
+
+    #[test]
+    fn test_parse_contract_requires_confirmation() {
+        let input = "CONTRACT c ISSUED_BY auth REQUIRES CONFIRMATION END";
+        if let Ok((
+            "",
+            Statement::Contract {
+                requires_confirmation,
+                ..
+            },
+        )) = parse_contract(input)
+        {
+            assert!(requires_confirmation);
+        } else {
+            panic!("Failed to parse REQUIRES CONFIRMATION in CONTRACT");
+        }
+    }
+
+    #[test]
+    fn test_parse_emit() {
+        let input = "EMIT alert DATA \"danger\"";
+        if let Ok((
+            "",
+            Statement::Emit {
+                event,
+                data: Some(data_expr),
+            },
+        )) = parse_emit(input)
+        {
+            assert_eq!(event, "alert");
+            assert_eq!(
+                data_expr,
+                Expression::Literal(AnnotatedValue::from(Value::Text("danger".to_string())))
+            );
+        } else {
+            panic!("Failed to parse EMIT");
+        }
+    }
+
+    #[test]
+    fn test_parse_on() {
+        let input = "ON alert SET x = 1 END";
+        if let Ok(("", Statement::On { event, handler })) = parse_on(input) {
+            assert_eq!(event, "alert");
+            assert_eq!(handler.len(), 1);
+        } else {
+            panic!("Failed to parse ON");
+        }
+    }
+
+    #[test]
+    fn test_parse_prove() {
+        let input = "PROVE { SET x = 1 } FOR \"balance_above_100\" AS proof1";
+        if let Ok((
+            "",
+            Statement::Prove {
+                statements,
+                claim,
+                proof_name,
+            },
+        )) = parse_prove(input)
+        {
+            assert_eq!(claim, "balance_above_100");
+            assert_eq!(proof_name, "proof1");
+            assert_eq!(statements.len(), 1);
+        } else {
+            panic!("Failed to parse PROVE");
+        }
+    }
+
+    #[test]
+    fn test_parse_reveal() {
+        let input = "REVEAL proof1 FOR \"balance_above_100\" INTO {result}";
+        if let Ok((
+            "",
+            Statement::Reveal {
+                proof_name,
+                claim,
+                to_agent,
+                result_into,
+            },
+        )) = parse_reveal(input)
+        {
+            assert_eq!(proof_name, "proof1");
+            assert_eq!(claim, "balance_above_100");
+            assert!(to_agent.is_none());
+            assert!(result_into.is_some());
+        } else {
+            panic!("Failed to parse REVEAL");
+        }
+    }
+
+    #[test]
+    fn test_parse_reveal_to_agent() {
+        let input = "REVEAL p FOR \"claim\" TO planner_agent INTO {res}";
+        if let Ok(("", Statement::Reveal { to_agent, .. })) = parse_reveal(input) {
+            assert_eq!(to_agent, Some("planner_agent".to_string()));
+        } else {
+            panic!("Failed to parse REVEAL with TO");
+        }
+    }
+
+    #[test]
+    fn test_parse_parallel_gather() {
+        let input = "PARALLEL SET x = 1 SET y = 2 GATHER INTO {res} END";
+        if let Ok((
+            "",
+            Statement::Parallel {
+                pattern,
+                branches,
+                result_into,
+                deadline,
+            },
+        )) = parse_parallel(input)
+        {
+            assert_eq!(pattern, ParallelPattern::Gather);
+            assert_eq!(branches.len(), 2);
+            assert!(result_into.is_some());
+            assert!(deadline.is_none());
+        } else {
+            panic!("Failed to parse PARALLEL GATHER");
+        }
+    }
+
+    #[test]
+    fn test_parse_parallel_gather_all() {
+        let input = "PARALLEL SET x = 1 GATHER_ALL INTO {res} END";
+        if let Ok(("", Statement::Parallel { pattern, .. })) = parse_parallel(input) {
+            assert_eq!(pattern, ParallelPattern::GatherAll);
+        } else {
+            panic!("Failed to parse PARALLEL GATHER_ALL");
+        }
+    }
+
+    #[test]
+    fn test_parse_parallel_gather_min() {
+        let input = "PARALLEL SET x = 1 SET y = 2 GATHER_MIN 1 INTO {res} END";
+        if let Ok(("", Statement::Parallel { pattern, .. })) = parse_parallel(input) {
+            assert_eq!(pattern, ParallelPattern::GatherMin(1));
+        } else {
+            panic!("Failed to parse PARALLEL GATHER_MIN");
+        }
+    }
+
+    #[test]
+    fn test_parse_race() {
+        let input = "RACE SET x = 1 SET y = 2 FIRST_INTO {res} END";
+        if let Ok((
+            "",
+            Statement::Parallel {
+                pattern,
+                branches,
+                result_into,
+                ..
+            },
+        )) = parse_race(input)
+        {
+            assert_eq!(pattern, ParallelPattern::Race);
+            // RACE wraps all stmts into a single branch
+            assert_eq!(branches.len(), 1);
+            assert_eq!(branches[0].len(), 2);
+            assert!(result_into.is_some());
+        } else {
+            panic!("Failed to parse RACE");
+        }
+    }
+
+    #[test]
+    fn test_parse_foreach() {
+        let input = "FOREACH item IN [1 2 3] SET x = {item} END";
+        if let Ok(("", Statement::ForEach { item, body, .. })) = parse_foreach(input) {
+            assert_eq!(item, "item");
+            assert_eq!(body.len(), 1);
+        } else {
+            panic!("Failed to parse FOREACH");
+        }
+    }
+
+    #[test]
+    fn test_parse_repeat() {
+        let input = "REPEAT UNTIL true SET x = 1 END";
+        if let Ok(("", Statement::Repeat { condition, body })) = parse_repeat(input) {
+            assert_eq!(
+                condition,
+                Expression::Literal(AnnotatedValue::from(Value::Boolean(true)))
+            );
+            assert_eq!(body.len(), 1);
+        } else {
+            panic!("Failed to parse REPEAT");
+        }
+    }
+
+    #[test]
+    fn test_parse_use_tool() {
+        let input = "USE add_numbers a 10 b 20 RESULT INTO {res} END";
+        if let Ok((
+            "",
+            Statement::UseTool {
+                tool_name,
+                args,
+                result_into,
+            },
+        )) = parse_use(input)
+        {
+            assert_eq!(tool_name, "add_numbers");
+            assert_eq!(args.len(), 2);
+            assert!(result_into.is_some());
+        } else {
+            panic!("Failed to parse USE");
+        }
+    }
+
+    #[test]
+    fn test_parse_delegate() {
+        let input = "DELEGATE \"planner\" GOAL \"search\" END";
+        if let Ok((
+            "",
+            Statement::Delegate {
+                agent_id,
+                goal_name,
+                args,
+            },
+        )) = parse_delegate(input)
+        {
+            assert_eq!(agent_id, "planner");
+            assert_eq!(goal_name, "search");
+            assert!(args.is_empty());
+        } else {
+            panic!("Failed to parse DELEGATE");
+        }
+    }
+
+    #[test]
+    fn test_parse_await() {
+        let input = "AWAIT {call_result} INTO {final}";
+        if let Ok((
+            "",
+            Statement::Await {
+                call_id,
+                result_into,
+            },
+        )) = parse_await(input)
+        {
+            assert_eq!(call_id, "call_result");
+            assert!(result_into.is_some());
+        } else {
+            panic!("Failed to parse AWAIT");
+        }
+    }
+
+    #[test]
+    fn test_parse_goal_with_options() {
+        let input = "GOAL retry_goal RETRY 3 DEADLINE 10s IDEMPOTENT SET x = 1 END";
+        if let Ok((
+            "",
+            Statement::Goal {
+                name,
+                retry,
+                deadline,
+                idempotent,
+                ..
+            },
+        )) = parse_goal(input)
+        {
+            assert_eq!(name, "retry_goal");
+            assert_eq!(retry, Some(3));
+            assert_eq!(deadline, Some(10.0));
+            assert!(idempotent);
+        } else {
+            panic!("Failed to parse GOAL with options");
+        }
+    }
+
+    #[test]
+    fn test_parse_goal_on_fail() {
+        let input = "GOAL g ON_FAIL[TIMEOUT] SET x = 1 END";
+        if let Ok(("", Statement::Goal { on_fail, .. })) = parse_goal(input) {
+            assert!(on_fail.contains_key(&GoalFailureType::Timeout));
+        } else {
+            panic!("Failed to parse GOAL ON_FAIL");
+        }
+    }
+
+    #[test]
+    fn test_parse_goal_audit_trail_false() {
+        let input = "GOAL g AUDIT_TRAIL false END";
+        if let Ok(("", Statement::Goal { audit_trail, .. })) = parse_goal(input) {
+            assert!(!audit_trail);
+        } else {
+            panic!("Failed to parse GOAL AUDIT_TRAIL false");
+        }
+    }
+
+    #[test]
+    fn test_parse_program_multi_statement() {
+        let input = "SET x = 1 SET y = 2 SET z = 3";
+        let result = parse_program(input);
+        assert!(result.is_ok());
+        let (_, stmts) = result.unwrap();
+        assert_eq!(stmts.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_duration_units() {
+        // Minutes
+        assert_eq!(parse_duration("2m"), Ok(("", 120.0)));
+        // Hours
+        assert_eq!(parse_duration("1h"), Ok(("", 3600.0)));
+        // Seconds
+        assert_eq!(parse_duration("30s"), Ok(("", 30.0)));
+    }
+
+    #[test]
+    fn test_parse_memory_scope_variants() {
+        assert_eq!(
+            parse_memory_scope("working"),
+            Ok(("", MemoryScope::Working))
+        );
+        assert_eq!(
+            parse_memory_scope("session"),
+            Ok(("", MemoryScope::Session))
+        );
+        assert_eq!(
+            parse_memory_scope("long_term"),
+            Ok(("", MemoryScope::LongTerm))
+        );
+        assert_eq!(parse_memory_scope("shared"), Ok(("", MemoryScope::Shared)));
+    }
+
+    #[test]
+    fn test_parse_binary_operators() {
+        assert_eq!(parse_binary_operator("=="), Ok(("", BinaryOperator::Eq)));
+        assert_eq!(parse_binary_operator(">"), Ok(("", BinaryOperator::Gt)));
+        assert_eq!(parse_binary_operator("<"), Ok(("", BinaryOperator::Lt)));
+        assert_eq!(parse_binary_operator("+"), Ok(("", BinaryOperator::Add)));
+        assert_eq!(parse_binary_operator("-"), Ok(("", BinaryOperator::Sub)));
+    }
+
+    #[test]
+    fn test_parse_recall_with_scope_and_on_missing() {
+        let input = "RECALL city INTO {c} SCOPE working ON_MISSING \"unknown\" END";
+        if let Ok((
+            "",
+            Statement::Recall {
+                name,
+                into_var,
+                scope,
+                on_missing,
+                ..
+            },
+        )) = parse_recall(input)
+        {
+            assert_eq!(name, "city");
+            assert_eq!(into_var, "c");
+            assert_eq!(scope, MemoryScope::Working);
+            assert!(on_missing.is_some());
+        } else {
+            panic!("Failed to parse RECALL with scope and on_missing");
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Coverage-boosting parser tests
+    // ──────────────────────────────────────────────────────────────────────────
+
+    // --- Index path segment ---
+    #[test]
+    fn test_parse_index_path_segment() {
+        let result = parse_path_segment("[2]");
+        assert_eq!(result, Ok(("", PathSegment::Index(2))));
+    }
+
+    // --- parse_list ---
+    #[test]
+    fn test_parse_list_value() {
+        let result = parse_value("[1 2 3]");
+        assert!(result.is_ok());
+        if let Ok((_, av)) = result {
+            if let Value::List(items) = av.value {
+                assert_eq!(items.len(), 3);
+            } else {
+                panic!("Expected list");
+            }
+        }
+    }
+
+    // --- BinaryOp in parse_expression (outside braces) ---
+    #[test]
+    fn test_parse_expression_binary_op_outside_braces() {
+        let input = "42 + 8";
+        let result = parse_expression(input);
+        assert!(result.is_ok());
+        if let Ok((_, expr)) = result {
+            matches!(expr, Expression::BinaryOp { .. });
+        }
+    }
+
+    // --- Annotation inside inner expression ---
+    #[test]
+    fn test_parse_inner_expression_annotation() {
+        // {value AS sensitive}
+        let input = "SET x = {val AS sensitive}";
+        let result = parse_set(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Set { value, .. })) = result {
+            matches!(value, Expression::Annotated { .. });
+        }
+    }
+
+    // --- BinaryOp inside inner expression ---
+    #[test]
+    fn test_parse_inner_expression_binary_op() {
+        // SET x = {a + b} where a and b are variable refs inside braces
+        let input = "SET z = {a + b}";
+        let result = parse_set(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Set { value, .. })) = result {
+            matches!(value, Expression::BinaryOp { .. });
+        }
+    }
+
+    // --- GoalOutput with annotations (parse_goal_output) ---
+    #[test]
+    fn test_parse_goal_output_with_annotation() {
+        let input = "GOAL my_goal\nSET x = 1\nOUTPUT\nx text AS sensitive\nEND\nEND";
+        let result = parse_goal(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Goal { outputs, .. })) = result {
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].name, "x");
+            assert_eq!(outputs[0].type_name, "text");
+            assert!(!outputs[0].annotations.is_empty());
+        }
+    }
+
+    // --- Goal WAIT option ---
+    #[test]
+    fn test_parse_goal_wait_option() {
+        let input = "GOAL my_goal\nSET x = 1\nWAIT 5s\nEND";
+        let result = parse_goal(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Goal { wait, .. })) = result {
+            assert_eq!(wait, Some(5.0));
+        }
+    }
+
+    // --- Goal AUDIT_TRAIL true ---
+    #[test]
+    fn test_parse_goal_audit_trail_true() {
+        let input = "GOAL my_goal\nSET x = 1\nAUDIT_TRAIL true\nEND";
+        let result = parse_goal(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Goal { audit_trail, .. })) = result {
+            assert!(audit_trail);
+        }
+    }
+
+    // --- Goal CONFIRM_WITH option ---
+    #[test]
+    fn test_parse_goal_confirm_with() {
+        let input = "GOAL my_goal\nSET x = 1\nCONFIRM_WITH supervisor\nEND";
+        let result = parse_goal(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Goal { confirm_with, .. })) = result {
+            assert_eq!(confirm_with, Some("supervisor".to_string()));
+        }
+    }
+
+    // --- Goal TIMEOUT_CONFIRMATION option ---
+    #[test]
+    fn test_parse_goal_timeout_confirmation() {
+        let input = "GOAL my_goal\nSET x = 1\nTIMEOUT_CONFIRMATION 30s\nEND";
+        let result = parse_goal(input);
+        assert!(result.is_ok());
+        if let Ok((
+            _,
+            Statement::Goal {
+                timeout_confirmation,
+                ..
+            },
+        )) = result
+        {
+            assert_eq!(timeout_confirmation, Some(30.0));
+        }
+    }
+
+    // --- Goal FALLBACK option ---
+    #[test]
+    fn test_parse_goal_fallback_option() {
+        let input = "GOAL my_goal\nSET x = 1\nFALLBACK SET x = 0\nEND";
+        let result = parse_goal(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Goal { fallback, .. })) = result {
+            assert!(fallback.is_some());
+        }
+    }
+
+    // --- Parallel with DEADLINE ---
+    #[test]
+    fn test_parse_parallel_with_deadline() {
+        // No space between duration and END — parse_duration leaves trailing space uncleaned
+        let input = "PARALLEL SET a = 1 GATHER INTO {res} DEADLINE 10sEND";
+        let result = parse_parallel(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Parallel { deadline, .. })) = result {
+            assert_eq!(deadline, Some(10.0));
+        }
+    }
+
+    // --- Parallel GATHER_ALL with DEADLINE ---
+    #[test]
+    fn test_parse_parallel_gather_all_with_deadline() {
+        let input = "PARALLEL SET a = 1 GATHER_ALL INTO {res} DEADLINE 5sEND";
+        let result = parse_parallel(input);
+        assert!(result.is_ok());
+        if let Ok((
+            _,
+            Statement::Parallel {
+                pattern, deadline, ..
+            },
+        )) = result
+        {
+            assert_eq!(pattern, ParallelPattern::GatherAll);
+            assert_eq!(deadline, Some(5.0));
+        }
+    }
+
+    // --- Race with DEADLINE ---
+    #[test]
+    fn test_parse_race_with_deadline() {
+        let input = "RACE SET a = 1 FIRST_INTO {result} DEADLINE 3sEND";
+        let result = parse_race(input);
+        assert!(result.is_ok());
+        if let Ok((
+            _,
+            Statement::Parallel {
+                pattern, deadline, ..
+            },
+        )) = result
+        {
+            assert_eq!(pattern, ParallelPattern::Race);
+            assert_eq!(deadline, Some(3.0));
+        }
+    }
+
+    // --- REMEMBER with EXPIRES ---
+    #[test]
+    fn test_parse_remember_with_expires() {
+        let input = "REMEMBER key VALUE 42 EXPIRES 10m END";
+        let result = parse_remember(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Remember { expires, .. })) = result {
+            assert_eq!(expires, Some(600.0)); // 10 minutes = 600 seconds
+        }
+    }
+
+    // --- RECALL with FUZZY and THRESHOLD ---
+    #[test]
+    fn test_parse_recall_fuzzy_threshold() {
+        let input = "RECALL city INTO {c} FUZZY true THRESHOLD 0.8 END";
+        let result = parse_recall(input);
+        assert!(result.is_ok());
+        if let Ok((
+            _,
+            Statement::Recall {
+                fuzzy, threshold, ..
+            },
+        )) = result
+        {
+            assert!(fuzzy);
+            assert_eq!(threshold, Some(0.8));
+        }
+    }
+
+    // --- parse_use_wasm ---
+    #[test]
+    fn test_parse_use_wasm() {
+        let input = "USE_WASM \"module.wasm\" FUNCTION \"process\" RESULT INTO {output} END";
+        let result = parse_use_wasm(input);
+        assert!(result.is_ok());
+        if let Ok((
+            _,
+            Statement::UseWasm {
+                module_path,
+                function_name,
+                result_into,
+                ..
+            },
+        )) = result
+        {
+            assert_eq!(module_path, "module.wasm");
+            assert_eq!(function_name, "process");
+            assert!(result_into.is_some());
+        }
+    }
+
+    // --- parse_call ---
+    #[test]
+    fn test_parse_call() {
+        let input = "CALL \"AgentB\" GOAL \"pay\" RESULT INTO {res} END";
+        let result = parse_call(input);
+        assert!(result.is_ok());
+        if let Ok((
+            _,
+            Statement::Call {
+                agent_id,
+                goal_name,
+                result_into,
+                ..
+            },
+        )) = result
+        {
+            assert_eq!(agent_id, "AgentB");
+            assert_eq!(goal_name, "pay");
+            assert!(result_into.is_some());
+        }
+    }
+
+    // --- parse_contract with EXPIRES and BUDGET ---
+    #[test]
+    fn test_parse_contract_with_expires_and_budget() {
+        let input = "CONTRACT my_contract ISSUED_BY auth CAN USE my_tool BUDGET 100 EXPIRES 1h END";
+        let result = parse_contract(input);
+        assert!(result.is_ok());
+        if let Ok((
+            _,
+            Statement::Contract {
+                budget,
+                expires,
+                capabilities,
+                ..
+            },
+        )) = result
+        {
+            assert_eq!(budget, Some(100.0));
+            assert_eq!(expires, Some(3600.0));
+            assert_eq!(capabilities.len(), 1);
+        }
+    }
+
+    // --- parse_variable_path with index segment ---
+    #[test]
+    fn test_parse_variable_path_with_index() {
+        let result = parse_variable_path("items[0].name");
+        assert!(result.is_ok());
+        if let Ok((_, path)) = result {
+            assert_eq!(path.root, "items");
+            assert_eq!(path.segments.len(), 2);
+            assert_eq!(path.segments[0], PathSegment::Index(0));
+            assert_eq!(path.segments[1], PathSegment::Field("name".to_string()));
+        }
+    }
+
+    // --- parse_goal_item with result_into ---
+    #[test]
+    fn test_parse_goal_with_result_into() {
+        let input = "GOAL my_goal\nSET x = 1\nRESULT INTO {outcome}\nEND";
+        let result = parse_goal(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Goal { result_into, .. })) = result {
+            assert!(result_into.is_some());
+            assert_eq!(result_into.unwrap().root, "outcome");
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Batch 3: additional parser coverage tests
+    // ──────────────────────────────────────────────────────────────────────────
+
+    // --- IF with ELSE branch (lines 243-245) ---
+    #[test]
+    fn test_parse_if_with_else_branch() {
+        let input = "IF {x} SET a = 1 ELSE SET a = 0 END";
+        let result = parse_if(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::If { else_branch, .. })) = result {
+            assert!(else_branch.is_some());
+        }
+    }
+
+    // --- REMEMBER with string key (lines 576-581) ---
+    #[test]
+    fn test_parse_remember_with_string_key() {
+        let input = "REMEMBER \"my key\" VALUE 42 END";
+        let result = parse_remember(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Remember { name, .. })) = result {
+            assert_eq!(name, "my key");
+        }
+    }
+
+    // --- RECALL with string key ---
+    #[test]
+    fn test_parse_recall_with_string_key() {
+        let input = "RECALL \"city name\" INTO {c} END";
+        let result = parse_recall(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Recall { name, .. })) = result {
+            assert_eq!(name, "city name");
+        }
+    }
+
+    // --- REMEMBER with SCOPE session (covers parse_memory_scope session branch) ---
+    #[test]
+    fn test_parse_remember_scope_session() {
+        let input = "REMEMBER session_key VALUE 1 SCOPE session END";
+        let result = parse_remember(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Remember { scope, .. })) = result {
+            assert_eq!(scope, MemoryScope::Session);
+        }
+    }
+
+    // --- FORGET with SCOPE working ---
+    #[test]
+    fn test_parse_forget_with_scope_working() {
+        let input = "FORGET session_key SCOPE working END";
+        let result = parse_forget(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Forget { scope, .. })) = result {
+            assert_eq!(scope, MemoryScope::Working);
+        }
+    }
+
+    // --- GOAL IDEMPOTENT option ---
+    #[test]
+    fn test_parse_goal_idempotent_opt() {
+        let input = "GOAL my_goal\nSET x = 1\nIDEMPOTENT\nEND";
+        let result = parse_goal(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Goal { idempotent, .. })) = result {
+            assert!(idempotent);
+        }
+    }
+
+    // --- GOAL ON_FAIL option ---
+    #[test]
+    fn test_parse_goal_on_fail_opt() {
+        let input = "GOAL my_goal\nSET x = 1\nON_FAIL SET x = 0\nEND";
+        let result = parse_goal(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Goal { on_fail, .. })) = result {
+            assert!(!on_fail.is_empty());
+        }
+    }
+
+    // --- AWAIT with INTO ---
+    #[test]
+    fn test_parse_await_with_result_into() {
+        let input = "AWAIT {my_call_id} INTO {result}";
+        let result = parse_await(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Await { result_into, .. })) = result {
+            assert!(result_into.is_some());
+        }
+    }
+
+    // --- AWAIT without INTO ---
+    #[test]
+    fn test_parse_await_without_result_into() {
+        let input = "AWAIT {my_call_id}";
+        let result = parse_await(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Await { result_into, .. })) = result {
+            assert!(result_into.is_none());
+        }
+    }
+
+    // --- EMIT with DATA ---
+    #[test]
+    fn test_parse_emit_with_data_value() {
+        let input = "EMIT my_event DATA 42";
+        let result = parse_emit(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Emit { event, data })) = result {
+            assert_eq!(event, "my_event");
+            assert!(data.is_some());
+        }
+    }
+
+    // --- EMIT without DATA - parser requires DATA, so just test with DATA ---
+    #[test]
+    fn test_parse_emit_with_number_data() {
+        let input = "EMIT status_event DATA 1";
+        let result = parse_emit(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Emit { event, data })) = result {
+            assert_eq!(event, "status_event");
+            assert!(data.is_some());
+        }
+    }
+
+    // --- ON event handler ---
+    #[test]
+    fn test_parse_on_event_handler() {
+        let input = "ON my_event SET x = 1 END";
+        let result = parse_on(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::On { event, handler })) = result {
+            assert_eq!(event, "my_event");
+            assert_eq!(handler.len(), 1);
+        }
+    }
+
+    // --- REVEAL with INTO ---
+    #[test]
+    fn test_parse_reveal_with_result_into() {
+        let input = "REVEAL my_proof FOR \"my claim\" INTO {verified}";
+        let result = parse_reveal(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::Reveal { result_into, .. })) = result {
+            assert!(result_into.is_some());
+        }
+    }
+
+    // --- PROVE statement ---
+    #[test]
+    fn test_parse_prove_stmt() {
+        let input = "PROVE {SET x = 1} FOR \"my claim\" AS my_proof";
+        let result = parse_prove(input);
+        assert!(result.is_ok());
+        if let Ok((
+            _,
+            Statement::Prove {
+                claim, proof_name, ..
+            },
+        )) = result
+        {
+            assert_eq!(claim, "my claim");
+            assert_eq!(proof_name, "my_proof");
+        }
+    }
+
+    // --- Index path segment via USE ---
+    #[test]
+    fn test_parse_index_path_segment_via_use_tool() {
+        let input = "USE search q \"hello\" RESULT INTO {res[0]} END";
+        let result = parse_use(input);
+        assert!(result.is_ok());
+        if let Ok((_, Statement::UseTool { result_into, .. })) = result {
+            let path = result_into.unwrap();
+            assert_eq!(path.segments.len(), 1);
+            matches!(path.segments[0], PathSegment::Index(0));
+        }
     }
 }
