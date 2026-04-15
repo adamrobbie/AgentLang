@@ -2178,7 +2178,14 @@ mod tests {
         let input = "GOAL my_goal\nSET x = 1\nTIMEOUT_CONFIRMATION 30s\nEND";
         let result = parse_goal(input);
         assert!(result.is_ok());
-        if let Ok((_, Statement::Goal { timeout_confirmation, .. })) = result {
+        if let Ok((
+            _,
+            Statement::Goal {
+                timeout_confirmation,
+                ..
+            },
+        )) = result
+        {
             assert_eq!(timeout_confirmation, Some(30.0));
         }
     }
@@ -2212,7 +2219,13 @@ mod tests {
         let input = "PARALLEL SET a = 1 GATHER_ALL INTO {res} DEADLINE 5sEND";
         let result = parse_parallel(input);
         assert!(result.is_ok());
-        if let Ok((_, Statement::Parallel { pattern, deadline, .. })) = result {
+        if let Ok((
+            _,
+            Statement::Parallel {
+                pattern, deadline, ..
+            },
+        )) = result
+        {
             assert_eq!(pattern, ParallelPattern::GatherAll);
             assert_eq!(deadline, Some(5.0));
         }
@@ -2224,7 +2237,13 @@ mod tests {
         let input = "RACE SET a = 1 FIRST_INTO {result} DEADLINE 3sEND";
         let result = parse_race(input);
         assert!(result.is_ok());
-        if let Ok((_, Statement::Parallel { pattern, deadline, .. })) = result {
+        if let Ok((
+            _,
+            Statement::Parallel {
+                pattern, deadline, ..
+            },
+        )) = result
+        {
             assert_eq!(pattern, ParallelPattern::Race);
             assert_eq!(deadline, Some(3.0));
         }
@@ -2247,7 +2266,13 @@ mod tests {
         let input = "RECALL city INTO {c} FUZZY true THRESHOLD 0.8 END";
         let result = parse_recall(input);
         assert!(result.is_ok());
-        if let Ok((_, Statement::Recall { fuzzy, threshold, .. })) = result {
+        if let Ok((
+            _,
+            Statement::Recall {
+                fuzzy, threshold, ..
+            },
+        )) = result
+        {
             assert!(fuzzy);
             assert_eq!(threshold, Some(0.8));
         }
@@ -2256,11 +2281,19 @@ mod tests {
     // --- parse_use_wasm ---
     #[test]
     fn test_parse_use_wasm() {
-        let input =
-            "USE_WASM \"module.wasm\" FUNCTION \"process\" RESULT INTO {output} END";
+        let input = "USE_WASM \"module.wasm\" FUNCTION \"process\" RESULT INTO {output} END";
         let result = parse_use_wasm(input);
         assert!(result.is_ok());
-        if let Ok((_, Statement::UseWasm { module_path, function_name, result_into, .. })) = result {
+        if let Ok((
+            _,
+            Statement::UseWasm {
+                module_path,
+                function_name,
+                result_into,
+                ..
+            },
+        )) = result
+        {
             assert_eq!(module_path, "module.wasm");
             assert_eq!(function_name, "process");
             assert!(result_into.is_some());
@@ -2273,7 +2306,16 @@ mod tests {
         let input = "CALL \"AgentB\" GOAL \"pay\" RESULT INTO {res} END";
         let result = parse_call(input);
         assert!(result.is_ok());
-        if let Ok((_, Statement::Call { agent_id, goal_name, result_into, .. })) = result {
+        if let Ok((
+            _,
+            Statement::Call {
+                agent_id,
+                goal_name,
+                result_into,
+                ..
+            },
+        )) = result
+        {
             assert_eq!(agent_id, "AgentB");
             assert_eq!(goal_name, "pay");
             assert!(result_into.is_some());
@@ -2311,10 +2353,7 @@ mod tests {
             assert_eq!(path.root, "items");
             assert_eq!(path.segments.len(), 2);
             assert_eq!(path.segments[0], PathSegment::Index(0));
-            assert_eq!(
-                path.segments[1],
-                PathSegment::Field("name".to_string())
-            );
+            assert_eq!(path.segments[1], PathSegment::Field("name".to_string()));
         }
     }
 
@@ -2486,7 +2525,13 @@ mod tests {
         let input = "PROVE {SET x = 1} FOR \"my claim\" AS my_proof";
         let result = parse_prove(input);
         assert!(result.is_ok());
-        if let Ok((_, Statement::Prove { claim, proof_name, .. })) = result {
+        if let Ok((
+            _,
+            Statement::Prove {
+                claim, proof_name, ..
+            },
+        )) = result
+        {
             assert_eq!(claim, "my claim");
             assert_eq!(proof_name, "my_proof");
         }

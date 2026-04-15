@@ -1,5 +1,5 @@
-use crate::ast::{AnnotatedValue, MemoryScope, Value};
 use super::context::Context;
+use crate::ast::{AnnotatedValue, MemoryScope, Value};
 use anyhow::Result;
 use std::collections::HashMap;
 

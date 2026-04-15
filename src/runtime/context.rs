@@ -1,9 +1,9 @@
-use crate::ast::*;
-use crate::crypto;
 use super::audit::{AuditChain, Event, format_value_safe};
 use super::memory::{JsonFileBackend, MemoryBackend};
 use super::registry_rpc::registry_service_client::RegistryServiceClient;
 use super::registry_rpc::{GetSharedRequest, PutSharedRequest};
+use crate::ast::*;
+use crate::crypto;
 use anyhow::{Result, anyhow};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::RngCore;

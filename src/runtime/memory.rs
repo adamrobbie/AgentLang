@@ -1,5 +1,5 @@
-use crate::ast::{AnnotatedValue, GoalFailureType, MemoryScope, PathSegment, Value, VariablePath};
 use super::audit::AgentError;
+use crate::ast::{AnnotatedValue, GoalFailureType, MemoryScope, PathSegment, Value, VariablePath};
 use anyhow::{Result, anyhow};
 use rand::RngCore;
 use ring::aead;

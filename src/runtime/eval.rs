@@ -1,25 +1,27 @@
-use crate::ast::*;
-use crate::crypto;
 use super::agent_rpc::CallRequest;
 use super::agent_rpc::agent_service_client::AgentServiceClient;
-use super::registry_rpc::registry_service_client::RegistryServiceClient;
-use super::registry_rpc::{LookupRequest, PutSharedRequest};
-use super::audit::{AgentError, Event, format_value_safe};
-use super::call::{build_completed_call_envelope, build_failed_call_envelope, build_pending_call_envelope, store_call_result};
+use super::audit::{AgentError, Event};
+use super::call::{
+    build_completed_call_envelope, build_failed_call_envelope, build_pending_call_envelope,
+    store_call_result,
+};
 use super::context::{Context, ContractInfo};
-use super::goal::{apply_annotations, build_goal_result, classify_goal_failure, store_goal_result};
+use super::goal::{build_goal_result, classify_goal_failure, store_goal_result};
 use super::memory::{
     ensure_value_safe_for_irreversible_action, inherit_metadata, propagate_container_metadata,
     resolve_path, sanitize_recalled_value,
 };
+use super::registry_rpc::LookupRequest;
+use super::registry_rpc::registry_service_client::RegistryServiceClient;
+use crate::ast::*;
+use crate::crypto;
 use anyhow::{Result, anyhow};
 use async_recursion::async_recursion;
 use ed25519_dalek::Signer;
 use ring::digest;
 use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::time::{Duration, sleep};
-use wasmtime::{Engine, Linker, Module, Store, Val, ValType};
+use wasmtime::{Linker, Module, Store, Val, ValType};
 
 #[async_recursion]
 pub async fn eval_expression(expr: &Expression, ctx: &Context) -> Result<AnnotatedValue> {
@@ -1325,4 +1327,3 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
         }
     }
 }
-

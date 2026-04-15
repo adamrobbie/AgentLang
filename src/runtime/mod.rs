@@ -7,18 +7,18 @@ pub mod registry_rpc {
 }
 
 pub mod audit;
-pub mod memory;
-pub mod context;
 pub mod call;
-pub mod goal;
+pub mod context;
 pub mod eval;
+pub mod goal;
+pub mod memory;
 
 pub use audit::*;
-pub use memory::*;
-pub use context::*;
 pub use call::*;
-pub use goal::*;
+pub use context::*;
 pub use eval::*;
+pub use goal::*;
+pub use memory::*;
 
 #[cfg(test)]
 pub use context::unique_test_path;
@@ -1743,10 +1743,7 @@ mod tests {
         assert!(loaded.contains_key("secret"));
         assert!(loaded.contains_key("plain"));
         assert_eq!(loaded["plain"].value, Value::Number(42.0));
-        assert_eq!(
-            loaded["secret"].value,
-            Value::Text("topsecret".to_string())
-        );
+        assert_eq!(loaded["secret"].value, Value::Text("topsecret".to_string()));
 
         let _ = fs::remove_file(&file_path);
     }
@@ -1768,14 +1765,9 @@ mod tests {
             AnnotatedValue::from(Value::Number(30.0)),
         );
 
-        let result = backend
-            .fuzzy_search("user_name", &memory, None)
-            .unwrap();
+        let result = backend.fuzzy_search("user_name", &memory, None).unwrap();
         assert!(result.is_some());
-        assert_eq!(
-            result.unwrap().value,
-            Value::Text("Alice".to_string())
-        );
+        assert_eq!(result.unwrap().value, Value::Text("Alice".to_string()));
     }
 
     #[test]
@@ -1812,11 +1804,7 @@ mod tests {
     fn test_context_default() {
         let ctx = Context::default();
         // default() just calls new(), so it should work fine
-        assert!(ctx
-            .working_variables
-            .lock()
-            .unwrap()
-            .is_empty());
+        assert!(ctx.working_variables.lock().unwrap().is_empty());
     }
 
     // --- get_variable and set_variable LongTerm scope ---
@@ -1856,10 +1844,11 @@ mod tests {
         };
         eval(&forget_stmt, ctx.clone()).await.unwrap();
 
-        assert!(ctx
-            .get_variable("lt_key", MemoryScope::LongTerm)
-            .await
-            .is_err());
+        assert!(
+            ctx.get_variable("lt_key", MemoryScope::LongTerm)
+                .await
+                .is_err()
+        );
     }
 
     // --- resolve_path virtual metadata fields ---
@@ -1926,9 +1915,8 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_path_index_out_of_bounds() {
         let ctx = Context::new();
-        let list_val = AnnotatedValue::from(Value::List(vec![
-            AnnotatedValue::from(Value::Number(10.0)),
-        ]));
+        let list_val =
+            AnnotatedValue::from(Value::List(vec![AnnotatedValue::from(Value::Number(10.0))]));
         ctx.set_variable("arr".to_string(), list_val, MemoryScope::Working)
             .await
             .unwrap();
@@ -2016,14 +2004,8 @@ mod tests {
         let args: HashMap<String, AnnotatedValue> = HashMap::new();
         let env = build_pending_call_envelope("call1", "agentA", "doWork", &args);
         if let Value::Object(fields) = env.value {
-            assert_eq!(
-                fields["status"].value,
-                Value::Text("pending".to_string())
-            );
-            assert_eq!(
-                fields["call_id"].value,
-                Value::Text("call1".to_string())
-            );
+            assert_eq!(fields["status"].value, Value::Text("pending".to_string()));
+            assert_eq!(fields["call_id"].value, Value::Text("call1".to_string()));
         } else {
             panic!("Expected object");
         }
@@ -2035,14 +2017,8 @@ mod tests {
         let result = AnnotatedValue::from(Value::Text("done".to_string()));
         let env = build_completed_call_envelope("call1", "agentA", "doWork", &args, result);
         if let Value::Object(fields) = env.value {
-            assert_eq!(
-                fields["status"].value,
-                Value::Text("completed".to_string())
-            );
-            assert_eq!(
-                fields["result"].value,
-                Value::Text("done".to_string())
-            );
+            assert_eq!(fields["status"].value, Value::Text("completed".to_string()));
+            assert_eq!(fields["result"].value, Value::Text("done".to_string()));
         } else {
             panic!("Expected object");
         }
@@ -2053,10 +2029,7 @@ mod tests {
         let args: HashMap<String, AnnotatedValue> = HashMap::new();
         let env = build_failed_call_envelope("call1", "agentA", "doWork", &args, "network error");
         if let Value::Object(fields) = env.value {
-            assert_eq!(
-                fields["status"].value,
-                Value::Text("error".to_string())
-            );
+            assert_eq!(fields["status"].value, Value::Text("error".to_string()));
             assert_eq!(
                 fields["error"].value,
                 Value::Text("network error".to_string())
@@ -2149,10 +2122,7 @@ mod tests {
             .await
             .unwrap();
         if let Value::Object(fields) = result.value {
-            assert_eq!(
-                fields["flight_id"].value,
-                Value::Text("FL-001".to_string())
-            );
+            assert_eq!(fields["flight_id"].value, Value::Text("FL-001".to_string()));
         } else {
             panic!("Expected object");
         }
@@ -2495,10 +2465,7 @@ mod tests {
         .await
         .unwrap();
 
-        let val = ctx
-            .get_variable("arr", MemoryScope::Working)
-            .await
-            .unwrap();
+        let val = ctx.get_variable("arr", MemoryScope::Working).await.unwrap();
         if let Value::List(items) = val.value {
             assert_eq!(items[1].value, Value::Number(99.0));
         } else {
@@ -2551,9 +2518,7 @@ mod tests {
         let ctx = Context::new();
         let stmt = Statement::Remember {
             name: "temp".to_string(),
-            value: Expression::Literal(AnnotatedValue::from(Value::Text(
-                "temporary".to_string(),
-            ))),
+            value: Expression::Literal(AnnotatedValue::from(Value::Text("temporary".to_string()))),
             scope: MemoryScope::Working,
             expires: Some(3600.0), // expires in 1 hour (spawns task, won't expire in test)
         };
@@ -2614,10 +2579,12 @@ mod tests {
         eval(&stmt, ctx.clone()).await.unwrap();
 
         let audit = ctx.audit_chain.lock().unwrap();
-        assert!(audit
-            .entries
-            .iter()
-            .any(|e| e.op.contains("GOAL_SUCCESS:audited_goal")));
+        assert!(
+            audit
+                .entries
+                .iter()
+                .any(|e| e.op.contains("GOAL_SUCCESS:audited_goal"))
+        );
     }
 
     // --- Goal idempotent second run skips ---
@@ -2750,8 +2717,7 @@ mod tests {
 
     #[test]
     fn test_apply_annotations_approximate() {
-        let val = AnnotatedValue::from(Value::Number(3.14));
-        let annotated = apply_annotations(val, &[Annotation::Approximate]);
+        let val = AnnotatedValue::from(Value::Number(2.5));
         assert!(annotated.is_approximate);
     }
 
@@ -2773,7 +2739,9 @@ mod tests {
     async fn test_eval_expression_annotated_uncertain() {
         let ctx = Context::new();
         let expr = Expression::Annotated {
-            expr: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(5.0)))),
+            expr: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                5.0,
+            )))),
             annotation: Annotation::Uncertain,
         };
         let result = eval_expression(&expr, &ctx).await.unwrap();
@@ -2784,7 +2752,9 @@ mod tests {
     async fn test_eval_expression_annotated_approximate() {
         let ctx = Context::new();
         let expr = Expression::Annotated {
-            expr: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(3.14)))),
+            expr: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                2.5,
+            )))),
             annotation: Annotation::Approximate,
         };
         let result = eval_expression(&expr, &ctx).await.unwrap();
@@ -2835,10 +2805,7 @@ mod tests {
     async fn test_if_condition_non_empty_object_is_true() {
         let ctx = Context::new();
         let mut fields = HashMap::new();
-        fields.insert(
-            "k".to_string(),
-            AnnotatedValue::from(Value::Number(1.0)),
-        );
+        fields.insert("k".to_string(), AnnotatedValue::from(Value::Number(1.0)));
         let stmt = Statement::If {
             condition: Expression::Literal(AnnotatedValue::from(Value::Object(fields))),
             then_branch: vec![Statement::Set {
@@ -2983,7 +2950,12 @@ mod tests {
 
         // Audit chain should have a TOOL_EXEC entry
         let audit = ctx.audit_chain.lock().unwrap();
-        assert!(audit.entries.iter().any(|e| e.op.contains("TOOL_EXEC:side_tool")));
+        assert!(
+            audit
+                .entries
+                .iter()
+                .any(|e| e.op.contains("TOOL_EXEC:side_tool"))
+        );
     }
 
     // --- Remember with Shared scope and sensitive value → error ---
@@ -3098,7 +3070,11 @@ mod tests {
             pattern: ParallelPattern::Gather,
         };
         eval(&stmt, ctx.clone()).await.unwrap();
-        assert!(ctx.get_variable("result", MemoryScope::Working).await.is_ok());
+        assert!(
+            ctx.get_variable("result", MemoryScope::Working)
+                .await
+                .is_ok()
+        );
     }
 
     // --- GatherAll with branch errors ---
@@ -3253,9 +3229,15 @@ mod tests {
         store_call_result(&ctx, "call_x", envelope).await.unwrap();
 
         // call_x is stored
-        ctx.get_variable("call_x", MemoryScope::Working).await.unwrap();
+        ctx.get_variable("call_x", MemoryScope::Working)
+            .await
+            .unwrap();
         // call_x.result should NOT be present (no flat_result)
-        assert!(ctx.get_variable("call_x.result", MemoryScope::Working).await.is_err());
+        assert!(
+            ctx.get_variable("call_x.result", MemoryScope::Working)
+                .await
+                .is_err()
+        );
     }
 
     // --- Forget Session scope ---
@@ -3276,7 +3258,11 @@ mod tests {
         };
         eval(&stmt, ctx.clone()).await.unwrap();
 
-        assert!(ctx.get_variable("sess_key", MemoryScope::Session).await.is_err());
+        assert!(
+            ctx.get_variable("sess_key", MemoryScope::Session)
+                .await
+                .is_err()
+        );
     }
 
     // --- Await with result_into = None (stores under call_id) ---
@@ -3355,7 +3341,11 @@ mod tests {
             pattern: ParallelPattern::GatherMin(2),
         };
         eval(&stmt, ctx.clone()).await.unwrap();
-        assert!(ctx.get_variable("min_result", MemoryScope::Working).await.is_ok());
+        assert!(
+            ctx.get_variable("min_result", MemoryScope::Working)
+                .await
+                .is_ok()
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -3367,7 +3357,9 @@ mod tests {
     async fn test_eval_expression_annotated_confidence() {
         let ctx = Context::new();
         let expr = Expression::Annotated {
-            expr: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(5.0)))),
+            expr: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                5.0,
+            )))),
             annotation: Annotation::Confidence,
         };
         let result = eval_expression(&expr, &ctx).await.unwrap();
@@ -3383,7 +3375,9 @@ mod tests {
                 "hello".to_string(),
             )))),
             op: BinaryOperator::Sub,
-            right: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(1.0)))),
+            right: Box::new(Expression::Literal(AnnotatedValue::from(Value::Number(
+                1.0,
+            )))),
         };
         assert!(eval_expression(&expr, &ctx).await.is_err());
     }
@@ -3405,7 +3399,11 @@ mod tests {
             scope: MemoryScope::Working,
         };
         eval(&stmt, ctx.clone()).await.unwrap();
-        assert!(ctx.get_variable("work_key", MemoryScope::Working).await.is_err());
+        assert!(
+            ctx.get_variable("work_key", MemoryScope::Working)
+                .await
+                .is_err()
+        );
     }
 
     // --- Delegate with args (lines 1699, 1702, 1704) ---
@@ -3519,7 +3517,12 @@ mod tests {
         eval(&stmt, ctx.clone()).await.unwrap();
 
         // The pending_calls should have an entry
-        assert!(ctx.pending_calls.lock().unwrap().contains_key("call_result"));
+        assert!(
+            ctx.pending_calls
+                .lock()
+                .unwrap()
+                .contains_key("call_result")
+        );
     }
 
     // --- Goal with result_into (covers store_goal_result lines 881-882) ---
@@ -3700,10 +3703,9 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Using the tool should now fail because contract is expired
-        ctx.tools
-            .lock()
-            .unwrap()
-            .insert("my_tool".to_string(), ToolDefinition {
+        ctx.tools.lock().unwrap().insert(
+            "my_tool".to_string(),
+            ToolDefinition {
                 name: "my_tool".to_string(),
                 description: None,
                 category: None,
@@ -3714,7 +3716,8 @@ mod tests {
                 side_effect: false,
                 rate_limit: None,
                 timeout: None,
-            });
+            },
+        );
 
         let use_stmt = Statement::UseTool {
             tool_name: "my_tool".to_string(),
