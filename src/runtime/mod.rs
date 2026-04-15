@@ -2718,6 +2718,7 @@ mod tests {
     #[test]
     fn test_apply_annotations_approximate() {
         let val = AnnotatedValue::from(Value::Number(2.5));
+        let annotated = apply_annotations(val, &[Annotation::Approximate]);
         assert!(annotated.is_approximate);
     }
 
