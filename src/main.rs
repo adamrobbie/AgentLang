@@ -4,6 +4,7 @@ use AgentLang::registry_rpc::RegisterRequest;
 use AgentLang::runtime;
 use AgentLang::*;
 use anyhow::{Context, Result};
+use ariadne::{Color, Label, Report, ReportKind, Source};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::Signer;
 use std::collections::HashMap;
@@ -155,7 +156,19 @@ async fn run_agent(port: u16, id: String, script_path: Option<String>, registry_
                     }
                 }
             }
-            Err(e) => eprintln!("Parse error: {:?}", e),
+            Err(e) => {
+                let filename: String = path.clone();
+                Report::build(ReportKind::Error, (filename.clone(), 0..0))
+                    .with_message("Parse error in AgentLang script")
+                    .with_label(
+                        Label::new((filename.clone(), 0..source.len()))
+                            .with_message(format!("{:?}", e))
+                            .with_color(Color::Red),
+                    )
+                    .finish()
+                    .eprint((filename, Source::from(source)))
+                    .unwrap();
+            }
         }
     } else {
         println!("Agent {} running. Press Ctrl+C to exit.", id);
