@@ -62,6 +62,17 @@ GOAL plan_trip
 END
 ```
 
+## 🔍 How It Compares
+
+AgentLang sits in a unique whitespace: **A natively compiled, memory-safe language that treats AI uncertainty, agent-to-agent trust, and Zero Knowledge privacy as first-class syntactical primitives.**
+
+| Ecosystem | Examples | AgentLang Difference |
+| :--- | :--- | :--- |
+| **Agent Frameworks** | LangGraph, AutoGen, CrewAI | These are *libraries* on top of Python/TS requiring heavy boilerplate (`try/except`, retry loops). AgentLang is a *DSL* with native semantics (`GOAL`, `ON_FAIL`, `RETRY`). |
+| **Prompting DSLs** | LMQL, Guidance, DSPy | These focus on the *micro-level* (constraining a single LLM response). AgentLang focuses on *macro-level* orchestration, parallel execution, and state. |
+| **Crypto Agent Networks** | Fetch.ai, Autonolas | These use Python SDKs to connect agents to ledgers. AgentLang bakes **zk-STARKs** and data sensitivity (`AS sensitive`) directly into the compiler types for guaranteed privacy. |
+| **Actor-Model Languages** | Elixir/Erlang, Pony | These lack concepts for LLM "confidence thresholds" or "hallucination recovery". AgentLang fuses Actor Model supervision with AI-native primitives. |
+
 ## 🏗️ Architecture
 
 AgentLang uses a **Pure Rust** architecture designed for massive throughput and zero-cost safety:
