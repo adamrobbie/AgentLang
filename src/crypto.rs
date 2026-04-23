@@ -39,8 +39,9 @@ impl Air for FibAir {
         let degrees = vec![
             winterfell::TransitionConstraintDegree::new(1),
             winterfell::TransitionConstraintDegree::new(1),
+            winterfell::TransitionConstraintDegree::new(1),
         ];
-        let num_assertions = 4;
+        let num_assertions = 5;
         let context = AirContext::new(trace_info, degrees, num_assertions, options);
         Self {
             context,
@@ -56,8 +57,7 @@ impl Air for FibAir {
             Assertion::single(0, last_step, self.pub_inputs.col0_last),
             Assertion::single(1, last_step, self.pub_inputs.col1_last),
             // The claim_hash is a public input that we assert is correct.
-            // In a more complex AIR, this would be tied to the trace.
-            // For this prototype, we just verify it matches the public input.
+            Assertion::single(2, 0, self.pub_inputs.claim_hash),
         ]
     }
 
@@ -71,6 +71,9 @@ impl Air for FibAir {
         let next = frame.next();
         result[0] = next[0] - current[1];
         result[1] = next[1] - (current[0] + current[1]);
+        
+        // Col 2 is just the claim hash carrying over the entire trace unchanged
+        result[2] = next[2] - current[2];
     }
 
     fn context(&self) -> &AirContext<Self::BaseField> {
@@ -96,16 +99,19 @@ impl FibProver {
     }
 
     pub fn build_trace(&self, n: usize) -> TraceTable<BaseElement> {
-        let mut trace = TraceTable::new(2, n);
+        let mut trace = TraceTable::new(3, n);
+        let ch = self.claim_hash;
         trace.fill(
             |state| {
                 state[0] = BaseElement::ONE;
                 state[1] = BaseElement::ONE;
+                state[2] = ch;
             },
             |_, state| {
                 let next = state[0] + state[1];
                 state[0] = state[1];
                 state[1] = next;
+                state[2] = ch;
             },
         );
         trace
