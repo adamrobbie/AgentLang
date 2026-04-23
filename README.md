@@ -27,7 +27,7 @@ While the ultimate intent is to build a robust, production-ready language and ec
 *   **First-Class Confidence:** Use `AS confidence` types to let agents make decisions based on their own certainty (e.g., `IF {city.confidence} > 0.9`).
 *   **Privacy by Default:** Sensitive data is automatically encrypted and protected via **zk-STARKs (Zero Knowledge Proofs)**, allowing agents to prove permissions without revealing raw secrets.
 *   **Trust-Aware Communication:** Every inter-agent message is cryptographically signed and verifiable via a federated Agent Registry.
-*   **Elixir-Inspired Runtime:** A pure **Rust/Tokio** architecture utilizing **Bastion** for massive concurrency and fault-tolerant OTP-style orchestration, natively powering cryptography and ZK-proof generation.
+*   **Elixir-Inspired Runtime:** A pure **Rust/Tokio** architecture utilizing **Ractor** for massive concurrency and fault-tolerant OTP-style orchestration, natively powering cryptography and ZK-proof generation.
 *   **MCP Compatible:** Native support for the Model Context Protocol (MCP), making it compatible with the existing ecosystem of tools and data sources.
 
 ## 📝 Example Syntax
@@ -77,7 +77,7 @@ AgentLang sits in a unique whitespace: **A natively compiled, memory-safe langua
 
 AgentLang uses a **Pure Rust** architecture designed for massive throughput and zero-cost safety:
 
-1.  **Orchestration (Tokio + Bastion):** Every `GOAL` is a supervised task. We use the **Bastion** runtime to provide OTP-style supervision trees, ensuring that one failing agent cannot crash the system.
+1.  **Orchestration (Tokio + Ractor):** Every `GOAL` is a supervised task. We use the **Ractor** framework to provide OTP-style supervision trees, ensuring that one failing agent cannot crash the system.
 2.  **Safety Layer:** Built-in support for **WebAssembly (WASM)** allows for sandboxed agent execution and hot-swappable logic without restarting the host.
 3.  **High-Performance Primitives:**
     *   **winterfell:** Fast zk-STARK proof generation.
@@ -89,7 +89,7 @@ AgentLang uses a **Pure Rust** architecture designed for massive throughput and 
 
 - [ ] **Phase 1:** TypeScript-based Interpreter (PoC)
 - [ ] **Phase 2:** Full Grammar & Type Validation
-- [ ] **Phase 3:** Native Rust Actor-Model Orchestrator (Bastion)
+- [ ] **Phase 3:** Native Rust Actor-Model Orchestrator (Ractor)
 - [ ] **Phase 4:** Rust-based Crypto & ZK-Proof Engine
 - [ ] **Phase 5:** Federated Agent Registry
 

@@ -866,7 +866,7 @@ END
 
 ### 13.1 Pure Rust Runtime Model
 
-AgentLang 1.0 utilizes a **Pure Rust** architecture optimized for maximum throughput, memory safety, and deterministic execution. The runtime is built on the **Tokio** asynchronous executor and the **Bastion** highly-available supervisor framework, providing OTP-like resilience without the overhead of a virtual machine.
+AgentLang 1.0 utilizes a **Pure Rust** architecture optimized for maximum throughput, memory safety, and deterministic execution. The runtime is built on the **Tokio** asynchronous executor and the **Ractor** highly-available supervisor framework, providing OTP-like resilience without the overhead of a virtual machine.
 
 ```
 AgentLang Source (.al)

@@ -52,7 +52,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    runtime::ensure_bastion_started();
+    runtime::ensure_ractor_started();
 
     match cli.command {
         Commands::Registry { port } => run_registry(port).await?,
@@ -420,7 +420,7 @@ async fn run_demo() -> Result<()> {
                 ctx.audit_chain.lock().unwrap().entries.len()
             );
             println!("====================================================");
-            bastion::prelude::Bastion::stop();
+            // We can just exit, Tokio handles cleanup automatically for Ractor
         }
         Err(e) => {
                 let filename = "examples/demo.agentlang".to_string();

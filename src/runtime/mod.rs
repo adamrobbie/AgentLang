@@ -24,14 +24,12 @@ pub use memory::*;
 #[cfg(test)]
 pub use context::unique_test_path;
 
-use bastion::prelude::*;
 use std::sync::Once;
 
-pub fn ensure_bastion_started() {
-    static BASTION_START: Once = Once::new();
-    BASTION_START.call_once(|| {
-        Bastion::init();
-        Bastion::start();
+pub fn ensure_ractor_started() {
+    static RACTOR_START: Once = Once::new();
+    RACTOR_START.call_once(|| {
+        // Ractor is implicitly initialized by Tokio so we don't need a global start command.
     });
 }
 
@@ -39,12 +37,12 @@ pub fn ensure_bastion_started() {
 use std::sync::LazyLock;
 
 #[cfg(test)]
-static BASTION_TEST_MUTEX: LazyLock<tokio::sync::Mutex<()>> =
+static RACTOR_TEST_MUTEX: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 #[cfg(test)]
-pub async fn bastion_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
-    BASTION_TEST_MUTEX.lock().await
+pub async fn ractor_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    RACTOR_TEST_MUTEX.lock().await
 }
 
 #[cfg(test)]
@@ -188,8 +186,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_structured_error_routing() {
-        let _guard = bastion_test_guard().await;
-        ensure_bastion_started();
+        let _guard = ractor_test_guard().await;
+        ensure_ractor_started();
         let ctx = Context::new();
 
         let mut on_fail = HashMap::new();
@@ -331,8 +329,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_parallel_aggregation() {
-        let _guard = bastion_test_guard().await;
-        ensure_bastion_started();
+        let _guard = ractor_test_guard().await;
+        ensure_ractor_started();
         let ctx = Context::new();
 
         let stmt = Statement::Parallel {
@@ -368,8 +366,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_race_aggregation() {
-        let _guard = bastion_test_guard().await;
-        ensure_bastion_started();
+        let _guard = ractor_test_guard().await;
+        ensure_ractor_started();
         let ctx = Context::new();
 
         let stmt = Statement::Parallel {
@@ -436,8 +434,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_goal_retry_exhaustion() {
-        let _guard = bastion_test_guard().await;
-        ensure_bastion_started();
+        let _guard = ractor_test_guard().await;
+        ensure_ractor_started();
         let ctx = Context::new();
         let goal_stmt = Statement::Goal {
             name: "fail_forever".to_string(),
@@ -468,8 +466,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_goal_idempotency() {
-        let _guard = bastion_test_guard().await;
-        ensure_bastion_started();
+        let _guard = ractor_test_guard().await;
+        ensure_ractor_started();
         let ctx = Context::new();
         let goal_name = "once".to_string();
 
@@ -1428,8 +1426,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_goal_deadline_timeout() {
-        let _guard = bastion_test_guard().await;
-        ensure_bastion_started();
+        let _guard = ractor_test_guard().await;
+        ensure_ractor_started();
         let ctx = Context::new();
 
         // A goal that sleeps longer than its deadline should fail with a timeout error.
@@ -1458,8 +1456,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_parallel_gather_all() {
-        let _guard = bastion_test_guard().await;
-        ensure_bastion_started();
+        let _guard = ractor_test_guard().await;
+        ensure_ractor_started();
         let ctx = Context::new();
 
         let stmt = Statement::Parallel {
@@ -1489,8 +1487,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_parallel_gather_min() {
-        let _guard = bastion_test_guard().await;
-        ensure_bastion_started();
+        let _guard = ractor_test_guard().await;
+        ensure_ractor_started();
         let ctx = Context::new();
 
         let stmt = Statement::Parallel {
@@ -2296,8 +2294,8 @@ mod tests {
     // --- Goal with fallback handler ---
     #[tokio::test]
     async fn test_goal_fallback_handler() {
-        let _guard = bastion_test_guard().await;
-        ensure_bastion_started();
+        let _guard = ractor_test_guard().await;
+        ensure_ractor_started();
         let ctx = Context::new();
 
         let fallback_stmt = Statement::Set {
@@ -2340,8 +2338,8 @@ mod tests {
     // --- Goal with wait ---
     #[tokio::test]
     async fn test_goal_with_wait() {
-        let _guard = bastion_test_guard().await;
-        ensure_bastion_started();
+        let _guard = ractor_test_guard().await;
+        ensure_ractor_started();
         let ctx = Context::new();
 
         let start = std::time::Instant::now();
@@ -2555,8 +2553,8 @@ mod tests {
     // --- Goal audit trail ---
     #[tokio::test]
     async fn test_goal_audit_trail_true() {
-        let _guard = bastion_test_guard().await;
-        ensure_bastion_started();
+        let _guard = ractor_test_guard().await;
+        ensure_ractor_started();
         let ctx = Context::new();
 
         let stmt = Statement::Goal {
@@ -2591,8 +2589,8 @@ mod tests {
     // --- Goal idempotent second run skips ---
     #[tokio::test]
     async fn test_goal_idempotent_second_run_skips() {
-        let _guard = bastion_test_guard().await;
-        ensure_bastion_started();
+        let _guard = ractor_test_guard().await;
+        ensure_ractor_started();
         let ctx = Context::new();
 
         // First run
@@ -3530,8 +3528,8 @@ mod tests {
     // --- Goal with result_into (covers store_goal_result lines 881-882) ---
     #[tokio::test]
     async fn test_goal_with_result_into_stores_flat_result() {
-        let _guard = bastion_test_guard().await;
-        ensure_bastion_started();
+        let _guard = ractor_test_guard().await;
+        ensure_ractor_started();
         let ctx = Context::new();
 
         // Set x so result_into can find it
