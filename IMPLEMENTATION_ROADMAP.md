@@ -343,9 +343,9 @@ The spec positions trust and registry behavior as first-class concerns, but the 
 
 **Tasks:**
 1. Introduce a storage abstraction layer for working, session, long-term, and shared memory.
-2. Replace session storage with a higher-concurrency structure.
-3. Replace JSON-file long-term memory with database-backed persistence.
-4. Replace substring fuzzy recall with vector-backed retrieval.
+2. Replace session storage with a higher-concurrency structure like DashMap.
+3. Replace JSON-file long-term memory with a Rust-native embedded vector database (e.g. LanceDB).
+4. Replace substring fuzzy recall with true semantic embedding vector-backed retrieval.
 5. Add expiry enforcement and threshold-aware fuzzy retrieval.
 6. Add migration/test strategy for persistence-backed memory behavior.
 

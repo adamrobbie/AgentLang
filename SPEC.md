@@ -476,8 +476,8 @@ END
 |---|---|---|---|
 | `working` | Current GOAL only | This agent | BEAM process heap |
 | `session` | Current session | This agent | ETS (in-memory) |
-| `long_term` | Until FORGET or expiry | This agent | PostgreSQL + pgvector |
-| `shared` | Until FORGET or expiry | All trusted agents | PostgreSQL + pgvector |
+| `long_term` | Until FORGET or expiry | This agent | Embedded Vector DB (LanceDB) |
+| `shared` | Until FORGET or expiry | All trusted agents | Embedded Vector DB (LanceDB) |
 
 ### 7.3 Memory Operations
 
@@ -892,8 +892,8 @@ AgentLang Source (.al)
    Memory Layer
    |-- Working   (Tokio Local Storage)
    |-- Session   (DashMap)
-   |-- Long-term (PostgreSQL + pgvector via sqlx)
-   |-- Shared    (PostgreSQL + pgvector via sqlx)
+   |-- Long-term (Embedded Vector DB / LanceDB)
+   |-- Shared    (Embedded Vector DB / LanceDB)
          |
    Tool Executor
    |-- Standard Library (Rust Built-ins)
@@ -1158,7 +1158,7 @@ Complete alphabetical listing of all AgentLang reserved keywords.
 | **Idempotent** | A GOAL or tool call that produces the same result regardless of how many times it is executed. |
 | **MCP** | Model Context Protocol — an industry standard for tool and data access in agent systems. AgentLang tools are MCP-compatible. |
 | **NIF** | Native Implemented Function — the mechanism for calling Rust code from the Elixir/BEAM orchestration layer. |
-| **pgvector** | A PostgreSQL extension for vector similarity search. Used as the backend for fuzzy recall. |
+| **pgvector** | A PostgreSQL extension for vector similarity search. Replaced by LanceDB embedded vector storage in the AgentLang reference implementation. |
 | **Registry** | A federated service that stores and verifies agent identities and contracts. |
 | **Sensitive** | A type annotation marking a value as PII or secret. Auto-encrypted, ZK-proof-protected, and redacted in audit logs. |
 | **Supervision Tree** | An OTP pattern where processes are supervised by parent processes that apply restart strategies on failure. |
