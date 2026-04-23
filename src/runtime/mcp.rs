@@ -78,19 +78,23 @@ impl McpClient {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
             while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
-                if let Ok(res) = serde_json::from_str::<JsonRpcResponse>(&line)
-                    && let Some(id) = res.id
-                {
-                    let mut p = pending.lock().await;
-                    if let Some(sender) = p.remove(&id) {
-                        if let Some(err) = res.error {
-                            let _ = sender.send(Err(anyhow!("JSON-RPC Error: {:?}", err)));
-                        } else if let Some(result) = res.result {
-                            let _ = sender.send(Ok(result));
-                        } else {
-                            let _ = sender.send(Err(anyhow!("Missing result and error in JSON-RPC response")));
+                // If it parses as JSON-RPC, handle it
+                if let Ok(res) = serde_json::from_str::<JsonRpcResponse>(&line) {
+                    if let Some(id) = res.id {
+                        let mut p = pending.lock().await;
+                        if let Some(sender) = p.remove(&id) {
+                            if let Some(err) = res.error {
+                                let _ = sender.send(Err(anyhow!("JSON-RPC Error: {:?}", err)));
+                            } else if let Some(result) = res.result {
+                                let _ = sender.send(Ok(result));
+                            } else {
+                                let _ = sender.send(Err(anyhow!("Missing result and error in JSON-RPC response")));
+                            }
                         }
                     }
+                } else if !line.trim().is_empty() {
+                    // Log output that is not standard JSON-RPC (e.g. server console.logs)
+                    eprintln!("[MCP Server Log]: {}", line.trim());
                 }
                 line.clear();
             }
@@ -267,7 +271,15 @@ pub async fn load_mcp_servers(ctx: Arc<Context>, command: String, args: Vec<Stri
 
 fn value_to_json(val: &ast::Value) -> JsonValue {
     match val {
-        ast::Value::Number(n) => JsonValue::Number(serde_json::Number::from_f64(*n).unwrap()),
+        ast::Value::Number(n) => {
+            // If the number is an exact integer, serialize it as an integer
+            // to avoid strict JSON Schema validation failures for int types
+            if n.fract() == 0.0 {
+                JsonValue::Number(serde_json::Number::from(*n as i64))
+            } else {
+                JsonValue::Number(serde_json::Number::from_f64(*n).unwrap())
+            }
+        },
         ast::Value::Text(t) => JsonValue::String(t.clone()),
         ast::Value::Boolean(b) => JsonValue::Bool(*b),
         ast::Value::List(l) => JsonValue::Array(l.iter().map(|v| value_to_json(&v.value)).collect()),

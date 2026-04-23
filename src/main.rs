@@ -383,41 +383,17 @@ async fn run_demo() -> Result<()> {
     }
 
     // Integrated demonstration
-    let script_content = r#"
-REMEMBER "user_api_key" VALUE "sk-secret-123" AS sensitive SCOPE long_term END
-REMEMBER "agent_name" VALUE "PrimaryOrchestrator" SCOPE session END
-ON "alert" SET event_processed = true END
-GOAL fetch_data 
-  PARALLEL
-    USE search_flights query "BTC" RESULT INTO {res1} END
-    USE search_flights query "ETH" RESULT INTO {res2} END
-  GATHER INTO {parallel_res}
-  END
-  REMEMBER "m_data" VALUE {parallel_res} SCOPE session END 
-END
-RECALL "api" INTO {found} FUZZY true SCOPE long_term END
-REMEMBER "f_found" VALUE {found} SCOPE session END
-GOAL federated_call 
-  CALL "AgentB" GOAL "pay" RESULT INTO {my_call} END
-  RETRY 2
-  DEADLINE 5s
-  AWAIT {my_call}
-END
-REMEMBER "f_sentiment" VALUE {my_call} SCOPE session END
-PROVE {
-  SET confidential_data = "top_secret" AS sensitive
-  REMEMBER "secret_vault" VALUE {confidential_data} SCOPE long_term END
-} AS auth_proof
-REVEAL auth_proof FOR "auth_proof" INTO {secret}
-EMIT "alert" DATA "done"
-"#;
+    let script_content = fs::read_to_string("examples/demo.agentlang")
+        .context("Failed to read examples/demo.agentlang")?;
 
     println!("Parsing integrated program...");
     match parser::parse_program(script_content.trim()) {
         Ok((_, program)) => {
             println!("Executing main program ({} statements)...", program.len());
             for stmt in program {
-                runtime::eval(&stmt, ctx.clone()).await?;
+                if let Err(e) = runtime::eval(&stmt, ctx.clone()).await {
+                    eprintln!("Execution error: {:?}", e);
+                }
             }
 
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -447,7 +423,17 @@ EMIT "alert" DATA "done"
             bastion::prelude::Bastion::stop();
         }
         Err(e) => {
-            eprintln!("Parse error: {:?}", e);
+                let filename = "examples/demo.agentlang".to_string();
+                Report::build(ReportKind::Error, (filename.clone(), 0..0))
+                    .with_message("Parse error in integrated demo script")
+                    .with_label(
+                        Label::new((filename.clone(), 0..script_content.len()))
+                            .with_message(format!("{:?}", e))
+                            .with_color(Color::Red),
+                    )
+                    .finish()
+                    .eprint((filename, Source::from(script_content)))
+                    .unwrap();
         }
     }
 
