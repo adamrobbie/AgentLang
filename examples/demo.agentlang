@@ -1,16 +1,33 @@
+// AgentLang 1.0 Demo Script
+// Demonstrates goal execution, memory management, ZK-proofs, and parallelism.
+
+// 1. Store a sensitive API key in long-term memory
 REMEMBER "user_api_key" VALUE "sk-secret-123" AS sensitive SCOPE long_term END
+
+// 2. Set working variables
 REMEMBER "agent_name" VALUE "PrimaryOrchestrator" SCOPE session END
+
+// 3. Register an event handler
 ON "alert" SET event_processed = true END
+
+// 4. Parallel execution of MCP/Native tools
 GOAL fetch_data 
   PARALLEL
     USE search_flights query "BTC" RESULT INTO {res1} END
     USE search_flights query "ETH" RESULT INTO {res2} END
   GATHER INTO {parallel_res}
   END
+  
+  // 5. Store the parallel result in session memory
   REMEMBER "m_data" VALUE {parallel_res} SCOPE session END 
 END
+
+// 6. Demonstrate semantic / fuzzy recall 
+// (Finds "user_api_key" when searching for "api")
 RECALL "api" INTO {found} FUZZY true SCOPE long_term END
 REMEMBER "f_found" VALUE {found} SCOPE session END
+
+// 7. Inter-Agent Communication (Federated Calling)
 GOAL federated_call 
   CALL "AgentB" GOAL "pay" RESULT INTO {my_call} END
   RETRY 2
@@ -18,9 +35,17 @@ GOAL federated_call
   AWAIT {my_call}
 END
 REMEMBER "f_sentiment" VALUE {my_call} SCOPE session END
+
+// 8. Zero Knowledge Proof generation
+// We cryptographically prove that the variable "confidential_data" was set to "top_secret"
+// without exposing the raw string directly over the network.
 PROVE {
   SET confidential_data = "top_secret" AS sensitive
   REMEMBER "secret_vault" VALUE {confidential_data} SCOPE long_term END
 } AS auth_proof
+
+// 9. Reveal using the generated zk-STARK proof
 REVEAL auth_proof FOR "auth_proof" INTO {secret}
+
+// 10. Emit an event that triggers the ON handler above
 EMIT "alert" DATA "done"
