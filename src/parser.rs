@@ -2,13 +2,27 @@ use crate::ast::*;
 use nom::{
     IResult, Parser,
     branch::alt,
-    bytes::complete::{tag, take_while1},
+    bytes::complete::{tag, take_until, take_while1},
     character::complete::{alpha1, alphanumeric1, char, digit1, multispace0, none_of},
     combinator::{map, map_res, opt, recognize},
     multi::{many_till, many0},
-    sequence::{delimited, pair, preceded},
+    sequence::{delimited, pair, preceded, terminated},
 };
 use std::collections::HashMap;
+
+/// Eat whitespace and // line comments
+fn eat_ws_and_comments(mut input: &str) -> IResult<&str, &str> {
+    loop {
+        let (next, _) = multispace0.parse(input)?;
+        if next.starts_with("//") {
+            let (after_comment, _) = opt(take_until("\n")).parse(next)?;
+            let (after_newline, _) = opt(tag("\n")).parse(after_comment)?;
+            input = after_newline;
+        } else {
+            return Ok((next, ""));
+        }
+    }
+}
 
 /// Simple whitespace wrapper
 fn ws<'a, F, O>(mut inner: F) -> impl FnMut(&'a str) -> IResult<&'a str, O>
@@ -16,9 +30,9 @@ where
     F: Parser<&'a str, Output = O, Error = nom::error::Error<&'a str>>,
 {
     move |input: &'a str| {
-        let (input, _) = multispace0(input)?;
+        let (input, _) = eat_ws_and_comments(input)?;
         let (input, res) = inner.parse(input)?;
-        let (input, _) = multispace0(input)?;
+        let (input, _) = eat_ws_and_comments(input)?;
         Ok((input, res))
     }
 }
