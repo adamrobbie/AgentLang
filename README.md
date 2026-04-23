@@ -15,6 +15,12 @@ AgentLang is a programming language specifically designed for the "Agentic Era."
 
 It introduces goal-oriented control flow, first-class uncertainty/confidence types, privacy-preserving Zero Knowledge Proof (ZKP) integration, and a high-performance hybrid runtime.
 
+## ⚠️ Disclaimer
+
+**AgentLang is currently a Research & Education project.** 
+
+While the ultimate intent is to build a robust, production-ready language and ecosystem for the Agentic Era, the current implementation serves primarily as a proof-of-concept and learning vehicle for combining Rust, actor-model concurrency, zero-knowledge proofs, and LLM-centric parsing. APIs, syntax, and features are subject to rapid, breaking changes.
+
 ## 🌟 Key Features
 
 *   **Goal-Oriented Execution:** Replace fragile loops and `try/catch` blocks with native `GOAL` directives featuring built-in `RETRY`, `ON_FAIL`, and `DEADLINE`.
