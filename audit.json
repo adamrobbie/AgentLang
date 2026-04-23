@@ -133,5 +133,85 @@
     "op": "SET:count:Working:Number(0.0)",
     "prev_hash": "603113afadb645863dbf5b78ba84ea5bcf17b0ddf206f3eba0e4dc8dd29fbfc9",
     "timestamp": 1775842211
+  },
+  {
+    "op": "SET:user_api_key:LongTerm:[REDACTED]",
+    "prev_hash": "3c48a2fffa9aacf762b1bbd3f6eca490807007e0f9758deb4560d86ddd60eb25",
+    "timestamp": 1776957840
+  },
+  {
+    "op": "SET:agent_name:Session:Text(\"PrimaryOrchestrator\")",
+    "prev_hash": "5cc0fe5fd347894a5be29a2db6e72b3c276b19748fb2b5f6414c2411490ef838",
+    "timestamp": 1776957840
+  },
+  {
+    "op": "SET:res2:Working:{flights: [{id: Text(\"FL-456\"), price: Number(299.0)}]}",
+    "prev_hash": "632fd42ff08e071ac28830eee9563b43e392314017277fad32662e149bc78bbd",
+    "timestamp": 1776957840
+  },
+  {
+    "op": "SET:res1:Working:{flights: [{id: Text(\"FL-456\"), price: Number(299.0)}]}",
+    "prev_hash": "733f746985f38d7356aa0919beac6d552b5c50c29c6d738264a1713e2c1e08c9",
+    "timestamp": 1776957840
+  },
+  {
+    "op": "SET:parallel_res:Working:{branch_0: {res1: {flights: [{id: Text(\"FL-456\"), price: Number(299.0)}]}, res2: {flights: [{id: Text(\"FL-456\"), price: Number(299.0)}]}}, branch_1: {res2: {flights: [{id: Text(\"FL-456\"), price: Number(299.0)}]}}}",
+    "prev_hash": "184171fca739840026e24b317f408315ded207de9c93410206afda35d317a2e7",
+    "timestamp": 1776957840
+  },
+  {
+    "op": "SET:m_data:Session:{branch_0: {res1: {flights: [{id: Text(\"FL-456\"), price: Number(299.0)}]}, res2: {flights: [{id: Text(\"FL-456\"), price: Number(299.0)}]}}, branch_1: {res2: {flights: [{id: Text(\"FL-456\"), price: Number(299.0)}]}}}",
+    "prev_hash": "5baf35cdadc5028d32eca24da4f784fde5b14be9bfcab6590ef952045bd764ce",
+    "timestamp": 1776957840
+  },
+  {
+    "op": "SET:fetch_data:Working:{parallel_res: {branch_0: {res1: {flights: [{id: Text(\"FL-456\"), price: Number(299.0)}]}, res2: {flights: [{id: Text(\"FL-456\"), price: Number(299.0)}]}}, branch_1: {res2: {flights: [{id: Text(\"FL-456\"), price: Number(299.0)}]}}}, res1: {flights: [{id: Text(\"FL-456\"), price: Number(299.0)}]}, res2: {flights: [{id: Text(\"FL-456\"), price: Number(299.0)}]}}",
+    "prev_hash": "cd3071067c463afb94e49a268c6102e16915df70847dd435a9a8f4e406143454",
+    "timestamp": 1776957840
+  },
+  {
+    "op": "GOAL_SUCCESS:fetch_data",
+    "prev_hash": "657654dd47f6699797dbbc01a830e8750f3abcef7e156664b64175d49a444efa",
+    "timestamp": 1776957840
+  },
+  {
+    "op": "SET:found:Working:[REDACTED]",
+    "prev_hash": "a223c2a44573edc92b7a5a330e529f651619205670dcdc91de7e0e5a957e5b21",
+    "timestamp": 1776957840
+  },
+  {
+    "op": "SET:f_found:Session:[REDACTED]",
+    "prev_hash": "d08792dd9fd6950c137f749715b45fdf0ab2fcd7f395d7f2770830ed846e4295",
+    "timestamp": 1776957840
+  },
+  {
+    "op": "SET:my_call:Working:{agent_id: Text(\"AgentB\"), args: {}, call_id: Text(\"my_call\"), goal_name: Text(\"pay\"), result: Null, status: Text(\"pending\")}",
+    "prev_hash": "eb086f44db3ea33c8dad989bc9c7ce726bacd54195c76b1802a669c5c30135e7",
+    "timestamp": 1776957840
+  },
+  {
+    "op": "SET:my_call.result:Working:Null",
+    "prev_hash": "8cb2e507e0f81ef10774040a5fb3dbe59b1fb2d394661cc6b0886dce4f153ff9",
+    "timestamp": 1776957840
+  },
+  {
+    "op": "SET:my_call:Working:{agent_id: Text(\"AgentB\"), args: {}, call_id: Text(\"my_call\"), goal_name: Text(\"pay\"), result: {payment_status: Boolean(true)}, status: Text(\"completed\")}",
+    "prev_hash": "91d62fafb676c0234400fb4f9c770484604998bf407ac680d5522c8902fee45f",
+    "timestamp": 1776957840
+  },
+  {
+    "op": "SET:federated_call:Working:{my_call.result: Null, my_call: {agent_id: Text(\"AgentB\"), args: {}, call_id: Text(\"my_call\"), goal_name: Text(\"pay\"), result: {payment_status: Boolean(true)}, status: Text(\"completed\")}}",
+    "prev_hash": "3e5cb8c3894e22546a2f3b2de30347ed9bae05da4d9a8329d3b0eee790db42e7",
+    "timestamp": 1776957840
+  },
+  {
+    "op": "GOAL_SUCCESS:federated_call",
+    "prev_hash": "a128fff547d4b446ae8e1c40c580849046dfeca4e6574f00a08a892408ff9da1",
+    "timestamp": 1776957840
+  },
+  {
+    "op": "SET:f_sentiment:Session:{agent_id: Text(\"AgentB\"), args: {}, call_id: Text(\"my_call\"), goal_name: Text(\"pay\"), result: {payment_status: Boolean(true)}, status: Text(\"completed\")}",
+    "prev_hash": "3e71c2c682c53070936e71bf3e3ab72722ccc2426286745ed997c63fadcb486e",
+    "timestamp": 1776957840
   }
 ]

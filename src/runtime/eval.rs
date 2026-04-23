@@ -392,28 +392,29 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 // Basic type hint validation (prototype)
                 if let Some(arg_val) = evaluated_args.get(&input_field.name) {
                     match input_field.type_hint.as_str() {
-                        "number" | "float" | "int" => {
-                            if !matches!(arg_val.value, Value::Number(_)) {
-                                return Err(anyhow!(AgentError {
-                                    failure_type: GoalFailureType::ToolFail,
-                                    message: format!(
-                                        "Type mismatch for '{}': expected number, found {:?}",
-                                        input_field.name, arg_val.value
-                                    ),
-                                }));
-                            }
+                        "number" | "float" | "int"
+                            if !matches!(arg_val.value, Value::Number(_)) =>
+                        {
+                            return Err(anyhow!(AgentError {
+                                failure_type: GoalFailureType::ToolFail,
+                                message: format!(
+                                    "Type mismatch for '{}': expected number, found {:?}",
+                                    input_field.name, arg_val.value
+                                ),
+                            }));
                         }
-                        "text" | "string" => {
-                            if !matches!(arg_val.value, Value::Text(_)) {
-                                return Err(anyhow!(AgentError {
-                                    failure_type: GoalFailureType::ToolFail,
-                                    message: format!(
-                                        "Type mismatch for '{}': expected text, found {:?}",
-                                        input_field.name, arg_val.value
-                                    ),
-                                }));
-                            }
+                        "text" | "string"
+                            if !matches!(arg_val.value, Value::Text(_)) =>
+                        {
+                            return Err(anyhow!(AgentError {
+                                failure_type: GoalFailureType::ToolFail,
+                                message: format!(
+                                    "Type mismatch for '{}': expected text, found {:?}",
+                                    input_field.name, arg_val.value
+                                ),
+                            }));
                         }
+                        "number" | "float" | "int" | "text" | "string" => {}
                         _ => {} // Skip others for now
                     }
                 }

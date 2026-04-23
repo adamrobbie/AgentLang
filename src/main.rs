@@ -3,13 +3,169 @@ use AgentLang::parser;
 use AgentLang::registry_rpc::RegisterRequest;
 use AgentLang::runtime;
 use AgentLang::*;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 use ed25519_dalek::Signer;
 use std::collections::HashMap;
+use std::fs;
+
+#[derive(Parser)]
+#[command(name = "AgentLang")]
+#[command(about = "AgentLang Runner", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Start the AgentLang registry server
+    Registry {
+        #[arg(short, long, default_value = "50050")]
+        port: u16,
+    },
+    /// Start a local agent and optionally run a script
+    Agent {
+        /// The port this agent will listen on
+        #[arg(short, long, default_value = "50051")]
+        port: u16,
+        /// The Agent ID
+        #[arg(short, long, default_value = "PrimaryOrchestrator")]
+        id: String,
+        /// Path to an .agentlang script to execute after starting
+        #[arg(short, long)]
+        script: Option<String>,
+        /// URL of the registry server
+        #[arg(short, long, default_value = "http://[::1]:50050")]
+        registry: String,
+    },
+    /// Run the integrated multi-agent demo
+    Demo,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
     runtime::ensure_bastion_started();
+
+    match cli.command {
+        Commands::Registry { port } => run_registry(port).await?,
+        Commands::Agent { port, id, script, registry } => run_agent(port, id, script, registry).await?,
+        Commands::Demo => run_demo().await?,
+    }
+
+    Ok(())
+}
+
+async fn run_registry(port: u16) -> Result<()> {
+    let addr = format!("[::1]:{}", port).parse()?;
+    println!("Starting Registry on {}", addr);
+    let registry = MyRegistryService::new();
+    start_registry(registry, addr).await?;
+    Ok(())
+}
+
+async fn run_agent(port: u16, id: String, script_path: Option<String>, registry_addr: String) -> Result<()> {
+    let ctx = runtime::Context::new();
+    
+    // Default Tools
+    {
+        let mut handlers = ctx.tool_handlers.lock().unwrap();
+        handlers.insert(
+            "search_flights".to_string(),
+            std::sync::Arc::new(|args| {
+                let query = args
+                    .get("query")
+                    .map(|v| format!("{:?}", v.value))
+                    .unwrap_or_default();
+                println!("  [Native Tool] search_flights executed with query: {}", query);
+                let mut flight = HashMap::new();
+                flight.insert("id".to_string(), ast::AnnotatedValue::from(ast::Value::Text("FL-456".to_string())));
+                flight.insert("price".to_string(), ast::AnnotatedValue::from(ast::Value::Number(299.0)));
+                let mut result = HashMap::new();
+                result.insert("flights".to_string(), ast::AnnotatedValue::from(ast::Value::List(vec![ast::AnnotatedValue::from(ast::Value::Object(flight))])));
+                Ok(ast::AnnotatedValue::from(ast::Value::Object(result)))
+            }),
+        );
+        let mut tools = ctx.tools.lock().unwrap();
+        tools.insert(
+            "search_flights".to_string(),
+            ast::ToolDefinition {
+                name: "search_flights".to_string(),
+                description: Some("Search for flights".to_string()),
+                category: Some(ast::ToolCategory::Read),
+                version: Some("1.0.0".to_string()),
+                inputs: vec![ast::ToolField {
+                    name: "query".to_string(),
+                    type_hint: "text".to_string(),
+                    required: true,
+                    annotations: vec![],
+                }],
+                outputs: vec![ast::ToolField {
+                    name: "flights".to_string(),
+                    type_hint: "list".to_string(),
+                    required: true,
+                    annotations: vec![],
+                }],
+                reversible: false,
+                side_effect: false,
+                rate_limit: None,
+                timeout: Some(5.0),
+            },
+        );
+    }
+
+    let service = MyAgentService {
+        ctx: ctx.clone(),
+        registries: vec![registry_addr.clone()],
+    };
+    
+    let addr = format!("[::1]:{}", port).parse()?;
+    
+    let id_clone = id.clone();
+    tokio::spawn(async move {
+        println!("Starting Agent {} on {}", id_clone, addr);
+        let _ = start_agent(service, addr).await;
+    });
+    
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    // Register
+    let endpoint = format!("http://[::1]:{}", port);
+    let payload = format!("{}:{}", id, endpoint);
+    let signature = ctx.identity.signing_key.sign(payload.as_bytes()).to_bytes().to_vec();
+
+    let mut client = AgentLang::registry_rpc::registry_service_client::RegistryServiceClient::connect(registry_addr.clone()).await?;
+    client.register_agent(RegisterRequest {
+        agent_id: id.clone(),
+        endpoint,
+        public_key: ctx.identity.verifying_key.to_bytes().to_vec(),
+        signature,
+    }).await?;
+    *ctx.agent_id.lock().unwrap() = id.clone();
+
+    if let Some(path) = script_path {
+        let source = fs::read_to_string(&path).context("Failed to read script file")?;
+        println!("Executing script: {}", path);
+        match parser::parse_program(source.trim()) {
+            Ok((_, program)) => {
+                for stmt in program {
+                    if let Err(e) = runtime::eval(&stmt, ctx.clone()).await {
+                        eprintln!("Execution error: {:?}", e);
+                    }
+                }
+            }
+            Err(e) => eprintln!("Parse error: {:?}", e),
+        }
+    } else {
+        println!("Agent {} running. Press Ctrl+C to exit.", id);
+        tokio::signal::ctrl_c().await?;
+    }
+    
+    Ok(())
+}
+
+async fn run_demo() -> Result<()> {
 
     println!("====================================================");
     println!("   AgentLang 1.0 - Production Runtime Execution     ");
@@ -198,7 +354,7 @@ async fn main() -> Result<()> {
     }
 
     // Integrated demonstration
-    let source = r#"
+    let script_content = r#"
 REMEMBER "user_api_key" VALUE "sk-secret-123" AS sensitive SCOPE long_term END
 REMEMBER "agent_name" VALUE "PrimaryOrchestrator" SCOPE session END
 ON "alert" SET event_processed = true END
@@ -227,8 +383,8 @@ REVEAL auth_proof FOR "auth_proof" INTO {secret}
 EMIT "alert" DATA "done"
 "#;
 
-    println!("Parsing program...");
-    match parser::parse_program(source.trim()) {
+    println!("Parsing integrated program...");
+    match parser::parse_program(script_content.trim()) {
         Ok((_, program)) => {
             println!("Executing main program ({} statements)...", program.len());
             for stmt in program {
