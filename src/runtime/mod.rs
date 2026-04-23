@@ -11,6 +11,7 @@ pub mod call;
 pub mod context;
 pub mod eval;
 pub mod goal;
+pub mod mcp;
 pub mod memory;
 
 pub use audit::*;

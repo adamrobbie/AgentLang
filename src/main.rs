@@ -2,6 +2,7 @@ use AgentLang::ast;
 use AgentLang::parser;
 use AgentLang::registry_rpc::RegisterRequest;
 use AgentLang::runtime;
+use AgentLang::runtime::mcp;
 use AgentLang::*;
 use anyhow::{Context, Result};
 use ariadne::{Color, Label, Report, ReportKind, Source};
@@ -9,6 +10,7 @@ use clap::{Parser, Subcommand};
 use ed25519_dalek::Signer;
 use std::collections::HashMap;
 use std::fs;
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "AgentLang")]
@@ -39,6 +41,9 @@ enum Commands {
         /// URL of the registry server
         #[arg(short, long, default_value = "http://[::1]:50050")]
         registry: String,
+        /// Command and arguments to run an MCP server (can be provided multiple times)
+        #[arg(long = "mcp", num_args = 1..)]
+        mcp_servers: Vec<String>,
     },
     /// Run the integrated multi-agent demo
     Demo,
@@ -51,7 +56,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Registry { port } => run_registry(port).await?,
-        Commands::Agent { port, id, script, registry } => run_agent(port, id, script, registry).await?,
+        Commands::Agent { port, id, script, registry, mcp_servers } => run_agent(port, id, script, registry, mcp_servers).await?,
         Commands::Demo => run_demo().await?,
     }
 
@@ -66,8 +71,19 @@ async fn run_registry(port: u16) -> Result<()> {
     Ok(())
 }
 
-async fn run_agent(port: u16, id: String, script_path: Option<String>, registry_addr: String) -> Result<()> {
+async fn run_agent(port: u16, id: String, script_path: Option<String>, registry_addr: String, mcp_servers: Vec<String>) -> Result<()> {
     let ctx = runtime::Context::new();
+    
+    // Load MCP Servers if provided
+    for cmd in mcp_servers {
+        let parts: Vec<String> = cmd.split_whitespace().map(String::from).collect();
+        if !parts.is_empty() {
+            let exe = parts[0].clone();
+            let args = parts[1..].to_vec();
+            println!("Starting MCP Server: {}", cmd);
+            mcp::load_mcp_servers(Arc::new(ctx.clone()), exe, args).await?;
+        }
+    }
     
     // Default Tools
     {
