@@ -1,0 +1,19 @@
+// Exercises IF/ELSE, FOREACH, and REPEAT (UNTIL <truthy> exits before body runs).
+
+SET ready = true
+SET total = 0
+
+IF {ready}
+  SET path_taken = "yes"
+ELSE
+  SET path_taken = "no"
+END
+
+FOREACH n IN [1 2 3]
+  SET last_seen = {n}
+END
+
+// REPEAT UNTIL evaluates the condition first; a truthy condition skips the body.
+REPEAT UNTIL true
+  SET unreachable = 1
+END

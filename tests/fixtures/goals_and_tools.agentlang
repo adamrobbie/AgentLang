@@ -1,0 +1,20 @@
+// Top-level GOAL/TOOL/AGENT/CONTRACT statements register definitions but
+// don't fire any side effects on their own — this exercises the parser's
+// declaration paths and the runtime's registration handlers.
+
+AGENT planner ID abc123 REGISTRY registry.example SIGNED_BY authority.example TRUST_LEVEL verified END
+
+CONTRACT search_contract ISSUED_BY authority.example CAN USE search_flights BUDGET 100 END
+
+TOOL add_numbers
+  DESCRIPTION "Add two numbers"
+  CATEGORY read
+  VERSION 1.0.0
+  INPUT a number REQUIRED END
+  INPUT b number REQUIRED END
+  OUTPUT sum number REQUIRED END
+END
+
+GOAL retry_goal RETRY 3 DEADLINE 10s IDEMPOTENT
+  SET status = "ready"
+END

@@ -236,22 +236,16 @@ impl AgentService for MyAgentService {
             let isolated_ctx = runtime::Context::new();
 
             for (name, val_str) in req.args {
-                let value = if let Ok(n) = val_str.parse::<f64>() {
-                    ast::Value::Number(n)
-                } else if val_str == "true" {
-                    ast::Value::Boolean(true)
-                } else if val_str == "false" {
-                    ast::Value::Boolean(false)
-                } else {
-                    ast::Value::Text(val_str.trim_matches('"').to_string())
-                };
+                let annotated = serde_json::from_str::<ast::AnnotatedValue>(&val_str)
+                    .map_err(|e| {
+                        Status::invalid_argument(format!(
+                            "argument '{}' is not a JSON-encoded AnnotatedValue: {}",
+                            name, e
+                        ))
+                    })?;
 
                 isolated_ctx
-                    .set_variable(
-                        name,
-                        ast::AnnotatedValue::from(value),
-                        ast::MemoryScope::Working,
-                    )
+                    .set_variable(name, annotated, ast::MemoryScope::Working)
                     .await
                     .map_err(|e| Status::internal(format!("Failed to set argument: {}", e)))?;
             }
@@ -662,11 +656,18 @@ mod tests {
             .to_bytes()
             .to_vec();
 
-        // Pass three args: a number, a bool, and a string
+        // Pass three args as JSON-encoded AnnotatedValues — the only wire
+        // format the receiver accepts.
+        let to_json = |v: ast::Value| {
+            serde_json::to_string(&ast::AnnotatedValue::from(v)).unwrap()
+        };
         let mut args = HashMap::new();
-        args.insert("num_arg".to_string(), "3.14".to_string());
-        args.insert("bool_arg".to_string(), "true".to_string());
-        args.insert("text_arg".to_string(), "\"hello\"".to_string());
+        args.insert("num_arg".to_string(), to_json(ast::Value::Number(3.14)));
+        args.insert("bool_arg".to_string(), to_json(ast::Value::Boolean(true)));
+        args.insert(
+            "text_arg".to_string(),
+            to_json(ast::Value::Text("hello".to_string())),
+        );
 
         let req = CallRequest {
             goal_name: goal_name.clone(),

@@ -1,0 +1,21 @@
+// Exercises PARALLEL with GATHER / GATHER_ALL / GATHER_MIN, plus RACE.
+
+PARALLEL
+  SET a = 1
+  SET b = 2
+GATHER INTO {p_gather} END
+
+PARALLEL
+  SET c = 3
+  SET d = 4
+GATHER_ALL INTO {p_all} END
+
+PARALLEL
+  SET e = 5
+  SET f = 6
+GATHER_MIN 1 INTO {p_min} END
+
+RACE
+  SET g = 7
+  SET h = 8
+FIRST_INTO {r_winner} END

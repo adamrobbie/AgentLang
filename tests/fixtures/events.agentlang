@@ -1,0 +1,7 @@
+// Exercises ON / EMIT. The handler is registered on a background task; we
+// EMIT but don't depend on the handler running — this fixture only needs to
+// parse + eval without panicking.
+
+ON "tick" SET tick_count = 1 END
+EMIT "tick" DATA "first"
+EMIT "tick" DATA "second"

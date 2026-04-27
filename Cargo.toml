@@ -31,3 +31,7 @@ winterfell = "0.13.1"
 [build-dependencies]
 tonic-build = "0.14.5"
 tonic-prost-build = "0.14.5"
+
+[dev-dependencies]
+serial_test = "3.2"
+tempfile = "3.14"

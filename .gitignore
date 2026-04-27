@@ -1,1 +1,7 @@
 /target
+
+# Per-machine runtime state written by Context::new()
+/agent.id
+/agent.key
+/memory.json
+/audit.json
