@@ -187,8 +187,11 @@ impl Prover for FibProver {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct StarkProof {
     pub proof: Vec<u8>,
-    pub col0_last: u64,
-    pub col1_last: u64,
+    // f128 field elements — must be u128 to avoid truncating Fibonacci values
+    // for trace lengths n >= 128, where Fib(n) exceeds u64::MAX and any narrower
+    // encoding silently desynchronises prover and verifier.
+    pub col0_last: u128,
+    pub col1_last: u128,
     pub claim_hash: u64,
     pub num_steps: usize,
 }
@@ -226,8 +229,8 @@ pub fn generate_proof(n: usize, claim: &str) -> anyhow::Result<StarkProof> {
 
     Ok(StarkProof {
         proof: proof.to_bytes(),
-        col0_last: pub_inputs.col0_last.as_int() as u64,
-        col1_last: pub_inputs.col1_last.as_int() as u64,
+        col0_last: pub_inputs.col0_last.as_int(),
+        col1_last: pub_inputs.col1_last.as_int(),
         claim_hash: pub_inputs.claim_hash.as_int() as u64,
         num_steps: n,
     })
@@ -243,8 +246,8 @@ pub fn verify_proof(proof_data: &StarkProof, claim: &str) -> anyhow::Result<()> 
         .map_err(|e| anyhow::anyhow!("Failed to parse STARK proof: {}", e))?;
 
     let pub_inputs = PublicInputs {
-        col0_last: BaseElement::new(proof_data.col0_last as u128),
-        col1_last: BaseElement::new(proof_data.col1_last as u128),
+        col0_last: BaseElement::new(proof_data.col0_last),
+        col1_last: BaseElement::new(proof_data.col1_last),
         claim_hash: expected_claim_hash,
     };
     let min_opts = AcceptableOptions::MinConjecturedSecurity(95);
@@ -266,6 +269,18 @@ mod tests {
     fn test_generate_and_verify_proof_success() {
         let proof_data = generate_proof(64, "my_claim").unwrap();
         assert!(verify_proof(&proof_data, "my_claim").is_ok());
+    }
+
+    #[test]
+    fn test_generate_and_verify_proof_at_large_trace_lengths() {
+        // Regression: previously col0_last/col1_last were stored as u64, so
+        // Fib(n) values for n >= 128 (which exceed u64::MAX) were silently
+        // truncated and verification failed with "constraint evaluations over
+        // the out-of-domain frame are inconsistent". Widening to u128 fixed it.
+        for &n in &[128usize, 256, 512, 1024] {
+            let p = generate_proof(n, "x").unwrap();
+            assert!(verify_proof(&p, "x").is_ok(), "n={n} failed to verify");
+        }
     }
 
     #[test]

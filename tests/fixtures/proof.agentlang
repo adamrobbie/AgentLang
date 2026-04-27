@@ -1,0 +1,12 @@
+// Exercises PROVE / REVEAL: a zk-STARK proof is generated over an inner
+// statement block, then verified via REVEAL. The hash-derived trace length
+// in eval.rs is non-deterministic across fixture content; this file would
+// have flaked before crypto.rs widened col0_last/col1_last to u128.
+
+PROVE {
+  SET balance = 250
+  SET approved = true
+  REMEMBER "balance_snapshot" VALUE {balance} SCOPE long_term END
+} FOR "balance_above_100" AS balance_proof
+
+REVEAL balance_proof FOR "balance_above_100" INTO {balance_unlock}

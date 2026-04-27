@@ -1,0 +1,13 @@
+// Exercises SET, REMEMBER, RECALL, FORGET across Working / Session / LongTerm.
+
+SET origin = "London"
+SET count = 7
+
+REMEMBER "city" VALUE "Paris" SCOPE session END
+REMEMBER "api_key" VALUE "sk-fixture-001" AS sensitive SCOPE long_term END
+REMEMBER "ttl_key" VALUE 99 SCOPE session EXPIRES 30s END
+
+RECALL "city" INTO {echo_city} SCOPE session END
+RECALL "missing" INTO {echo_missing} ON_MISSING "fallback" SCOPE session END
+
+FORGET "ttl_key" SCOPE session END

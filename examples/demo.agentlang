@@ -42,7 +42,7 @@ REMEMBER "f_sentiment" VALUE {my_call} SCOPE session END
 PROVE {
   SET confidential_data = "top_secret" AS sensitive
   REMEMBER "secret_vault" VALUE {confidential_data} SCOPE long_term END
-} AS auth_proof
+} FOR "auth_proof" AS auth_proof
 
 // 9. Reveal using the generated zk-STARK proof
 REVEAL auth_proof FOR "auth_proof" INTO {secret}
