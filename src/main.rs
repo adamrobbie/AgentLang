@@ -152,7 +152,7 @@ async fn run_agent(port: u16, id: String, script_path: Option<String>, registry_
     let payload = format!("{}:{}", id, endpoint);
     let signature = ctx.identity.signing_key.sign(payload.as_bytes()).to_bytes().to_vec();
 
-    let mut client = AgentLang::registry_rpc::registry_service_client::RegistryServiceClient::connect(registry_addr.clone()).await?;
+    let mut client = AgentLang::tls::connect_registry(&registry_addr).await?;
     client.register_agent(RegisterRequest {
         agent_id: id.clone(),
         endpoint,
@@ -259,11 +259,7 @@ async fn run_demo() -> Result<()> {
             .to_bytes()
             .to_vec();
 
-        let mut client =
-            AgentLang::registry_rpc::registry_service_client::RegistryServiceClient::connect(
-                registry_addr.to_string(),
-            )
-            .await?;
+        let mut client = AgentLang::tls::connect_registry(registry_addr).await?;
         client
             .register_agent(RegisterRequest {
                 agent_id: agent_id.clone(),
@@ -363,11 +359,7 @@ async fn run_demo() -> Result<()> {
             .to_bytes()
             .to_vec();
 
-        let mut client =
-            AgentLang::registry_rpc::registry_service_client::RegistryServiceClient::connect(
-                registry_addr.to_string(),
-            )
-            .await?;
+        let mut client = AgentLang::tls::connect_registry(registry_addr).await?;
         client
             .register_agent(RegisterRequest {
                 agent_id: agent_id.clone(),

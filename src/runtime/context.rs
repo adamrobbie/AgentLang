@@ -1,7 +1,8 @@
 use super::audit::{AuditChain, Event, format_value_safe};
 use super::memory::{JsonFileBackend, MemoryBackend};
-use super::registry_rpc::registry_service_client::RegistryServiceClient;
 use super::registry_rpc::{GetSharedRequest, PutSharedRequest};
+use super::secret;
+use crate::tls;
 use crate::ast::*;
 use crate::crypto;
 use anyhow::{Result, anyhow};
@@ -112,25 +113,28 @@ impl Context {
         let id_file = unique_test_path("agent-id");
         #[cfg(not(test))]
         let id_file = "agent.id".to_string();
-        let identity = if let Ok(existing_id) = fs::read(&id_file) {
-            let existing_id: Vec<u8> = existing_id;
-            if existing_id.len() == 32 {
-                let bytes: [u8; 32] = existing_id.try_into().unwrap();
+        let identity = match secret::read_identity(&id_file) {
+            Ok(Some(bytes)) => {
                 let signing_key = SigningKey::from_bytes(&bytes);
                 let verifying_key = VerifyingKey::from(&signing_key);
                 Identity {
                     signing_key,
                     verifying_key,
                 }
-            } else {
+            }
+            Ok(None) => {
                 let id = Identity::generate();
-                let _ = fs::write(id_file, id.signing_key.to_bytes());
+                if let Err(e) = secret::write_identity(&id_file, &id.signing_key.to_bytes()) {
+                    eprintln!("[agentlang] WARNING: failed to persist identity: {e}");
+                }
                 id
             }
-        } else {
-            let id = Identity::generate();
-            let _ = fs::write(id_file, id.signing_key.to_bytes());
-            id
+            Err(e) => {
+                // Don't silently regenerate — that would let a corrupted or
+                // tampered file masquerade as "first run" and orphan TOFU
+                // bindings the registry already knows.
+                panic!("Failed to load identity from '{id_file}': {e}");
+            }
         };
 
         let default_agent_id = hex::encode(&identity.verifying_key.to_bytes()[..4]);
@@ -230,7 +234,7 @@ impl Context {
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
                 for reg_addr in registries {
-                    if let Ok(mut client) = RegistryServiceClient::connect(reg_addr).await
+                    if let Ok(mut client) = tls::connect_registry(&reg_addr).await
                         && let Ok(res) = client
                             .get_shared_state(GetSharedRequest {
                                 key: name.to_string(),
@@ -343,7 +347,7 @@ impl Context {
                     .clone();
                 let mut success = false;
                 for reg_addr in registries {
-                    if let Ok(mut client) = RegistryServiceClient::connect(reg_addr).await
+                    if let Ok(mut client) = tls::connect_registry(&reg_addr).await
                         && let Ok(res) = client
                             .put_shared_state(PutSharedRequest {
                                 key: name.clone(),

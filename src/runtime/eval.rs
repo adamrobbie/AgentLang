@@ -1,5 +1,4 @@
 use super::agent_rpc::CallRequest;
-use super::agent_rpc::agent_service_client::AgentServiceClient;
 use super::audit::{AgentError, Event};
 use super::call::{
     build_completed_call_envelope, build_failed_call_envelope, build_pending_call_envelope,
@@ -12,9 +11,9 @@ use super::memory::{
     resolve_path, sanitize_recalled_value,
 };
 use super::registry_rpc::LookupRequest;
-use super::registry_rpc::registry_service_client::RegistryServiceClient;
 use crate::ast::*;
 use crate::crypto;
+use crate::tls;
 use anyhow::{Result, anyhow};
 use async_recursion::async_recursion;
 use ed25519_dalek::Signer;
@@ -648,8 +647,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                         .clone();
 
                     for reg_addr in registries {
-                        if let Ok(mut reg_client) =
-                            RegistryServiceClient::connect(reg_addr.clone()).await
+                        if let Ok(mut reg_client) = tls::connect_registry(&reg_addr).await
                             && let Ok(res) = reg_client
                                 .lookup_agent(LookupRequest {
                                     agent_id: agent_id_clone.clone(),
@@ -675,7 +673,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                             .to_vec();
 
                         if let Ok(mut agent_client) =
-                            AgentServiceClient::connect(lookup_data.endpoint.clone()).await
+                            tls::connect_agent(&lookup_data.endpoint).await
                         {
                             let _ = agent_client
                                 .call_goal(CallRequest {
@@ -1195,8 +1193,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                         .clone();
 
                     for reg_addr in registries {
-                        if let Ok(mut reg_client) =
-                            RegistryServiceClient::connect(reg_addr.clone()).await
+                        if let Ok(mut reg_client) = tls::connect_registry(&reg_addr).await
                             && let Ok(res) = reg_client
                                 .lookup_agent(LookupRequest {
                                     agent_id: agent_id_clone.clone(),
@@ -1227,8 +1224,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                         .to_bytes()
                         .to_vec();
 
-                    let mut agent_client =
-                        AgentServiceClient::connect(lookup_data.endpoint.clone()).await?;
+                    let mut agent_client = tls::connect_agent(&lookup_data.endpoint).await?;
 
                     let rpc_call = agent_client.call_goal(CallRequest {
                         goal_name: goal_name_clone.clone(),

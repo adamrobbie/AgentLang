@@ -1,10 +1,9 @@
-pub mod agent_rpc {
-    tonic::include_proto!("agent");
-}
-
-pub mod registry_rpc {
-    tonic::include_proto!("registry");
-}
+// Re-export the canonical proto modules generated in lib.rs. Generating them
+// here a second time produced parallel copies of every type, so passing a
+// `runtime::registry_rpc::GetSharedRequest` into a client built from
+// `crate::registry_rpc::RegistryServiceClient` failed `IntoRequest`.
+pub use crate::agent_rpc;
+pub use crate::registry_rpc;
 
 pub mod audit;
 pub mod call;
@@ -13,6 +12,7 @@ pub mod eval;
 pub mod goal;
 pub mod mcp;
 pub mod memory;
+pub mod secret;
 
 pub use audit::*;
 pub use call::*;
