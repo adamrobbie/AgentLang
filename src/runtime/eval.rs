@@ -17,10 +17,39 @@ use crate::tls;
 use anyhow::{Result, anyhow};
 use async_recursion::async_recursion;
 use ed25519_dalek::Signer;
-use ring::digest;
 use std::collections::HashMap;
 use tokio::time::{Duration, sleep};
 use wasmtime::{Instance, Linker, Module, Store, Val, ValType};
+
+/// Serializes the working-variables map to a deterministic, sortable byte
+/// representation used as input to the execution-digest STARK trace.
+///
+/// Format: each variable contributes one `key:Debug(value)|` segment, sorted
+/// by key. The format is intentionally textual so that floating-point and
+/// non-canonical structured values still produce stable bytes — the digest
+/// binds to whatever representation reaches this point. Two distinct states
+/// will produce different bytes (the audit's tamper-evidence guarantee);
+/// two equivalent-but-differently-ordered states will not, because of the
+/// sort.
+pub(crate) fn build_state_bytes(ctx: &Context) -> Vec<u8> {
+    // Magic prefix is constant across all Prove invocations. It serves two
+    // purposes: (a) domain-separates AgentLang state digests from any other
+    // byte stream that might collide, and (b) guarantees the trace polynomial
+    // is non-trivial even when the working-variable map is empty — winterfell
+    // rejects degenerate (constant) trace polys at the composer stage.
+    let mut out = String::from("agentlang-prove-v1|");
+    let vars = ctx
+        .working_variables
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut keys: Vec<_> = vars.keys().collect();
+    keys.sort();
+    for k in keys {
+        let v = vars.get(k).unwrap();
+        out.push_str(&format!("{}:{:?}|", k, v.value));
+    }
+    out.into_bytes()
+}
 
 /// Allocates `bytes.len() + 1` in the WASM module's linear memory via the
 /// module-exported `alloc` function and writes the bytes followed by a
@@ -987,31 +1016,10 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 eval(stmt, ctx.clone()).await?;
             }
 
-            let mut state_repr = String::new();
-            {
-                let vars = ctx
-                    .working_variables
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let mut keys: Vec<_> = vars.keys().collect();
-                keys.sort();
-                for k in keys {
-                    let v = vars.get(k).unwrap();
-                    state_repr.push_str(&format!("{}:{:?}|", k, v.value));
-                }
-            }
-
-            let hash = digest::digest(&digest::SHA256, state_repr.as_bytes());
-            let hash_bytes = hash.as_ref();
-            let mut steps =
-                32 + (u32::from_be_bytes(hash_bytes[0..4].try_into().unwrap()) % 64) as usize;
-
-            // Winterfell requires power-of-two trace length
-            if !steps.is_power_of_two() {
-                steps = steps.next_power_of_two();
-            }
-
-            let proof = crypto::generate_proof(steps, claim)?;
+            // The trace consumes these bytes one at a time; tampering with
+            // any byte changes the polynomial digest in the proof.
+            let state_bytes = build_state_bytes(&ctx);
+            let proof = crypto::generate_proof(&state_bytes, claim)?;
             ctx.proofs
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

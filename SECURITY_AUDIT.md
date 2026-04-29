@@ -1,6 +1,6 @@
 # AgentLang Security Audit & Feature Gap Analysis
 **Original audit:** April 2026
-**Last updated:** 2026-04-28 — Section 2 rewritten to match implementation; gaps 2.2/2.3/2.5 reclassified as **IMPLEMENTED**, 2.4 as **PARTIALLY ADDRESSED**.
+**Last updated:** 2026-04-28 — Section 2 rewritten to match implementation; gaps 2.2/2.3/2.5 reclassified as **IMPLEMENTED**, 2.4 as **PARTIALLY ADDRESSED**, 2.1 reclassified as **MOSTLY ADDRESSED** after Fibonacci STARK was replaced with `ExecutionDigestAir`. Companion roadmap for the residual ZKP gaps lives in `ZKP_ROADMAP.md`.
 
 > **Note on file paths.** The original audit predates the split of
 > `src/runtime.rs` into the `src/runtime/` module. References below have
@@ -50,10 +50,13 @@
 
 ## 2. Feature Gaps (Specification Deviations)
 
-### 2.1 Mocked Zero Knowledge Proofs (ZKP)
-- **Status:** Stubbed.
-- **Deviation:** `PROVE` statements execute logic but generate a Fibonacci STARK proof instead of proving the actual execution trace or state transitions.
-- **Impact:** The "Trusted by Design" promise is currently non-functional for privacy-preserving claims.
+### 2.1 Zero Knowledge Proofs (ZKP) — **MOSTLY ADDRESSED**
+- **Status:** State-binding STARK in place; execution-trace and per-statement binding still future work (see `ZKP_ROADMAP.md`).
+- **Resolution:** `src/crypto.rs` now hosts an `ExecutionDigestAir` that binds the proof to a Schwartz-Zippel-style polynomial digest of the post-execution state. The trace enforces the recurrence `digest_{i+1} = digest_i * M + s_i` over the bytes produced by `build_state_bytes` (`src/runtime/eval.rs:34`). The AIR's public inputs are `(claim_hash, multiplier, state_digest)` where `claim_hash = SHA-256(claim)` and `multiplier` is a Fiat-Shamir-derived constant — also bound to the claim, so the prover cannot grind it after the fact. The AIR is degree-1 in trace columns and uses the f128 base field; soundness against state-byte tampering is `≤ N/|F| ≈ 2^-108` for `N ≤ 2^20`. The full 128-bit `state_digest` is exposed in `StarkProof` so external comparison preserves that margin (we previously truncated to u64, which broke OOD frame consistency).
+- **Outstanding:**
+  - The trace encodes the bytes of *post-execution state*, not statement-level evaluation steps. Two different statement sequences that produce the same final state are indistinguishable to a verifier — execution path is not bound, only the result.
+  - State serialization is `key:Debug(value)|` text. Strings, lists, and objects are formatted via `Debug`, so the bound is on textual representation rather than a canonical structural form.
+  - No per-statement-type AIRs (REMEMBER/RECALL/IF/GOAL each as their own constraint encoding), no zkVM migration, no SHA-256-inside-AIR digest. These are tracked in `ZKP_ROADMAP.md` as multi-week-to-multi-month follow-on work.
 
 ### 2.2 Shared Memory — **IMPLEMENTED**
 - **Status:** Functional.
