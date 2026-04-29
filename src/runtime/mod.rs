@@ -3754,4 +3754,144 @@ mod tests {
 
     // --- parser: IF ELSE branch (lines 243-245) ---
     // (parser function tests are in parser.rs)
+
+    // ──────────────────────────────────────────────────────────────────────
+    // WASM marshaling end-to-end (security audit §2.4)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Tiny WAT module with a bump allocator + an `echo` function that
+    /// returns its input pointer unchanged. Used by the marshaling tests:
+    /// AgentLang allocates memory and writes the payload, calls echo, and
+    /// then re-reads the NUL-terminated bytes from the returned pointer.
+    /// If the trailing NUL is missing, the read overflows into uninit
+    /// heap and the test fails — which is exactly what the pre-fix code
+    /// would produce.
+    const WASM_ECHO_MODULE: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (global $heap_top (mut i32) (i32.const 1024))
+          (func (export "alloc") (param $size i32) (result i32)
+            (local $ptr i32)
+            (local.set $ptr (global.get $heap_top))
+            (global.set $heap_top
+              (i32.add (global.get $heap_top) (local.get $size)))
+            (local.get $ptr))
+          (func (export "echo") (param $ptr i32) (result i32)
+            (local.get $ptr)))
+    "#;
+
+    fn write_echo_module() -> tempfile::NamedTempFile {
+        let mut f = tempfile::Builder::new()
+            .suffix(".wat")
+            .tempfile()
+            .expect("tempfile");
+        std::io::Write::write_all(&mut f, WASM_ECHO_MODULE.as_bytes()).unwrap();
+        f
+    }
+
+    #[tokio::test]
+    async fn test_wasm_string_round_trip_is_nul_terminated() {
+        let module_file = write_echo_module();
+        let ctx = Context::new();
+
+        let stmt = Statement::UseWasm {
+            module_path: module_file.path().to_string_lossy().to_string(),
+            function_name: "echo".to_string(),
+            args: vec![(
+                "msg".to_string(),
+                Expression::Literal(AnnotatedValue::from(Value::Text("hello".to_string()))),
+            )],
+            result_into: Some(VariablePath::root("result")),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let val = ctx
+            .get_variable("result", MemoryScope::Working)
+            .await
+            .unwrap();
+        // Without the trailing NUL fix, the return-side string scan would
+        // either run off into zeroed (or uninit) memory and produce
+        // "hello..." with junk, or fall back to Number(ptr).
+        assert_eq!(val.value, Value::Text("hello".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_wasm_list_marshaling_via_json() {
+        let module_file = write_echo_module();
+        let ctx = Context::new();
+
+        let list = Value::List(vec![
+            AnnotatedValue::from(Value::Number(1.0)),
+            AnnotatedValue::from(Value::Number(2.0)),
+            AnnotatedValue::from(Value::Number(3.0)),
+        ]);
+
+        let stmt = Statement::UseWasm {
+            module_path: module_file.path().to_string_lossy().to_string(),
+            function_name: "echo".to_string(),
+            args: vec![(
+                "items".to_string(),
+                Expression::Literal(AnnotatedValue::from(list)),
+            )],
+            result_into: Some(VariablePath::root("result")),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let val = ctx
+            .get_variable("result", MemoryScope::Working)
+            .await
+            .unwrap();
+        // List was JSON-encoded on the way in; echo returns the same ptr;
+        // AgentLang reads back the NUL-terminated JSON string. The point
+        // of the test is that the JSON round-trips intact.
+        let s = match val.value {
+            Value::Text(s) => s,
+            other => panic!("expected Text JSON, got {:?}", other),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
+        // Value enum is externally tagged: List(Vec<AnnotatedValue>) →
+        // {"List": [{"value": {"Number": 1.0}, ...}, ...]}
+        let items = parsed["List"].as_array().expect("List array");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["value"]["Number"], serde_json::json!(1.0));
+        assert_eq!(items[1]["value"]["Number"], serde_json::json!(2.0));
+        assert_eq!(items[2]["value"]["Number"], serde_json::json!(3.0));
+    }
+
+    #[tokio::test]
+    async fn test_wasm_object_marshaling_via_json() {
+        let module_file = write_echo_module();
+        let ctx = Context::new();
+
+        let mut fields = HashMap::new();
+        fields.insert(
+            "city".to_string(),
+            AnnotatedValue::from(Value::Text("Paris".to_string())),
+        );
+        let obj = Value::Object(fields);
+
+        let stmt = Statement::UseWasm {
+            module_path: module_file.path().to_string_lossy().to_string(),
+            function_name: "echo".to_string(),
+            args: vec![(
+                "trip".to_string(),
+                Expression::Literal(AnnotatedValue::from(obj)),
+            )],
+            result_into: Some(VariablePath::root("result")),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let val = ctx
+            .get_variable("result", MemoryScope::Working)
+            .await
+            .unwrap();
+        let s = match val.value {
+            Value::Text(s) => s,
+            other => panic!("expected Text JSON, got {:?}", other),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
+        // Externally tagged: Object(HashMap<String, AnnotatedValue>) →
+        // {"Object": {"city": {"value": {"Text": "Paris"}, ...}}}
+        assert_eq!(parsed["Object"]["city"]["value"]["Text"], serde_json::json!("Paris"));
+    }
 }

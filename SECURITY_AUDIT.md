@@ -65,10 +65,14 @@
 - **Resolution:** `MyAgentService::call_goal` (`src/lib.rs:252`) parses each `CallRequest.args` entry into a typed `Value` (`Number` / `Boolean` / `Text`) and inserts it into the isolated context's `working_variables` before evaluating the goal body. The caller (`src/runtime/eval.rs:1229`) serializes call-site arguments into the same map.
 - **Outstanding:** Args are stringly-typed over the wire (`map<string, string>`); structured values like lists or nested objects must be passed as JSON text and parsed by the callee. Tighter typing would require evolving `proto/agent.proto`.
 
-### 2.4 Limited WASM Interoperability — **PARTIALLY ADDRESSED**
-- **Status:** Numeric types only.
-- **Current support:** `I32`, `I64`, and `F64` arguments and return values are wired through `Statement::UseWasm` in `src/runtime/eval.rs:1047-1067`. Booleans coerce to `I32`.
-- **Outstanding:** Strings, lists, and structured objects are still not marshaled — wasm tools that need them must accept pointers into linear memory and unmarshal manually. Component-Model bindings would close the gap.
+### 2.4 Limited WASM Interoperability — **MOSTLY ADDRESSED**
+- **Status:** All AgentLang value variants can be passed; structured types use a JSON-via-pointer convention.
+- **Current support:**
+  - Numerics: `I32`, `I64`, `F32`, `F64` (`src/runtime/eval.rs`).
+  - Booleans coerce to `I32`.
+  - **Text:** allocated via the module's `alloc` export and written **NUL-terminated** into linear memory; the function receives the pointer as `I32`. (Pre-fix, the runtime allocated `len` bytes and skipped the trailing NUL — callees that scanned for termination read past the payload into uninitialized heap.)
+  - **Lists & Objects:** serialized to JSON, then passed under the same NUL-terminated-string convention. Callees parse the payload with their JSON library of choice. End-to-end coverage in `runtime::tests::test_wasm_list_marshaling_via_json` and `test_wasm_object_marshaling_via_json`.
+- **Outstanding:** No wit-bindgen / Component-Model bindings — every WASM tool must implement `alloc(size: i32) -> i32` and a `memory` export. Multi-return-value support is limited to the first slot. Floats narrower than `F64` lose precision through the `as f64` cast on return.
 
 ### 2.5 Federated Registry — **IMPLEMENTED**
 - **Status:** Functional with caveats.

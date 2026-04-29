@@ -20,7 +20,35 @@ use ed25519_dalek::Signer;
 use ring::digest;
 use std::collections::HashMap;
 use tokio::time::{Duration, sleep};
-use wasmtime::{Linker, Module, Store, Val, ValType};
+use wasmtime::{Instance, Linker, Module, Store, Val, ValType};
+
+/// Allocates `bytes.len() + 1` in the WASM module's linear memory via the
+/// module-exported `alloc` function and writes the bytes followed by a
+/// trailing NUL. Returns the pointer (i32) of the allocation. The trailing
+/// NUL is critical: without it, callees that scan for string termination
+/// (or AgentLang's own NUL-terminated return-string detection) read past
+/// the payload into uninitialized memory.
+fn write_nul_terminated(
+    store: &mut Store<()>,
+    instance: &Instance,
+    bytes: &[u8],
+) -> Result<i32> {
+    let memory = instance
+        .get_memory(&mut *store, "memory")
+        .ok_or_else(|| anyhow!("Memory export not found for string passing"))?;
+    let alloc_func = instance
+        .get_func(&mut *store, "alloc")
+        .ok_or_else(|| anyhow!("'alloc' export required to pass strings to WASM"))?;
+
+    let total_len = bytes.len() + 1;
+    let mut alloc_res = vec![Val::I32(0)];
+    alloc_func.call(&mut *store, &[Val::I32(total_len as i32)], &mut alloc_res)?;
+    let ptr = alloc_res[0].i32().unwrap();
+
+    memory.write(&mut *store, ptr as usize, bytes)?;
+    memory.write(&mut *store, ptr as usize + bytes.len(), &[0u8])?;
+    Ok(ptr)
+}
 
 #[async_recursion]
 pub async fn eval_expression(expr: &Expression, ctx: &Context) -> Result<AnnotatedValue> {
@@ -1046,19 +1074,18 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 let wasm_val = match (p_type, &val.value) {
                     (ValType::I32, Value::Number(n)) => Val::I32(*n as i32),
                     (ValType::I32, Value::Text(s)) => {
-                        let memory = instance
-                            .get_memory(&mut store, "memory")
-                            .ok_or_else(|| anyhow!("Memory export not found for string passing"))?;
-                        let alloc_func =
-                            instance.get_func(&mut store, "alloc").ok_or_else(|| {
-                                anyhow!("'alloc' export required to pass strings to WASM")
-                            })?;
-
-                        let mut alloc_res = vec![Val::I32(0)];
-                        alloc_func.call(&mut store, &[Val::I32(s.len() as i32)], &mut alloc_res)?;
-                        let ptr = alloc_res[0].i32().unwrap();
-
-                        memory.write(&mut store, ptr as usize, s.as_bytes())?;
+                        let ptr = write_nul_terminated(&mut store, &instance, s.as_bytes())?;
+                        Val::I32(ptr)
+                    }
+                    // Lists and objects are marshaled as JSON-encoded
+                    // NUL-terminated strings under the same alloc convention
+                    // as Text. Callees parse the payload with their JSON
+                    // library of choice (serde, parson, etc.). This is the
+                    // pragmatic ABI until wit-bindgen / Component Model
+                    // bindings are wired up.
+                    (ValType::I32, Value::List(_)) | (ValType::I32, Value::Object(_)) => {
+                        let json = serde_json::to_string(&val.value)?;
+                        let ptr = write_nul_terminated(&mut store, &instance, json.as_bytes())?;
                         Val::I32(ptr)
                     }
                     (ValType::I64, Value::Number(n)) => Val::I64(*n as i64),
