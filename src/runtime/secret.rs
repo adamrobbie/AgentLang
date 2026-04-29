@@ -29,6 +29,18 @@ const MAGIC: &[u8; 6] = b"AGLE1\0";
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 const ENV_VAR: &str = "AGENTLANG_MASTER_KEY";
+const STRICT_ENV_VAR: &str = "AGENTLANG_REQUIRE_ENCRYPTED_KEYS";
+
+/// Strict mode: when set to a truthy value, the runtime refuses to read or
+/// write any key material in plaintext. Used by production deployments to
+/// guarantee `AGENTLANG_MASTER_KEY` is configured and no fallback codepath
+/// silently leaves identity bytes on disk.
+pub fn strict_mode() -> bool {
+    matches!(
+        std::env::var(STRICT_ENV_VAR).ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes")
+    )
+}
 
 /// Returns 32-byte KEK derived from `AGENTLANG_MASTER_KEY` if set.
 /// Domain-separated from the session key derivation.
@@ -130,6 +142,14 @@ pub fn read_identity(path: &str) -> Result<Option<[u8; 32]>> {
 
     // Legacy plaintext format
     if raw.len() == 32 {
+        if strict_mode() && kek.is_none() {
+            return Err(anyhow!(
+                "Identity file '{}' is plaintext and {} is unset, but {} is enabled",
+                path,
+                ENV_VAR,
+                STRICT_ENV_VAR
+            ));
+        }
         let mut out = [0u8; 32];
         out.copy_from_slice(&raw);
         // If a KEK is available, re-write encrypted so the next load is
@@ -153,13 +173,22 @@ pub fn read_identity(path: &str) -> Result<Option<[u8; 32]>> {
 }
 
 /// Write a freshly generated 32-byte signing key. Encrypts when KEK is
-/// available, otherwise writes plaintext (with a one-shot warning).
+/// available, otherwise writes plaintext (with a one-shot warning). Refuses
+/// to write plaintext when strict mode is on.
 pub fn write_identity(path: &str, bytes: &[u8; 32]) -> Result<()> {
     if let Some(kek) = identity_kek_from_env() {
         let blob = wrap(bytes, &kek)?;
         std::fs::write(path, blob)
             .map_err(|e| anyhow!("Failed to write encrypted identity '{}': {}", path, e))?;
     } else {
+        if strict_mode() {
+            return Err(anyhow!(
+                "Refusing to write plaintext identity to '{}': {} is set but {} is unset",
+                path,
+                STRICT_ENV_VAR,
+                ENV_VAR
+            ));
+        }
         warn_unencrypted();
         std::fs::write(path, bytes)
             .map_err(|e| anyhow!("Failed to write identity '{}': {}", path, e))?;
@@ -178,6 +207,16 @@ mod tests {
             match val {
                 Some(v) => std::env::set_var(ENV_VAR, v),
                 None => std::env::remove_var(ENV_VAR),
+            }
+        }
+    }
+
+    fn set_strict(on: bool) {
+        unsafe {
+            if on {
+                std::env::set_var(STRICT_ENV_VAR, "1");
+            } else {
+                std::env::remove_var(STRICT_ENV_VAR);
             }
         }
     }
@@ -271,5 +310,63 @@ mod tests {
         let path = tmp.path().join("does_not_exist");
         set_master_key(None);
         assert!(read_identity(path.to_str().unwrap()).unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn strict_mode_refuses_plaintext_write() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("agent.id");
+        set_master_key(None);
+        set_strict(true);
+
+        let bytes = [9u8; 32];
+        let res = write_identity(path.to_str().unwrap(), &bytes);
+        set_strict(false);
+
+        assert!(res.is_err(), "strict mode must refuse plaintext writes");
+        assert!(
+            !path.exists(),
+            "no file should be created when strict mode rejects the write"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn strict_mode_refuses_plaintext_read() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("agent.id");
+
+        // Pre-seed legacy plaintext file.
+        let bytes = [7u8; 32];
+        std::fs::write(&path, bytes).unwrap();
+
+        set_master_key(None);
+        set_strict(true);
+        let res = read_identity(path.to_str().unwrap());
+        set_strict(false);
+
+        assert!(
+            res.is_err(),
+            "strict mode must refuse to read a plaintext identity file"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn strict_mode_with_master_key_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("agent.id");
+        let path_str = path.to_str().unwrap();
+
+        set_master_key(Some("strict-pass"));
+        set_strict(true);
+        let bytes = [3u8; 32];
+        write_identity(path_str, &bytes).unwrap();
+        let recovered = read_identity(path_str).unwrap().unwrap();
+        set_strict(false);
+        set_master_key(None);
+
+        assert_eq!(recovered, bytes);
     }
 }

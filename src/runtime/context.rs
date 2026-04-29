@@ -95,17 +95,30 @@ impl Context {
         if let Ok(env_key) = std::env::var("AGENTLANG_MASTER_KEY") {
             let hash = digest::digest(&digest::SHA256, env_key.as_bytes());
             key_bytes.copy_from_slice(hash.as_ref());
-        } else if let Ok(existing_key) = fs::read(&key_file) {
-            let existing_key: Vec<u8> = existing_key;
-            if existing_key.len() == 32 {
-                key_bytes.copy_from_slice(&existing_key);
+        } else {
+            // Skip the strict-mode guard in tests: Context::new is created
+            // by many parallel tests that don't manage env vars, and the
+            // strict_mode() probe is process-global. Strict-mode behavior
+            // is exercised directly in secret::tests.
+            #[cfg(not(test))]
+            if secret::strict_mode() {
+                panic!(
+                    "AGENTLANG_REQUIRE_ENCRYPTED_KEYS is set but AGENTLANG_MASTER_KEY is unset; \
+                     refusing to fall back to plaintext session key at '{key_file}'"
+                );
+            }
+            if let Ok(existing_key) = fs::read(&key_file) {
+                let existing_key: Vec<u8> = existing_key;
+                if existing_key.len() == 32 {
+                    key_bytes.copy_from_slice(&existing_key);
+                } else {
+                    rand::rng().fill_bytes(&mut key_bytes);
+                    let _ = fs::write(key_file, key_bytes);
+                }
             } else {
                 rand::rng().fill_bytes(&mut key_bytes);
                 let _ = fs::write(key_file, key_bytes);
             }
-        } else {
-            rand::rng().fill_bytes(&mut key_bytes);
-            let _ = fs::write(key_file, key_bytes);
         }
         let unbound_key = aead::UnboundKey::new(&aead::AES_256_GCM, &key_bytes).unwrap();
 

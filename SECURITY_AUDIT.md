@@ -1,6 +1,6 @@
 # AgentLang Security Audit & Feature Gap Analysis
 **Original audit:** April 2026
-**Last updated:** April 2026 — multiple findings remediated; see status notes below.
+**Last updated:** 2026-04-28 — Section 2 rewritten to match implementation; gaps 2.2/2.3/2.5 reclassified as **IMPLEMENTED**, 2.4 as **PARTIALLY ADDRESSED**.
 
 > **Note on file paths.** The original audit predates the split of
 > `src/runtime.rs` into the `src/runtime/` module. References below have
@@ -19,7 +19,8 @@
 - **Finding:** Identity keys (`agent.id`) and session encryption keys (`agent.key`) are stored as raw bytes on the filesystem.
 - **Impact:** Local compromise leads to total loss of agent identity and access to all "long_term" encrypted memory.
 - **Resolution (identity key):** When `AGENTLANG_MASTER_KEY` is set, `agent.id` is wrapped with AES-256-GCM under a domain-separated KEK derived from that env var. Existing plaintext files auto-migrate on first read. When the env var is unset the file is still plaintext (with a one-shot stderr warning) — production deployments should set the env var.
-- **Outstanding:** `agent.key` (session AEAD key for long-term memory) is still raw bytes on disk in the no-env-var path; with the env var set, it derives directly from the env var rather than being persisted, which is already safe. Adopting OS keychain integration would close the gap fully.
+- **Resolution (strict mode):** A new `AGENTLANG_REQUIRE_ENCRYPTED_KEYS=1` env var refuses to read or write any key material in plaintext: `secret::write_identity` errors when no KEK is available, `secret::read_identity` errors on legacy plaintext files, and `Context::new` panics if no master key is set. This gives operators a forcing function for production deployments — once strict mode is on, no fallback codepath can silently leave key bytes on disk.
+- **Outstanding:** Without strict mode, `agent.key` is still raw bytes on disk in the no-env-var path. Without an OS keychain (macOS Security framework, Linux Secret Service, Windows DPAPI), there's no portable place to store a wrapping key for the env-var-unset path. Strict mode + `AGENTLANG_MASTER_KEY` is the recommended posture today; OS keychain integration is the long-term fix.
 
 ### 1.3 High: Unbounded WASM Execution (DoS) — **REMEDIATED**
 - **Location:** `src/runtime/eval.rs` (`Statement::UseWasm`)
@@ -54,22 +55,22 @@
 - **Deviation:** `PROVE` statements execute logic but generate a Fibonacci STARK proof instead of proving the actual execution trace or state transitions.
 - **Impact:** The "Trusted by Design" promise is currently non-functional for privacy-preserving claims.
 
-### 2.2 Unimplemented Shared Memory
-- **Status:** Missing.
-- **Deviation:** `MemoryScope::Shared` returns `Err("Scope not implemented")`.
-- **Impact:** Agents cannot collaborate via a shared state layer as defined in §7.2.
+### 2.2 Shared Memory — **IMPLEMENTED**
+- **Status:** Functional.
+- **Resolution:** `MemoryScope::Shared` reads/writes through registry RPCs (`get_shared_state` / `put_shared_state`) — see `src/runtime/context.rs:230` (read) and `src/runtime/context.rs:341` (write). Values are JSON-encoded `AnnotatedValue`s and round-trip through any of the configured registries.
+- **Outstanding:** No replication or conflict resolution between peer registries; the first-found-wins read strategy is racy under concurrent writes. Acceptable for single-registry deployments.
 
-### 2.3 RPC Argument Injection
-- **Status:** Broken.
-- **Deviation:** `CALL` sends arguments over the wire, but the receiving agent (`MyAgentService::call_goal`) executes the goal in a fresh context without injecting those arguments into `working_variables`.
-- **Impact:** Cross-agent cooperation is limited to parameter-less goals.
+### 2.3 RPC Argument Injection — **IMPLEMENTED**
+- **Status:** Functional.
+- **Resolution:** `MyAgentService::call_goal` (`src/lib.rs:252`) parses each `CallRequest.args` entry into a typed `Value` (`Number` / `Boolean` / `Text`) and inserts it into the isolated context's `working_variables` before evaluating the goal body. The caller (`src/runtime/eval.rs:1229`) serializes call-site arguments into the same map.
+- **Outstanding:** Args are stringly-typed over the wire (`map<string, string>`); structured values like lists or nested objects must be passed as JSON text and parsed by the callee. Tighter typing would require evolving `proto/agent.proto`.
 
-### 2.4 Limited WASM Interoperability
-- **Status:** Minimal.
-- **Deviation:** The runtime only supports `I32` arguments and return values.
-- **Impact:** Complex data structures (strings, lists, objects) cannot be passed to WASM tools.
+### 2.4 Limited WASM Interoperability — **PARTIALLY ADDRESSED**
+- **Status:** Numeric types only.
+- **Current support:** `I32`, `I64`, and `F64` arguments and return values are wired through `Statement::UseWasm` in `src/runtime/eval.rs:1047-1067`. Booleans coerce to `I32`.
+- **Outstanding:** Strings, lists, and structured objects are still not marshaled — wasm tools that need them must accept pointers into linear memory and unmarshal manually. Component-Model bindings would close the gap.
 
-### 2.5 Hardcoded Federated Registry
-- **Status:** Centralized.
-- **Deviation:** The runtime assumes a single local registry at `[::1]:50050`.
-- **Impact:** Federation (§12) is not implemented.
+### 2.5 Federated Registry — **IMPLEMENTED**
+- **Status:** Functional with caveats.
+- **Resolution:** `MyRegistryService` carries a `peer_registries: Vec<String>` field (`src/lib.rs:36`); `lookup_agent` recursively delegates to peers with a TTL bound (`src/lib.rs:128`). Multiple registries can be configured per agent via `Context::registries`. The default `http://[::1]:50050` is just a starting value, not a hard assumption.
+- **Outstanding:** No discovery, gossip, or signed peering — peers must be configured statically. The registry-to-registry protocol is plaintext gRPC unless the operator configures TLS via `AGENTLANG_TLS_*`.

@@ -910,6 +910,120 @@ mod tests {
         assert!(res.success);
     }
 
+    /// Proves that args sent over CallRequest are readable from inside the
+    /// goal body — not just absorbed by the parser. The goal copies the
+    /// injected `num_arg` into the variable named after the goal, which is
+    /// what the RPC handler returns to the caller.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_agent_service_args_visible_in_goal_body() {
+        use ast::{Expression, MemoryScope, Statement, VariablePath};
+
+        let ctx = runtime::Context::new();
+        {
+            let mut goals = ctx.goals.lock().unwrap();
+            goals.insert(
+                "echo_arg".to_string(),
+                ast::GoalDefinition {
+                    body: vec![Statement::Remember {
+                        // Different name from the goal so it isn't filtered
+                        // out by collect_changed_working_values.
+                        name: "captured".to_string(),
+                        value: Expression::VariableRef(VariablePath::root("num_arg")),
+                        scope: MemoryScope::Working,
+                        expires: None,
+                    }],
+                    outputs: vec![],
+                    result_into: None,
+                    retry: None,
+                    on_fail: HashMap::new(),
+                    deadline: None,
+                    wait: None,
+                    idempotent: false,
+                    audit_trail: false,
+                    confirm_with: None,
+                    timeout_confirmation: None,
+                    fallback: None,
+                },
+            );
+        }
+
+        let registry = MyRegistryService::new();
+        let caller_ctx = runtime::Context::new();
+        let caller_id = "caller_arg_visible".to_string();
+        let endpoint = "http://localhost:9".to_string();
+        let payload = format!("{}:{}", caller_id, endpoint);
+        let signature = caller_ctx
+            .identity
+            .signing_key
+            .sign(payload.as_bytes())
+            .to_bytes()
+            .to_vec();
+
+        registry
+            .register_agent(Request::new(RegisterRequest {
+                agent_id: caller_id.clone(),
+                endpoint,
+                public_key: caller_ctx.identity.verifying_key.to_bytes().to_vec(),
+                signature,
+            }))
+            .await
+            .unwrap();
+
+        let reg_addr = "http://[::1]:50117".to_string();
+        let socket_addr: std::net::SocketAddr = "[::1]:50117".parse().unwrap();
+        tokio::spawn(async move {
+            let _ = start_registry(registry, socket_addr).await;
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let service = MyAgentService {
+            ctx: ctx.clone(),
+            registries: vec![reg_addr],
+        };
+
+        let goal_name = "echo_arg".to_string();
+        let call_payload = format!("{}:{}", goal_name, caller_id);
+        let call_signature = caller_ctx
+            .identity
+            .signing_key
+            .sign(call_payload.as_bytes())
+            .to_bytes()
+            .to_vec();
+
+        let mut args = HashMap::new();
+        args.insert("num_arg".to_string(), "42".to_string());
+
+        let req = CallRequest {
+            goal_name: goal_name.clone(),
+            args,
+            caller_id,
+            signature: call_signature,
+        };
+
+        let res = service
+            .call_goal(Request::new(req))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(res.success, "goal should succeed; got: {}", res.result_json);
+
+        let returned: ast::AnnotatedValue = serde_json::from_str(&res.result_json)
+            .expect("result must deserialize as AnnotatedValue");
+        let fields = match &returned.value {
+            ast::Value::Object(f) => f,
+            other => panic!("expected Object envelope, got {:?}", other),
+        };
+        let captured = fields
+            .get("captured")
+            .expect("`captured` should be in the result envelope — body read num_arg from working scope");
+        assert_eq!(
+            captured.value,
+            ast::Value::Number(42.0),
+            "injected arg num_arg=42 must be readable inside the goal body"
+        );
+    }
+
     /// Goal body that fails should return success=false with an error payload.
     #[tokio::test]
     #[serial_test::serial]
