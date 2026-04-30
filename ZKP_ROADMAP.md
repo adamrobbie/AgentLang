@@ -8,6 +8,9 @@ This is the **index** to AgentLang's ZKP roadmap. Each follow-on item has
 its own deep-dive document under `docs/zkp/` — that's where the detail
 lives. This page is intended as a one-page orientation for new readers.
 
+For implementation status (what's shipped, what's next, deviations from
+the deep-dive plans), see [`docs/zkp/STATUS.md`](docs/zkp/STATUS.md).
+
 ## Where we are today
 
 `src/crypto.rs` ships an `ExecutionDigestAir` that binds proofs to a
