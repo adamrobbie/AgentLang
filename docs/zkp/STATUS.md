@@ -55,25 +55,44 @@ Wired into `Statement::Prove` (eval.rs:1142) and verified in
 emission — the all-Nop trace is degenerate for winterfell; documented
 inline.
 
-**Key implementation deviations from the deep-dive's Phase 2 sketch:**
+**Key implementation deviations from the deep-dive's Phase 2 sketch.**
+Each closes off an option the plan assumed was open, so each carries a
+forward constraint into Phase 3+:
 
-- **Selector strategy.** Plan called for "selector columns per opcode +
-  selector-mutual-exclusion" constraints. We chose **Lagrange indicator
-  polynomials** over the opcode column instead (`opcode_indicator` in
-  crypto.rs). Soundness: zero witness gap (deterministic from opcode).
-  Cost: higher constraint degree (10 instead of 2). Reconsider if degree
-  becomes an FFT-cost problem in Phase 3+.
-- **Anti-pad design.** Power-of-two padding to a multiplicative subgroup
-  of size N can collapse witness columns into degree-N/2 polynomials when
-  the column happens to be even-symmetric (f(g^k) = f(g^(k+N/2))). The
-  current 5-row anti-pad (Nop, IF, GoalEnter, IF, GoalExit with
-  `goal_status=3`) is tuned to break this for every shipping test trace.
-  Documented inline at `ControlFlowProver::build_trace`.
-- **`StarkProof.control_flow` is `Option`-shaped, not feature-flagged.**
-  Plan called for a build-time `per_statement_air` feature; we ended up
-  with runtime opt-in via "log present ⇒ CF proof present." Simpler,
-  serialization-stable across versions, and lets dogfooding be per-call
-  rather than per-build. Revisit before flipping the default.
+- **Selector strategy: Lagrange indicators (degree 10) instead of
+  selector columns (degree 2).** `opcode_indicator` in `crypto.rs`
+  derives a degree-10 Lagrange polynomial over the 11-element opcode
+  alphabet. Soundness: no witness gap. Cost: every opcode-gated
+  constraint inherits degree 10.
+  *Phase 3 constraint:* with `blowup_factor=16` (max constraint degree
+  16), the lookup argument has only 6 degrees of headroom before we
+  have to double the blowup (doubles FFT cost). The deep dive's 2-day
+  winterfell-vs-Plonky3 prototype (Q1) must measure lookup-argument
+  *degree*, not just API ergonomics, and is now gating rather than
+  exploratory.
+- **`StarkProof.control_flow: Option<ControlFlowProof>` runtime opt-in
+  instead of build-time `per_statement_air` feature flag.** Simpler,
+  serialization-stable, and lets dogfooding happen per-call.
+  *Phase 3 constraint:* there's no fast rollback for a broken Phase 3
+  CF variant short of reverting the whole field. Open question Q5
+  (`proof_version: u8` + verifier dispatch table) was scheduled for
+  Phase 4; it now needs to land with Phase 3 so we keep the option to
+  evolve constraints without breaking older proofs.
+- **5-row anti-pad to break subgroup even-symmetry.** Power-of-two
+  padding to a multiplicative subgroup of size N can collapse a witness
+  column to a degree-N/2 polynomial when the column happens to be
+  even-symmetric (f(g^k) = f(g^(k+N/2))). The current anti-pad (Nop,
+  IF, GoalEnter, IF, GoalExit with `goal_status=3`) is hand-tuned to
+  break this for every shipping test trace, on the *current* witness
+  columns.
+  *Phase 3 constraint:* every new column added by Phase 3 (memory_root,
+  path_hash, etc.) needs the same audit. If a Prove body emits no
+  REMEMBER/RECALL, those columns are all-zero on real rows and the
+  anti-pad won't drive variation. Implementer choice: extend the
+  anti-pad (couples it to every column ever added) or split into
+  per-statement-family AIRs (multi-AIR aggregation cost). Soundness
+  review (Phase 5) must verify the chosen anti-pad doesn't open a
+  forgery vector.
 
 ### Phase 3 — Memory commitment + REMEMBER/RECALL lookup ⏳
 
