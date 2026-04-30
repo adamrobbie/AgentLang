@@ -9,6 +9,7 @@ pub mod audit;
 pub mod call;
 pub mod context;
 pub mod eval;
+pub mod exec_log;
 pub mod goal;
 pub mod mcp;
 pub mod memory;
@@ -3003,6 +3004,304 @@ mod tests {
 
         // proof should be stored in ctx.proofs
         assert!(ctx.proofs.lock().unwrap().contains_key("my_proof"));
+    }
+
+    // --- ExecutionLog wiring (ZKP Phase 1) ---
+    #[tokio::test]
+    async fn prove_records_set_into_exec_log() {
+        use super::exec_log::{Opcode, Operands};
+
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Set {
+                variable: "x".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+            }],
+            claim: "x is set".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let logs = ctx.exec_logs.lock().unwrap();
+        let log = logs.get("p").expect("exec_logs[\"p\"] should be populated");
+        let setlike: Vec<&Operands> = log
+            .entries()
+            .iter()
+            .filter(|e| matches!(e.operands, Operands::Set { .. }))
+            .map(|e| &e.operands)
+            .collect();
+        assert_eq!(setlike.len(), 1, "expected exactly one Set entry");
+        assert_eq!(log.entries().last().unwrap().opcode(), Opcode::Set);
+    }
+
+    #[tokio::test]
+    async fn statements_outside_prove_dont_record() {
+        let ctx = Context::new();
+        let stmt = Statement::Set {
+            variable: "x".to_string(),
+            value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let active = ctx.exec_log.lock().unwrap();
+        assert!(active.is_none(), "exec_log must be None outside Prove");
+        let logs = ctx.exec_logs.lock().unwrap();
+        assert!(logs.is_empty(), "no completed exec_logs without a Prove");
+    }
+
+    #[tokio::test]
+    async fn exec_log_active_field_cleared_after_prove() {
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![],
+            claim: "empty".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+        assert!(
+            ctx.exec_log.lock().unwrap().is_none(),
+            "active exec_log must be cleared after Prove returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_proves_keyed_by_name() {
+        let ctx = Context::new();
+        for name in ["a", "b", "c"] {
+            let stmt = Statement::Prove {
+                statements: vec![Statement::Set {
+                    variable: "x".to_string(),
+                    value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+                }],
+                claim: name.to_string(),
+                proof_name: name.to_string(),
+            };
+            eval(&stmt, ctx.clone()).await.unwrap();
+        }
+        let logs = ctx.exec_logs.lock().unwrap();
+        assert!(logs.contains_key("a"));
+        assert!(logs.contains_key("b"));
+        assert!(logs.contains_key("c"));
+        for name in ["a", "b", "c"] {
+            assert_eq!(logs.get(name).unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn prove_records_remember_with_scope() {
+        use super::exec_log::{Opcode, Operands};
+
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Remember {
+                name: "k".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Number(7.0))),
+                scope: MemoryScope::LongTerm,
+                expires: None,
+            }],
+            claim: "remembered".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let logs = ctx.exec_logs.lock().unwrap();
+        let log = logs.get("p").expect("log");
+        let remember = log
+            .entries()
+            .iter()
+            .find(|e| matches!(e.operands, Operands::Remember { .. }))
+            .expect("Remember entry");
+        assert_eq!(remember.opcode(), Opcode::Remember);
+        match remember.operands {
+            Operands::Remember { scope, .. } => assert_eq!(scope, MemoryScope::LongTerm),
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prove_records_if_branch_taken() {
+        use super::exec_log::{Opcode, Operands};
+
+        let ctx = Context::new();
+        // Condition is `true` literal; then-branch must be marked taken.
+        let stmt = Statement::Prove {
+            statements: vec![Statement::If {
+                condition: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))),
+                then_branch: vec![Statement::Set {
+                    variable: "y".to_string(),
+                    value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+                }],
+                else_branch: None,
+            }],
+            claim: "if-true".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let logs = ctx.exec_logs.lock().unwrap();
+        let log = logs.get("p").expect("log");
+        let if_entry = log
+            .entries()
+            .iter()
+            .find(|e| matches!(e.operands, Operands::If { .. }))
+            .expect("If entry");
+        assert_eq!(if_entry.opcode(), Opcode::If);
+        match if_entry.operands {
+            Operands::If { branch_taken, .. } => assert!(branch_taken, "then-branch taken"),
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prove_records_if_branch_not_taken() {
+        use super::exec_log::Operands;
+
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![Statement::If {
+                condition: Expression::Literal(AnnotatedValue::from(Value::Boolean(false))),
+                then_branch: vec![],
+                else_branch: None,
+            }],
+            claim: "if-false".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let logs = ctx.exec_logs.lock().unwrap();
+        let log = logs.get("p").expect("log");
+        let if_entry = log
+            .entries()
+            .iter()
+            .find(|e| matches!(e.operands, Operands::If { .. }))
+            .expect("If entry");
+        match if_entry.operands {
+            Operands::If { branch_taken, .. } => {
+                assert!(!branch_taken, "branch_taken=false when condition is false")
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prove_records_goal_enter_then_body_then_exit() {
+        use super::exec_log::{GoalStatus, Opcode, Operands};
+
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Goal {
+                name: "g".to_string(),
+                body: vec![Statement::Set {
+                    variable: "x".to_string(),
+                    value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+                }],
+                outputs: vec![],
+                result_into: None,
+                retry: None,
+                on_fail: HashMap::new(),
+                deadline: None,
+                wait: None,
+                idempotent: false,
+                audit_trail: false,
+                confirm_with: None,
+                timeout_confirmation: None,
+                fallback: None,
+            }],
+            claim: "goal".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let logs = ctx.exec_logs.lock().unwrap();
+        let log = logs.get("p").expect("log");
+        let opcodes: Vec<Opcode> = log.entries().iter().map(|e| e.opcode()).collect();
+        assert_eq!(
+            opcodes,
+            vec![Opcode::GoalEnter, Opcode::Set, Opcode::GoalExit]
+        );
+
+        match log.entries().last().unwrap().operands {
+            Operands::GoalExit { status, .. } => assert_eq!(status, GoalStatus::Success),
+            _ => panic!("expected GoalExit last"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prove_records_recall_with_scope() {
+        use super::exec_log::{Opcode, Operands};
+
+        let ctx = Context::new();
+        ctx.set_variable(
+            "x".to_string(),
+            AnnotatedValue::from(Value::Number(1.0)),
+            MemoryScope::Working,
+        )
+        .await
+        .unwrap();
+
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Recall {
+                name: "x".to_string(),
+                into_var: "y".to_string(),
+                scope: MemoryScope::Working,
+                on_missing: None,
+                fuzzy: false,
+                threshold: None,
+            }],
+            claim: "recall".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let logs = ctx.exec_logs.lock().unwrap();
+        let log = logs.get("p").expect("log");
+        let recall = log
+            .entries()
+            .iter()
+            .find(|e| matches!(e.operands, Operands::Recall { .. }))
+            .expect("Recall entry");
+        assert_eq!(recall.opcode(), Opcode::Recall);
+        match recall.operands {
+            Operands::Recall { scope, .. } => assert_eq!(scope, MemoryScope::Working),
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prove_records_forget_with_scope() {
+        use super::exec_log::{Opcode, Operands};
+
+        let ctx = Context::new();
+        ctx.set_variable(
+            "x".to_string(),
+            AnnotatedValue::from(Value::Number(1.0)),
+            MemoryScope::Working,
+        )
+        .await
+        .unwrap();
+
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Forget {
+                name: "x".to_string(),
+                scope: MemoryScope::Working,
+            }],
+            claim: "forget".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let logs = ctx.exec_logs.lock().unwrap();
+        let log = logs.get("p").expect("log");
+        let forget = log
+            .entries()
+            .iter()
+            .find(|e| matches!(e.operands, Operands::Forget { .. }))
+            .expect("Forget entry");
+        assert_eq!(forget.opcode(), Opcode::Forget);
+        match forget.operands {
+            Operands::Forget { scope, .. } => assert_eq!(scope, MemoryScope::Working),
+            _ => unreachable!(),
+        }
     }
 
     // --- Statement::Reveal ---

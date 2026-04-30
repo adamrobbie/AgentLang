@@ -1,4 +1,5 @@
 use super::audit::{AuditChain, Event, format_value_safe};
+use super::exec_log;
 use super::memory::{JsonFileBackend, MemoryBackend};
 use super::registry_rpc::{GetSharedRequest, PutSharedRequest};
 use super::secret;
@@ -54,6 +55,8 @@ pub struct Context {
     pub session_key: Arc<aead::LessSafeKey>,
     pub wasm_engine: Engine,
     pub proofs: Arc<Mutex<HashMap<String, crypto::StarkProof>>>,
+    pub exec_log: Arc<Mutex<Option<exec_log::ExecutionLog>>>,
+    pub exec_logs: Arc<Mutex<HashMap<String, exec_log::ExecutionLog>>>,
     pub goals: Arc<Mutex<HashMap<String, GoalDefinition>>>,
     pub tools: Arc<Mutex<HashMap<String, ToolDefinition>>>,
     pub tool_handlers: Arc<Mutex<HashMap<String, ToolHandlerFn>>>,
@@ -200,6 +203,8 @@ impl Context {
             session_key: Arc::new(aead::LessSafeKey::new(unbound_key)),
             wasm_engine,
             proofs: Arc::new(Mutex::new(HashMap::new())),
+            exec_log: Arc::new(Mutex::new(None)),
+            exec_logs: Arc::new(Mutex::new(HashMap::new())),
             goals: Arc::new(Mutex::new(HashMap::new())),
             tools: Arc::new(Mutex::new(HashMap::new())),
             tool_handlers: Arc::new(Mutex::new(HashMap::new())),
@@ -217,6 +222,20 @@ impl Default for Context {
 }
 
 impl Context {
+    /// Append `entry` to the active execution log if one is open. No-op
+    /// outside `Statement::Prove`. Used by Phase 1 wiring; Phase 2 trace
+    /// builders will read the completed log from `exec_logs`.
+    pub fn record_log(&self, entry: exec_log::LogEntry) {
+        if let Some(log) = self
+            .exec_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            log.record(entry);
+        }
+    }
+
     pub async fn get_variable(&self, name: &str, scope: MemoryScope) -> Result<AnnotatedValue> {
         match scope {
             MemoryScope::Working => self

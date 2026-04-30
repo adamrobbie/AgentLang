@@ -5,6 +5,7 @@ use super::call::{
     store_call_result,
 };
 use super::context::{Context, ContractInfo};
+use super::exec_log::{self, LogEntry, Operands};
 use super::goal::{build_goal_result, classify_goal_failure, store_goal_result};
 use super::memory::{
     ensure_value_safe_for_irreversible_action, inherit_metadata, propagate_container_metadata,
@@ -242,6 +243,20 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 sleep(Duration::from_secs_f64(*delay)).await;
             }
 
+            let audit_root_at_entry = exec_log::hash(
+                ctx.audit_chain
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .last_hash
+                    .as_bytes(),
+            );
+            ctx.record_log(LogEntry {
+                operands: Operands::GoalEnter {
+                    name_hash: exec_log::hash(name.as_bytes()),
+                    audit_root: audit_root_at_entry,
+                },
+            });
+
             let max_retries = retry.unwrap_or(0);
             use tokio::task::JoinSet;
 
@@ -325,6 +340,26 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 }
             };
 
+            let exit_status = match &result {
+                Ok(_) => exec_log::GoalStatus::Success,
+                Err(e) if e.to_string().contains("timed out") => exec_log::GoalStatus::Timeout,
+                Err(_) => exec_log::GoalStatus::Failure,
+            };
+            let audit_root_at_exit = exec_log::hash(
+                ctx.audit_chain
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .last_hash
+                    .as_bytes(),
+            );
+            ctx.record_log(LogEntry {
+                operands: Operands::GoalExit {
+                    name_hash: exec_log::hash(name.as_bytes()),
+                    status: exit_status,
+                    audit_root: audit_root_at_exit,
+                },
+            });
+
             if let Err(e) = result {
                 let failure_type = classify_goal_failure(&e);
 
@@ -344,6 +379,12 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
         }
         Statement::Set { variable, value } => {
             let val = eval_expression(value, &ctx).await?;
+            ctx.record_log(LogEntry {
+                operands: Operands::Set {
+                    name_hash: exec_log::hash(variable.as_bytes()),
+                    value_hash: exec_log::hash(format!("{:?}", val.value).as_bytes()),
+                },
+            });
             ctx.set_variable(variable.clone(), val, MemoryScope::Working)
                 .await?;
             Ok(())
@@ -354,14 +395,20 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             else_branch,
         } => {
             let cond = eval_expression(condition, &ctx).await?;
-            let is_true = match cond.value {
-                Value::Boolean(b) => b,
-                Value::Number(n) => n != 0.0,
+            let is_true = match &cond.value {
+                Value::Boolean(b) => *b,
+                Value::Number(n) => *n != 0.0,
                 Value::Text(s) => !s.is_empty(),
                 Value::List(l) => !l.is_empty(),
                 Value::Object(o) => !o.is_empty(),
                 Value::Null => false,
             };
+            ctx.record_log(LogEntry {
+                operands: Operands::If {
+                    cond_hash: exec_log::hash(format!("{:?}", cond.value).as_bytes()),
+                    branch_taken: is_true,
+                },
+            });
             if is_true {
                 for stmt in then_branch {
                     eval(stmt, ctx.clone()).await?;
@@ -804,6 +851,14 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                     &format!("write shared memory '{}'", name),
                 )?;
             }
+            ctx.record_log(LogEntry {
+                operands: Operands::Remember {
+                    scope: *scope,
+                    path_hash: exec_log::hash(name.as_bytes()),
+                    value_hash: exec_log::hash(format!("{:?}", val.value).as_bytes()),
+                    ttl: expires.map(|secs| secs as u64),
+                },
+            });
             ctx.set_variable(name.clone(), val, *scope).await?;
 
             // Schedule automatic removal after the requested duration.
@@ -885,12 +940,26 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             match result {
                 Ok(val) => {
                     let recalled = sanitize_recalled_value(val, *scope);
+                    ctx.record_log(LogEntry {
+                        operands: Operands::Recall {
+                            scope: *scope,
+                            path_hash: exec_log::hash(name.as_bytes()),
+                            value_hash: exec_log::hash(format!("{:?}", recalled.value).as_bytes()),
+                        },
+                    });
                     ctx.set_variable(into_var.clone(), recalled, MemoryScope::Working)
                         .await?;
                 }
                 Err(_) => {
                     if let Some(expr) = on_missing {
                         let val = eval_expression(expr, &ctx).await?;
+                        ctx.record_log(LogEntry {
+                            operands: Operands::Recall {
+                                scope: *scope,
+                                path_hash: exec_log::hash(name.as_bytes()),
+                                value_hash: exec_log::hash(format!("{:?}", val.value).as_bytes()),
+                            },
+                        });
                         ctx.set_variable(into_var.clone(), val, MemoryScope::Working)
                             .await?;
                     } else {
@@ -901,6 +970,12 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             Ok(())
         }
         Statement::Forget { name, scope } => {
+            ctx.record_log(LogEntry {
+                operands: Operands::Forget {
+                    scope: *scope,
+                    path_hash: exec_log::hash(name.as_bytes()),
+                },
+            });
             match scope {
                 MemoryScope::Working => {
                     ctx.working_variables
@@ -1012,8 +1087,23 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             claim,
             proof_name,
         } => {
+            *ctx.exec_log.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(exec_log::ExecutionLog::new());
+
             for stmt in statements {
                 eval(stmt, ctx.clone()).await?;
+            }
+
+            if let Some(log) = ctx
+                .exec_log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                ctx.exec_logs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(proof_name.clone(), log);
             }
 
             // The trace consumes these bytes one at a time; tampering with
