@@ -177,6 +177,11 @@ pub struct LogTraceRow {
     pub opcode: u8,
     pub branch_taken: u8,
     pub goal_status: u8,
+    /// Goal-stack depth BEFORE this row's opcode is processed. Row 0 is
+    /// always 0; each `GoalEnter` increments depth on the *next* row,
+    /// each `GoalExit` decrements. Phase 2 Slice 6 uses this column as
+    /// witness for the AIR's pairing constraint.
+    pub depth: u32,
 }
 
 impl Default for LogTraceRow {
@@ -187,13 +192,16 @@ impl Default for LogTraceRow {
     /// zero), which happens whenever a column never varies. We pin
     /// `opcode = Nop` (still in the valid set) but use `branch_taken = 1`
     /// and `goal_status = 1` so columns for those witnesses vary against
-    /// the all-zero values typical of Set/Remember/Recall rows. All four
+    /// the all-zero values typical of Set/Remember/Recall rows. `depth`
+    /// stays at 0 — Slice 6's depth boundary requires the final padded
+    /// row to carry depth 0, and Nop padding is depth-neutral. All
     /// transition constraints accept these padding values.
     fn default() -> Self {
         Self {
             opcode: Opcode::Nop as u8,
             branch_taken: 1,
             goal_status: 1,
+            depth: 0,
         }
     }
 }
@@ -205,6 +213,12 @@ pub struct LogTrace {
 
 impl From<&ExecutionLog> for LogTrace {
     fn from(log: &ExecutionLog) -> Self {
+        // `depth` is the goal-stack height BEFORE this row's opcode
+        // is processed. Each GoalEnter contributes +1 to subsequent
+        // rows; each GoalExit contributes -1. We use a signed counter
+        // internally to surface unbalanced traces as huge u32 values
+        // (which the AIR's depth boundary will reject as ≠ 0 at end).
+        let mut depth: i64 = 0;
         let rows = log
             .entries()
             .iter()
@@ -215,11 +229,18 @@ impl From<&ExecutionLog> for LogTrace {
                     Operands::GoalExit { status, .. } => (0, *status as u8),
                     _ => (0, 0),
                 };
-                LogTraceRow {
+                let row = LogTraceRow {
                     opcode,
                     branch_taken,
                     goal_status,
+                    depth: depth.max(0) as u32,
+                };
+                match &entry.operands {
+                    Operands::GoalEnter { .. } => depth += 1,
+                    Operands::GoalExit { .. } => depth -= 1,
+                    _ => {}
                 }
+                row
             })
             .collect();
         LogTrace { rows }

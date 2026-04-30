@@ -504,8 +504,32 @@ const CFA_OPCODE_COL: usize = 0;
 const CFA_BRANCH_COL: usize = 1;
 const CFA_STATUS_COL: usize = 2;
 const CFA_CLAIM_COL: usize = 3;
-const CFA_NUM_COLS: usize = 4;
+const CFA_DEPTH_COL: usize = 4;
+const CFA_NUM_COLS: usize = 5;
 const CFA_MIN_TRACE_LEN: usize = 8;
+
+const OPCODE_GOAL_ENTER: u128 = 0x01;
+const OPCODE_GOAL_EXIT: u128 = 0x02;
+
+/// Lagrange indicator polynomial that is 1 at `target` and 0 at every
+/// other valid opcode. Degree 10 over the 11-element opcode alphabet.
+/// Combined with the opcode-validity constraint, this lets the AIR drive
+/// the depth recurrence directly from the opcode column without an
+/// extra witness column.
+fn opcode_indicator<E: FieldElement<BaseField = BaseElement>>(opcode: E, target: u128) -> E {
+    let mut num = E::ONE;
+    let mut denom = BaseElement::ONE;
+    let target_bf = BaseElement::new(target);
+    for &v in VALID_OPCODES {
+        if v == target {
+            continue;
+        }
+        let v_bf = BaseElement::new(v);
+        num *= opcode - E::from(v_bf);
+        denom *= target_bf - v_bf;
+    }
+    num * E::from(denom.inv())
+}
 
 pub struct ControlFlowPublicInputs {
     pub claim_hash: BaseElement,
@@ -532,14 +556,19 @@ impl Air for ControlFlowAir {
         //   branch_taken bool: x*(x-1)                     → degree 2
         //   goal_status range: x*(x-1)*(x-2)*(x-3)         → degree 4
         //   claim_hash carry: next - current               → degree 1
+        //   depth recurrence: degree-10 indicator polys    → degree 10
         let degrees = vec![
             winterfell::TransitionConstraintDegree::new(11),
             winterfell::TransitionConstraintDegree::new(2),
             winterfell::TransitionConstraintDegree::new(4),
             winterfell::TransitionConstraintDegree::new(1),
+            winterfell::TransitionConstraintDegree::new(10),
         ];
-        // One assertion: claim_hash at row 0 binds the trace to the claim.
-        let context = AirContext::new(trace_info, degrees, 1, options);
+        // Three boundary assertions:
+        //   - claim_hash at row 0 binds the trace to the claim
+        //   - depth at row 0 = 0 (clean stack on entry)
+        //   - depth at last row = 0 (every Enter matched by an Exit)
+        let context = AirContext::new(trace_info, degrees, 3, options);
         Self {
             context,
             pub_inputs,
@@ -547,11 +576,12 @@ impl Air for ControlFlowAir {
     }
 
     fn get_assertions(&self) -> Vec<Assertion<Self::BaseField>> {
-        vec![Assertion::single(
-            CFA_CLAIM_COL,
-            0,
-            self.pub_inputs.claim_hash,
-        )]
+        let last = self.context.trace_info().length() - 1;
+        vec![
+            Assertion::single(CFA_CLAIM_COL, 0, self.pub_inputs.claim_hash),
+            Assertion::single(CFA_DEPTH_COL, 0, BaseElement::ZERO),
+            Assertion::single(CFA_DEPTH_COL, last, BaseElement::ZERO),
+        ]
     }
 
     fn evaluate_transition<E: FieldElement<BaseField = Self::BaseField>>(
@@ -583,6 +613,19 @@ impl Air for ControlFlowAir {
 
         // 4) claim_hash carries unchanged
         result[3] = next[CFA_CLAIM_COL] - cur[CFA_CLAIM_COL];
+
+        // 5) Goal-pair recurrence: next_depth = cur_depth + I_enter - I_exit.
+        //    I_enter is 1 iff cur_opcode = GoalEnter, 0 otherwise; symmetric
+        //    for I_exit. Combined with depth=0 boundary assertions at row 0
+        //    and the last padded row, this enforces every GoalEnter has a
+        //    matching GoalExit. (Negative-depth detection — i.e., "Exit
+        //    before Enter" with later compensating Enter — is deferred to
+        //    a future range-proof; the global-balance check still catches
+        //    most malformed traces.)
+        let opcode = cur[CFA_OPCODE_COL];
+        let i_enter = opcode_indicator(opcode, OPCODE_GOAL_ENTER);
+        let i_exit = opcode_indicator(opcode, OPCODE_GOAL_EXIT);
+        result[4] = next[CFA_DEPTH_COL] - cur[CFA_DEPTH_COL] - i_enter + i_exit;
     }
 
     fn context(&self) -> &AirContext<Self::BaseField> {
@@ -606,20 +649,66 @@ impl ControlFlowProver {
     }
 
     fn build_trace(&self) -> TraceTable<BaseElement> {
-        // Always include one "anti-padding" row directly after the real
-        // rows whose branch_taken / goal_status are the OPPOSITE of the
-        // `LogTraceRow::default()` padding. This guarantees both columns
-        // have at least one 0-valued and one 1-valued entry across the
-        // whole trace, so the constraint quotient polynomials reach
-        // their declared degrees. Without this, traces whose real rows
-        // happen to all carry branch_taken=1 (e.g., a single If(true))
-        // would yield constant-1 columns and winterfell would reject
-        // the witness as degenerate.
-        let mut rows = self.rows.clone();
+        // The trace gets three appended "anti-padding" rows after the
+        // real ones, then default Nop rows out to a power-of-two length.
+        //
+        // Anti-pad layout (in order):
+        //   row R    : Nop, branch=0, status=0
+        //              — drives branch/status column variation against
+        //                the (1, 1) values used in `LogTraceRow::default`.
+        //   row R+1  : GoalEnter, branch=0, status=0
+        //              — depth column rises by 1 here.
+        //   row R+2  : GoalExit, branch=1, status=1
+        //              — depth column falls back; combined with row R+1
+        //                this guarantees the depth column has at least
+        //                one 0 and one 1 across any trace, so its
+        //                constraint quotient reaches the declared degree.
+        //
+        // After the anti-pad sequence, depth has cycled through
+        // [d_after_real, d_after_real, d_after_real+1] and lands back at
+        // `d_after_real`. Default-padding rows carry `depth =
+        // d_after_real`, satisfying the recurrence (Nop is depth-neutral)
+        // *and* exposing balance failures: the depth-at-last-row boundary
+        // assertion checks for 0, so any d_after_real ≠ 0 (i.e., real
+        // rows had unmatched GoalEnter/Exit) triggers verifier rejection.
+
+        let real_rows = self.rows.clone();
+
+        // Compute depth-after-last-real-row from the row witnesses.
+        // The depth field on each real row is the depth BEFORE that
+        // row's opcode is processed, so we apply the last row's delta
+        // to derive what the next slot would carry.
+        let d_after_real: i64 = if let Some(last) = real_rows.last() {
+            let d = last.depth as i64;
+            match last.opcode {
+                0x01 => d + 1, // GoalEnter
+                0x02 => d - 1, // GoalExit
+                _ => d,
+            }
+        } else {
+            0
+        };
+        let d_after_real_u32 = d_after_real.max(0) as u32;
+        let d_after_real_plus_one_u32 = (d_after_real + 1).max(0) as u32;
+
+        let mut rows = real_rows;
         rows.push(LogTraceRow {
-            opcode: 0x00, // Nop — accepted by opcode validity
+            opcode: 0x00, // Nop
             branch_taken: 0,
             goal_status: 0,
+            depth: d_after_real_u32,
+        });
+        rows.push(LogTraceRow {
+            opcode: 0x01, // GoalEnter
+            branch_taken: 0,
+            goal_status: 0,
+            depth: d_after_real_u32,
+        });
+        rows.push(LogTraceRow {
+            opcode: 0x02, // GoalExit
+            branch_taken: 1,
+            goal_status: 1,
+            depth: d_after_real_plus_one_u32,
         });
 
         let needed = rows.len().saturating_add(1).max(CFA_MIN_TRACE_LEN);
@@ -631,22 +720,29 @@ impl ControlFlowProver {
 
         let mut trace = TraceTable::new(CFA_NUM_COLS, trace_len);
         let claim_hash = self.claim_hash;
+        let pad_depth = BaseElement::new(d_after_real_u32 as u128);
+
+        let fill_state = |state: &mut [BaseElement], row_opt: Option<LogTraceRow>| {
+            let row = row_opt.unwrap_or_default();
+            state[CFA_OPCODE_COL] = BaseElement::new(row.opcode as u128);
+            state[CFA_BRANCH_COL] = BaseElement::new(row.branch_taken as u128);
+            state[CFA_STATUS_COL] = BaseElement::new(row.goal_status as u128);
+            state[CFA_CLAIM_COL] = claim_hash;
+            // Default-padding rows carry depth = d_after_real so the
+            // depth recurrence holds across the Nop tail. Real and
+            // anti-pad rows already encode their own depth.
+            state[CFA_DEPTH_COL] = if row_opt.is_some() {
+                BaseElement::new(row.depth as u128)
+            } else {
+                pad_depth
+            };
+        };
 
         trace.fill(
-            |state| {
-                let row = rows.first().copied().unwrap_or_default();
-                state[CFA_OPCODE_COL] = BaseElement::new(row.opcode as u128);
-                state[CFA_BRANCH_COL] = BaseElement::new(row.branch_taken as u128);
-                state[CFA_STATUS_COL] = BaseElement::new(row.goal_status as u128);
-                state[CFA_CLAIM_COL] = claim_hash;
-            },
+            |state| fill_state(state, rows.first().copied()),
             |step, state| {
                 let next_idx = step + 1;
-                let row = rows.get(next_idx).copied().unwrap_or_default();
-                state[CFA_OPCODE_COL] = BaseElement::new(row.opcode as u128);
-                state[CFA_BRANCH_COL] = BaseElement::new(row.branch_taken as u128);
-                state[CFA_STATUS_COL] = BaseElement::new(row.goal_status as u128);
-                state[CFA_CLAIM_COL] = claim_hash;
+                fill_state(state, rows.get(next_idx).copied());
             },
         );
         trace
@@ -990,6 +1086,7 @@ mod tests {
                 opcode: 0x99,
                 branch_taken: 0,
                 goal_status: 0,
+                depth: 0,
             }],
             "claim",
         );
@@ -1003,6 +1100,7 @@ mod tests {
                 opcode: 0x11, // If
                 branch_taken: 2,
                 goal_status: 0,
+                depth: 0,
             }],
             "claim",
         );
@@ -1011,11 +1109,15 @@ mod tests {
     #[test]
     fn control_flow_proof_rejects_invalid_goal_status() {
         // goal_status = 5 falls outside {0, 1, 2, 3}.
+        // depth = 1 because anti-pad GoalExit at row R+2 carries depth 1
+        // and we want this single-row trace's depth column to vary; but
+        // the goal_status range constraint is what fails, not depth.
         assert_bad_rows_rejected(
             vec![LogTraceRow {
                 opcode: 0x02, // GoalExit
                 branch_taken: 0,
                 goal_status: 5,
+                depth: 1,
             }],
             "claim",
         );
@@ -1027,5 +1129,83 @@ mod tests {
         let mut proof = generate_control_flow_proof(&log, "claim").unwrap();
         proof.claim_hash = proof.claim_hash.wrapping_add(1);
         assert!(verify_control_flow_proof(&proof, "claim").is_err());
+    }
+
+    // ----------------------------------------------------------------------
+    // Phase 2 Slice 6 — GOAL_ENTER/EXIT pairing
+    // ----------------------------------------------------------------------
+
+    fn balanced_goal_log() -> ExecutionLog {
+        let mut log = ExecutionLog::new();
+        log.record(LogEntry {
+            operands: Operands::GoalEnter {
+                name_hash: [9; 32],
+                audit_root: [0; 32],
+            },
+        });
+        log.record(LogEntry {
+            operands: Operands::Set {
+                name_hash: [1; 32],
+                value_hash: [2; 32],
+            },
+        });
+        log.record(LogEntry {
+            operands: Operands::GoalExit {
+                name_hash: [9; 32],
+                status: crate::runtime::exec_log::GoalStatus::Success,
+                audit_root: [3; 32],
+            },
+        });
+        log
+    }
+
+    #[test]
+    fn control_flow_proof_accepts_balanced_goal() {
+        let log = balanced_goal_log();
+        let proof = generate_control_flow_proof(&log, "balanced").unwrap();
+        verify_control_flow_proof(&proof, "balanced").unwrap();
+    }
+
+    #[test]
+    fn control_flow_proof_rejects_unmatched_goal_enter() {
+        // GoalEnter with no matching GoalExit → final depth ≠ 0.
+        let mut log = ExecutionLog::new();
+        log.record(LogEntry {
+            operands: Operands::GoalEnter {
+                name_hash: [9; 32],
+                audit_root: [0; 32],
+            },
+        });
+        log.record(LogEntry {
+            operands: Operands::Set {
+                name_hash: [1; 32],
+                value_hash: [2; 32],
+            },
+        });
+        let trace = LogTrace::from(&log);
+        assert_bad_rows_rejected(trace.rows, "claim");
+    }
+
+    #[test]
+    fn control_flow_proof_rejects_extra_goal_exit() {
+        // GoalExit with no matching GoalEnter → final depth ≠ 0
+        // (depth would have to go negative through the trace, but
+        // boundary at last row catches the cumulative imbalance).
+        let mut log = ExecutionLog::new();
+        log.record(LogEntry {
+            operands: Operands::Set {
+                name_hash: [1; 32],
+                value_hash: [2; 32],
+            },
+        });
+        log.record(LogEntry {
+            operands: Operands::GoalExit {
+                name_hash: [9; 32],
+                status: crate::runtime::exec_log::GoalStatus::Success,
+                audit_root: [3; 32],
+            },
+        });
+        let trace = LogTrace::from(&log);
+        assert_bad_rows_rejected(trace.rows, "claim");
     }
 }
