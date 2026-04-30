@@ -75,18 +75,6 @@ inline.
   serialization-stable across versions, and lets dogfooding be per-call
   rather than per-build. Revisit before flipping the default.
 
-Slice ledger (commits on `security-hardening-1`):
-
-- `9dbd2af` — ExecutionLog + 7 statement types wired (Phase 1)
-- `1a923f7` — Call/Delegate/UseWasm wired (Phase 1 finish)
-- `a6d90c2` — Log bound into Prove digest (Slices 1+2)
-- `756bbc4` — `LogTrace` builder (Slice 3)
-- `6037933` — `ControlFlowAir` + constraints 1–4 (Slice 4)
-- `bc25b34` — Wired into `Statement::Prove` (Slice 5)
-- `4e92970` — GOAL_ENTER/EXIT pairing (Slice 6)
-- `0319f47` — IF branch-selector binding (Slice 7)
-- `77354db` — End-to-end nested round-trip test (Slice 8)
-
 ### Phase 3 — Memory commitment + REMEMBER/RECALL lookup ⏳
 
 **Not started. Highest schedule risk in the roadmap.**
