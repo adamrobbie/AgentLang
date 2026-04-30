@@ -3510,6 +3510,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prove_goal_if_else_round_trips_through_reveal() {
+        // Phase 2 Slice 8: end-to-end nested control-flow round-trip.
+        // Shape: Prove { Goal { If(true) { Set yes } else { Set no } } }
+        // Expected log: GoalEnter → If(branch_taken=true) → Set → GoalExit
+        // Both the STARK digest proof and the ControlFlowAir proof must
+        // verify cleanly through Statement::Reveal.
+        use super::exec_log::{Opcode, Operands};
+        let _guard = ractor_test_guard().await;
+        ensure_ractor_started();
+
+        let ctx = Context::new();
+        let inner_if = Statement::If {
+            condition: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))),
+            then_branch: vec![Statement::Set {
+                variable: "branch".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Text(
+                    "yes".to_string(),
+                ))),
+            }],
+            else_branch: Some(vec![Statement::Set {
+                variable: "branch".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Text(
+                    "no".to_string(),
+                ))),
+            }]),
+        };
+        let goal = Statement::Goal {
+            name: "decide".to_string(),
+            body: vec![inner_if],
+            outputs: vec![],
+            result_into: None,
+            retry: None,
+            on_fail: HashMap::new(),
+            deadline: None,
+            wait: None,
+            idempotent: false,
+            audit_trail: true,
+            confirm_with: None,
+            timeout_confirmation: None,
+            fallback: None,
+        };
+        let prove = Statement::Prove {
+            statements: vec![goal],
+            claim: "decision".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&prove, ctx.clone()).await.unwrap();
+
+        // Check the recorded log shape: GoalEnter, If(branch_taken=true),
+        // Set, GoalExit — in that order.
+        {
+            let logs = ctx.exec_logs.lock().unwrap();
+            let log = logs.get("p").expect("log stored under proof_name");
+            let opcodes: Vec<Opcode> = log.entries().iter().map(|e| e.opcode()).collect();
+            assert_eq!(
+                opcodes,
+                vec![Opcode::GoalEnter, Opcode::If, Opcode::Set, Opcode::GoalExit],
+                "expected nested Goal/If/Set/GoalExit log shape"
+            );
+            let if_entry = log
+                .entries()
+                .iter()
+                .find(|e| matches!(e.operands, Operands::If { .. }))
+                .unwrap();
+            match if_entry.operands {
+                Operands::If { branch_taken, .. } => {
+                    assert!(branch_taken, "true literal selects then-branch");
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        // CF proof must be present and bound to the same claim.
+        {
+            let proofs = ctx.proofs.lock().unwrap();
+            let proof = proofs.get("p").expect("proof stored");
+            let cf = proof
+                .control_flow
+                .as_ref()
+                .expect("CF proof present for non-empty log");
+            assert_eq!(cf.claim_hash, proof.claim_hash);
+        }
+
+        // Round-trip: Reveal must verify both the STARK digest AND the
+        // attached control-flow proof.
+        let reveal = Statement::Reveal {
+            proof_name: "p".to_string(),
+            claim: "decision".to_string(),
+            to_agent: None,
+            result_into: None,
+        };
+        eval(&reveal, ctx.clone())
+            .await
+            .expect("Reveal must verify a well-formed nested CF proof");
+    }
+
+    #[tokio::test]
     async fn reveal_rejects_tampered_control_flow_proof() {
         // Tamper with CF claim_hash post-Prove; Reveal must fail.
         let ctx = Context::new();
