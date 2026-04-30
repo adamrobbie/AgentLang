@@ -510,6 +510,7 @@ const CFA_MIN_TRACE_LEN: usize = 8;
 
 const OPCODE_GOAL_ENTER: u128 = 0x01;
 const OPCODE_GOAL_EXIT: u128 = 0x02;
+const OPCODE_IF: u128 = 0x11;
 
 /// Lagrange indicator polynomial that is 1 at `target` and 0 at every
 /// other valid opcode. Degree 10 over the 11-element opcode alphabet.
@@ -557,12 +558,14 @@ impl Air for ControlFlowAir {
         //   goal_status range: x*(x-1)*(x-2)*(x-3)         → degree 4
         //   claim_hash carry: next - current               → degree 1
         //   depth recurrence: degree-10 indicator polys    → degree 10
+        //   branch-IF binding: branch_taken*(opcode-IF)    → degree 2
         let degrees = vec![
             winterfell::TransitionConstraintDegree::new(11),
             winterfell::TransitionConstraintDegree::new(2),
             winterfell::TransitionConstraintDegree::new(4),
             winterfell::TransitionConstraintDegree::new(1),
             winterfell::TransitionConstraintDegree::new(10),
+            winterfell::TransitionConstraintDegree::new(2),
         ];
         // Three boundary assertions:
         //   - claim_hash at row 0 binds the trace to the claim
@@ -626,6 +629,12 @@ impl Air for ControlFlowAir {
         let i_enter = opcode_indicator(opcode, OPCODE_GOAL_ENTER);
         let i_exit = opcode_indicator(opcode, OPCODE_GOAL_EXIT);
         result[4] = next[CFA_DEPTH_COL] - cur[CFA_DEPTH_COL] - i_enter + i_exit;
+
+        // 6) Branch-IF binding: branch_taken=1 only on IF rows. Combined
+        //    with constraint 2 (branch_taken ∈ {0,1}), this rules out a
+        //    prover claiming `branch_taken=1` on (e.g.) a Set or Remember
+        //    row to forge a witness-driven branch decision elsewhere.
+        result[5] = bt * (opcode - E::from(BaseElement::new(OPCODE_IF)));
     }
 
     fn context(&self) -> &AirContext<Self::BaseField> {
@@ -649,28 +658,45 @@ impl ControlFlowProver {
     }
 
     fn build_trace(&self) -> TraceTable<BaseElement> {
-        // The trace gets three appended "anti-padding" rows after the
+        // The trace gets five appended "anti-padding" rows after the
         // real ones, then default Nop rows out to a power-of-two length.
         //
         // Anti-pad layout (in order):
         //   row R    : Nop, branch=0, status=0
-        //              — drives branch/status column variation against
-        //                the (1, 1) values used in `LogTraceRow::default`.
-        //   row R+1  : GoalEnter, branch=0, status=0
+        //   row R+1  : IF, branch=1, status=0
+        //              — drives branch_taken=1 variation at depth d.
+        //   row R+2  : GoalEnter, branch=0, status=0
         //              — depth column rises by 1 here.
-        //   row R+2  : GoalExit, branch=1, status=1
-        //              — depth column falls back; combined with row R+1
-        //                this guarantees the depth column has at least
-        //                one 0 and one 1 across any trace, so its
-        //                constraint quotient reaches the declared degree.
+        //   row R+3  : IF, branch=1, status=0
+        //              — drives a SECOND branch_taken=1 at depth d+1.
+        //                The two IFs sit at different positions whose
+        //                offsets keep the branch column from collapsing
+        //                to an even-symmetric polynomial on the
+        //                multiplicative subgroup (f(g^k) = f(g^(k+N/2)))
+        //                for the small-real-row traces where padding to
+        //                a power of two would otherwise pair the real
+        //                If's br=1 with the anti-pad IF's br=1 at
+        //                exactly the N/2 offset.
+        //   row R+4  : GoalExit, branch=0, status=3 (Timeout)
+        //              — drives goal_status≠0 variation and brings depth
+        //                back to its pre-anti-pad value. We use status=3
+        //                rather than 1 so the gs column escapes
+        //                even-symmetry on the multiplicative subgroup
+        //                (i.e. f(g^k) ≠ f(g^(k+N/2))) for short balanced
+        //                traces where the only real GoalExit also carries
+        //                status=1 — otherwise the gs column polynomial
+        //                collapses to degree (N/2 − 1) and winterfell's
+        //                degree-4 gs-range constraint quotient comes up
+        //                short of the expected bound.
         //
-        // After the anti-pad sequence, depth has cycled through
-        // [d_after_real, d_after_real, d_after_real+1] and lands back at
-        // `d_after_real`. Default-padding rows carry `depth =
-        // d_after_real`, satisfying the recurrence (Nop is depth-neutral)
-        // *and* exposing balance failures: the depth-at-last-row boundary
-        // assertion checks for 0, so any d_after_real ≠ 0 (i.e., real
-        // rows had unmatched GoalEnter/Exit) triggers verifier rejection.
+        // Both IFs are valid under Slice 7's binding constraint
+        // `branch_taken * (opcode - IF) = 0`. After the anti-pad
+        // sequence, depth lands back at `d_after_real`. Default-padding
+        // rows carry `depth = d_after_real`, satisfying the recurrence
+        // (Nop is depth-neutral) *and* exposing balance failures: the
+        // depth-at-last-row boundary assertion checks for 0, so any
+        // d_after_real ≠ 0 (i.e., real rows had unmatched
+        // GoalEnter/Exit) triggers verifier rejection.
 
         let real_rows = self.rows.clone();
 
@@ -699,15 +725,27 @@ impl ControlFlowProver {
             depth: d_after_real_u32,
         });
         rows.push(LogTraceRow {
+            opcode: 0x11, // IF #1 — branch_taken=1 at depth d (pre-GoalEnter)
+            branch_taken: 1,
+            goal_status: 0,
+            depth: d_after_real_u32,
+        });
+        rows.push(LogTraceRow {
             opcode: 0x01, // GoalEnter
             branch_taken: 0,
             goal_status: 0,
             depth: d_after_real_u32,
         });
         rows.push(LogTraceRow {
-            opcode: 0x02, // GoalExit
+            opcode: 0x11, // IF #2 — branch_taken=1 at depth d+1 (post-GoalEnter)
             branch_taken: 1,
-            goal_status: 1,
+            goal_status: 0,
+            depth: d_after_real_plus_one_u32,
+        });
+        rows.push(LogTraceRow {
+            opcode: 0x02, // GoalExit
+            branch_taken: 0,
+            goal_status: 3, // Timeout — chosen to break gs column even-symmetry
             depth: d_after_real_plus_one_u32,
         });
 
@@ -1184,6 +1222,38 @@ mod tests {
         });
         let trace = LogTrace::from(&log);
         assert_bad_rows_rejected(trace.rows, "claim");
+    }
+
+    #[test]
+    fn control_flow_proof_rejects_branch_taken_on_non_if_opcode() {
+        // Slice 7: branch_taken=1 is only meaningful for IF rows.
+        // A prover claiming branch_taken=1 on (e.g.) a Set row must
+        // be rejected — the AIR's binding constraint
+        //     branch_taken * (opcode - IF) = 0
+        // makes this impossible to verify.
+        assert_bad_rows_rejected(
+            vec![LogTraceRow {
+                opcode: 0x10, // Set, not IF
+                branch_taken: 1,
+                goal_status: 0,
+                depth: 0,
+            }],
+            "claim",
+        );
+    }
+
+    #[test]
+    fn control_flow_proof_accepts_if_with_branch_taken_one() {
+        // Slice 7: legitimate IF(true) row passes.
+        let mut log = ExecutionLog::new();
+        log.record(LogEntry {
+            operands: Operands::If {
+                cond_hash: [9; 32],
+                branch_taken: true,
+            },
+        });
+        let proof = generate_control_flow_proof(&log, "if-true").unwrap();
+        verify_control_flow_proof(&proof, "if-true").unwrap();
     }
 
     #[test]

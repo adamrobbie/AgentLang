@@ -185,22 +185,19 @@ pub struct LogTraceRow {
 }
 
 impl Default for LogTraceRow {
-    /// Padding row used to extend a trace to power-of-two length. Values
-    /// are picked so that every column has at least two distinct values
-    /// across any non-empty trace — winterfell's prover rejects traces
-    /// whose constraint quotient polynomials are degenerate (constant
-    /// zero), which happens whenever a column never varies. We pin
-    /// `opcode = Nop` (still in the valid set) but use `branch_taken = 1`
-    /// and `goal_status = 1` so columns for those witnesses vary against
-    /// the all-zero values typical of Set/Remember/Recall rows. `depth`
-    /// stays at 0 — Slice 6's depth boundary requires the final padded
-    /// row to carry depth 0, and Nop padding is depth-neutral. All
-    /// transition constraints accept these padding values.
+    /// Padding row used to extend a trace to power-of-two length. All
+    /// fields are zero except the Nop opcode. Column variation across
+    /// the trace is driven by the anti-pad sequence in
+    /// `ControlFlowProver::build_trace` (one Nop, GoalEnter, If,
+    /// GoalExit row); padding need not contribute. Pinning
+    /// branch_taken/goal_status to 0 keeps the Slice 7 binding
+    /// constraint `branch_taken * (opcode - IF) = 0` trivially
+    /// satisfied on padding rows.
     fn default() -> Self {
         Self {
             opcode: Opcode::Nop as u8,
-            branch_taken: 1,
-            goal_status: 1,
+            branch_taken: 0,
+            goal_status: 0,
             depth: 0,
         }
     }
@@ -1125,14 +1122,14 @@ mod tests {
     }
 
     #[test]
-    fn log_trace_row_default_is_valid_padding() {
-        // Padding rows must (a) carry a valid opcode (Nop) and (b) have
-        // witness values that drive column variation so the AIR's
-        // constraint quotient polynomials reach their declared degree.
-        // See `Default for LogTraceRow` for the rationale.
+    fn log_trace_row_default_is_zero_nop() {
+        // Padding rows are all-zero with a Nop opcode. Column variation
+        // is provided by the AIR's anti-pad sequence, not by padding
+        // defaults — see `Default for LogTraceRow` and Slice 7.
         let row = LogTraceRow::default();
         assert_eq!(row.opcode, Opcode::Nop as u8);
-        assert_eq!(row.branch_taken, 1, "padding must drive branch column variation");
-        assert_eq!(row.goal_status, 1, "padding must drive status column variation");
+        assert_eq!(row.branch_taken, 0);
+        assert_eq!(row.goal_status, 0);
+        assert_eq!(row.depth, 0);
     }
 }
