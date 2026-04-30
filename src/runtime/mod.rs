@@ -4353,4 +4353,92 @@ mod tests {
         // {"Object": {"city": {"value": {"Text": "Paris"}, ...}}}
         assert_eq!(parsed["Object"]["city"]["value"]["Text"], serde_json::json!("Paris"));
     }
+
+    // ----------------------------------------------------------------------
+    // Phase 2 Slice 2 — Prove digest binds the execution log
+    //
+    // After Slice 2, two Prove blocks that arrive at the same final state
+    // via different statement traces must produce *different* state_digests.
+    // The AIR consumes (state_bytes ++ canonical_log_bytes), so a divergent
+    // log path is observable in the proof.
+    // ----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn prove_digest_binds_execution_path_not_just_final_state() {
+        let mk_proof = |stmts: Vec<Statement>| async move {
+            let ctx = Context::new();
+            let stmt = Statement::Prove {
+                statements: stmts,
+                claim: "x_is_two".to_string(),
+                proof_name: "p".to_string(),
+            };
+            eval(&stmt, ctx.clone()).await.unwrap();
+            let proofs = ctx.proofs.lock().unwrap();
+            proofs.get("p").cloned().expect("proof stored")
+        };
+
+        // Path A: x := 1 then x := 2 — log has 2 Set entries.
+        let proof_a = mk_proof(vec![
+            Statement::Set {
+                variable: "x".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+            },
+            Statement::Set {
+                variable: "x".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Number(2.0))),
+            },
+        ])
+        .await;
+
+        // Path B: x := 2 directly — log has 1 Set entry.
+        let proof_b = mk_proof(vec![Statement::Set {
+            variable: "x".to_string(),
+            value: Expression::Literal(AnnotatedValue::from(Value::Number(2.0))),
+        }])
+        .await;
+
+        // Both reach the same final working state (x = 2.0), so under the
+        // pre-Phase-2 AIR the digests would match. Phase 2 must distinguish.
+        assert_ne!(
+            proof_a.state_digest, proof_b.state_digest,
+            "two Prove paths reaching the same final state must produce \
+             distinct digests once the log is bound into the AIR input"
+        );
+
+        // Both must still verify on their own claim — Phase 2 doesn't break
+        // the AIR's existing soundness, it just enriches what's bound.
+        crate::crypto::verify_proof(&proof_a, "x_is_two").unwrap();
+        crate::crypto::verify_proof(&proof_b, "x_is_two").unwrap();
+    }
+
+    #[tokio::test]
+    async fn prove_digest_changes_when_log_changes_even_with_empty_state() {
+        // No Set statements in either Prove → both leave working state
+        // unchanged. Path A logs an If(true, then-empty); Path B logs nothing.
+        // After Slice 2 the digests must differ on log_bytes alone.
+        let mk_proof = |stmts: Vec<Statement>| async move {
+            let ctx = Context::new();
+            let stmt = Statement::Prove {
+                statements: stmts,
+                claim: "control_flow_only".to_string(),
+                proof_name: "p".to_string(),
+            };
+            eval(&stmt, ctx.clone()).await.unwrap();
+            let proofs = ctx.proofs.lock().unwrap();
+            proofs.get("p").cloned().expect("proof stored")
+        };
+
+        let with_if = mk_proof(vec![Statement::If {
+            condition: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))),
+            then_branch: vec![],
+            else_branch: None,
+        }])
+        .await;
+        let empty = mk_proof(vec![]).await;
+
+        assert_ne!(
+            with_if.state_digest, empty.state_digest,
+            "log differences alone (no state mutation) must change the digest"
+        );
+    }
 }

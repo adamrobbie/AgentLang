@@ -1114,22 +1114,31 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 eval(stmt, ctx.clone()).await?;
             }
 
-            if let Some(log) = ctx
+            let log = ctx
                 .exec_log
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
-            {
-                ctx.exec_logs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(proof_name.clone(), log);
-            }
+                .unwrap_or_default();
 
-            // The trace consumes these bytes one at a time; tampering with
-            // any byte changes the polynomial digest in the proof.
+            // Phase 2: the AIR's polynomial digest now consumes both the
+            // post-execution state bytes AND the canonical execution log.
+            // The 8-byte big-endian state length prefix makes the boundary
+            // unambiguous so two (state, log) pairs cannot encode to the
+            // same byte stream by chance.
             let state_bytes = build_state_bytes(&ctx);
-            let proof = crypto::generate_proof(&state_bytes, claim)?;
+            let log_bytes = log.canonical_bytes();
+            let mut combined = Vec::with_capacity(8 + state_bytes.len() + log_bytes.len());
+            combined.extend_from_slice(&(state_bytes.len() as u64).to_be_bytes());
+            combined.extend_from_slice(&state_bytes);
+            combined.extend_from_slice(&log_bytes);
+
+            let proof = crypto::generate_proof(&combined, claim)?;
+
+            ctx.exec_logs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(proof_name.clone(), log);
             ctx.proofs
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
