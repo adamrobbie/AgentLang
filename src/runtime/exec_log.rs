@@ -163,6 +163,60 @@ impl ExecutionLog {
     }
 }
 
+/// One row of the Phase 2 AIR trace. The AIR consumes one row per
+/// `LogEntry`; constraints fire selector-style based on `opcode`.
+///
+/// `branch_taken` and `goal_status` surface the two control-flow witnesses
+/// the constraint families need without parsing the canonical-byte stream.
+/// Every other operand stays bound through the polynomial digest recurrence.
+///
+/// Default = Nop row with zero witnesses, used for trace padding to a
+/// power-of-two length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogTraceRow {
+    pub opcode: u8,
+    pub branch_taken: u8,
+    pub goal_status: u8,
+}
+
+impl Default for LogTraceRow {
+    fn default() -> Self {
+        Self {
+            opcode: Opcode::Nop as u8,
+            branch_taken: 0,
+            goal_status: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogTrace {
+    pub rows: Vec<LogTraceRow>,
+}
+
+impl From<&ExecutionLog> for LogTrace {
+    fn from(log: &ExecutionLog) -> Self {
+        let rows = log
+            .entries()
+            .iter()
+            .map(|entry| {
+                let opcode = entry.opcode() as u8;
+                let (branch_taken, goal_status) = match &entry.operands {
+                    Operands::If { branch_taken, .. } => (if *branch_taken { 1 } else { 0 }, 0),
+                    Operands::GoalExit { status, .. } => (0, *status as u8),
+                    _ => (0, 0),
+                };
+                LogTraceRow {
+                    opcode,
+                    branch_taken,
+                    goal_status,
+                }
+            })
+            .collect();
+        LogTrace { rows }
+    }
+}
+
 fn scope_byte(scope: MemoryScope) -> u8 {
     // Stable scope-byte assignment. Pinned by tests; bump proof_version
     // before reordering. See docs/zkp/01-per-statement-airs.md.
@@ -886,5 +940,167 @@ mod tests {
             operands: Operands::Nop,
         });
         assert_eq!(log.canonical_bytes(), vec![Opcode::Nop as u8]);
+    }
+
+    // ----------------------------------------------------------------------
+    // Phase 2 Slice 3 — LogTrace (opcode-row trace + control-flow witnesses)
+    //
+    // The Phase 2 AIR consumes one row per LogEntry. Beyond the opcode
+    // column, two witness columns surface control-flow facts that the AIR
+    // constrains directly:
+    //   - branch_taken: 0/1 on If rows, 0 elsewhere
+    //   - goal_status: GoalStatus byte on GoalExit rows, 0 elsewhere
+    // Operand hashes stay bound through the canonical-byte digest recurrence;
+    // no need to surface them as columns yet.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn log_trace_from_empty_log_has_no_rows() {
+        let log = ExecutionLog::new();
+        let trace = LogTrace::from(&log);
+        assert!(trace.rows.is_empty());
+    }
+
+    #[test]
+    fn log_trace_has_one_row_per_entry() {
+        let mut log = ExecutionLog::new();
+        log.record(set_entry(1, 2));
+        log.record(set_entry(3, 4));
+        log.record(LogEntry {
+            operands: Operands::Nop,
+        });
+        let trace = LogTrace::from(&log);
+        assert_eq!(trace.rows.len(), 3);
+    }
+
+    #[test]
+    fn log_trace_opcode_column_matches_entry_opcode() {
+        let mut log = ExecutionLog::new();
+        log.record(LogEntry {
+            operands: Operands::GoalEnter {
+                name_hash: h(1),
+                audit_root: h(2),
+            },
+        });
+        log.record(set_entry(3, 4));
+        log.record(LogEntry {
+            operands: Operands::GoalExit {
+                name_hash: h(1),
+                status: GoalStatus::Success,
+                audit_root: h(5),
+            },
+        });
+        let trace = LogTrace::from(&log);
+        assert_eq!(trace.rows[0].opcode, Opcode::GoalEnter as u8);
+        assert_eq!(trace.rows[1].opcode, Opcode::Set as u8);
+        assert_eq!(trace.rows[2].opcode, Opcode::GoalExit as u8);
+    }
+
+    #[test]
+    fn log_trace_if_row_carries_branch_taken_witness() {
+        let mut log = ExecutionLog::new();
+        log.record(LogEntry {
+            operands: Operands::If {
+                cond_hash: h(1),
+                branch_taken: true,
+            },
+        });
+        log.record(LogEntry {
+            operands: Operands::If {
+                cond_hash: h(2),
+                branch_taken: false,
+            },
+        });
+        let trace = LogTrace::from(&log);
+        assert_eq!(trace.rows[0].branch_taken, 1);
+        assert_eq!(trace.rows[1].branch_taken, 0);
+    }
+
+    #[test]
+    fn log_trace_branch_taken_is_zero_for_non_if_rows() {
+        let mut log = ExecutionLog::new();
+        log.record(set_entry(1, 2));
+        log.record(LogEntry {
+            operands: Operands::Recall {
+                scope: MemoryScope::LongTerm,
+                path_hash: h(3),
+                value_hash: h(4),
+            },
+        });
+        log.record(LogEntry {
+            operands: Operands::Nop,
+        });
+        let trace = LogTrace::from(&log);
+        for row in &trace.rows {
+            assert_eq!(row.branch_taken, 0, "branch_taken nonzero on non-If row");
+        }
+    }
+
+    #[test]
+    fn log_trace_goal_exit_row_carries_status_witness() {
+        let mk = |st| LogEntry {
+            operands: Operands::GoalExit {
+                name_hash: h(1),
+                status: st,
+                audit_root: h(2),
+            },
+        };
+        let mut log = ExecutionLog::new();
+        log.record(mk(GoalStatus::Success));
+        log.record(mk(GoalStatus::Failure));
+        log.record(mk(GoalStatus::Timeout));
+        let trace = LogTrace::from(&log);
+        assert_eq!(trace.rows[0].goal_status, GoalStatus::Success as u8);
+        assert_eq!(trace.rows[1].goal_status, GoalStatus::Failure as u8);
+        assert_eq!(trace.rows[2].goal_status, GoalStatus::Timeout as u8);
+    }
+
+    #[test]
+    fn log_trace_goal_status_is_zero_outside_goal_exit() {
+        let mut log = ExecutionLog::new();
+        log.record(LogEntry {
+            operands: Operands::GoalEnter {
+                name_hash: h(1),
+                audit_root: h(2),
+            },
+        });
+        log.record(set_entry(3, 4));
+        log.record(LogEntry {
+            operands: Operands::If {
+                cond_hash: h(5),
+                branch_taken: true,
+            },
+        });
+        let trace = LogTrace::from(&log);
+        for row in &trace.rows {
+            assert_eq!(
+                row.goal_status, 0,
+                "goal_status nonzero on non-GoalExit row (opcode={:#04x})",
+                row.opcode
+            );
+        }
+    }
+
+    #[test]
+    fn log_trace_preserves_record_order() {
+        let mut log = ExecutionLog::new();
+        for i in 0..5 {
+            log.record(set_entry(i, i + 100));
+        }
+        let trace = LogTrace::from(&log);
+        for row in &trace.rows {
+            assert_eq!(row.opcode, Opcode::Set as u8);
+        }
+        assert_eq!(trace.rows.len(), 5);
+    }
+
+    #[test]
+    fn log_trace_row_default_is_nop_zeroed() {
+        // Padding rows in the AIR will use Default; the default row must
+        // round-trip through opcode-validity as Nop with zero witnesses.
+        let row = LogTraceRow::default();
+        assert_eq!(row.opcode, Opcode::Nop as u8);
+        assert_eq!(row.branch_taken, 0);
+        assert_eq!(row.goal_status, 0);
     }
 }
