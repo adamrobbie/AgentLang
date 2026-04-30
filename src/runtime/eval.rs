@@ -732,6 +732,26 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 rpc_args.insert(k.clone(), format!("{:?}", val.value));
             }
 
+            // Args bytes are canonical because rpc_args is what travels in the
+            // RPC envelope; sorting keys keeps the hash insertion-order-free.
+            let mut sorted: Vec<(&String, &String)> = rpc_args.iter().collect();
+            sorted.sort_by_key(|(k, _)| k.as_str());
+            let args_bytes: Vec<u8> = sorted
+                .iter()
+                .flat_map(|(k, v)| format!("{}={}|", k, v).into_bytes())
+                .collect();
+            ctx.record_log(LogEntry {
+                operands: Operands::Delegate {
+                    callee_hash: exec_log::hash(agent_id.as_bytes()),
+                    goal_hash: exec_log::hash(goal_name.as_bytes()),
+                    args_hash: exec_log::hash(&args_bytes),
+                    // Delegate is fire-and-forget; the RPC outcome lives in
+                    // a spawned task. result_hash stays zero until Phase 4
+                    // wires a witness channel for the response.
+                    result_hash: [0u8; 32],
+                },
+            });
+
             let caller_id = ctx
                 .agent_id
                 .lock()
@@ -1205,7 +1225,32 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             let result_types: Vec<ValType> = func.ty(&store).results().collect();
             let mut results = vec![Val::I32(0); result_types.len()];
 
+            // Capture pre-call fuel and a stable byte-image of the inputs so
+            // the envelope binds (module, function, inputs, outputs, fuel)
+            // even though Wasmtime owns the actual execution off-trace.
+            let fuel_before = store.get_fuel().unwrap_or(0);
+            let input_bytes: Vec<u8> = wasm_args
+                .iter()
+                .flat_map(|v| format!("{:?}|", v).into_bytes())
+                .collect();
+
             func.call(&mut store, &wasm_args, &mut results)?;
+
+            let fuel_after = store.get_fuel().unwrap_or(0);
+            let fuel_consumed = fuel_before.saturating_sub(fuel_after);
+            let output_bytes: Vec<u8> = results
+                .iter()
+                .flat_map(|v| format!("{:?}|", v).into_bytes())
+                .collect();
+            ctx.record_log(LogEntry {
+                operands: Operands::UseWasm {
+                    module_hash: exec_log::hash(module_path.as_bytes()),
+                    function_hash: exec_log::hash(function_name.as_bytes()),
+                    input_hash: exec_log::hash(&input_bytes),
+                    output_hash: exec_log::hash(&output_bytes),
+                    fuel_consumed,
+                },
+            });
 
             let res_val = if let Some(res) = results.first() {
                 match res {
@@ -1277,6 +1322,25 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 rpc_args.insert(k.clone(), serde_json::to_string(&val)?);
                 evaluated_args.insert(k.clone(), val);
             }
+
+            // Sort by key so the args hash is independent of HashMap order.
+            let mut sorted: Vec<(&String, &String)> = rpc_args.iter().collect();
+            sorted.sort_by_key(|(k, _)| k.as_str());
+            let args_bytes: Vec<u8> = sorted
+                .iter()
+                .flat_map(|(k, v)| format!("{}={}|", k, v).into_bytes())
+                .collect();
+            ctx.record_log(LogEntry {
+                operands: Operands::Call {
+                    callee_hash: exec_log::hash(agent_id.as_bytes()),
+                    goal_hash: exec_log::hash(goal_name.as_bytes()),
+                    args_hash: exec_log::hash(&args_bytes),
+                    // Call's RPC outcome resolves on a oneshot in a spawned
+                    // task; result_hash stays zero until Phase 4 wires a
+                    // witness channel for the response.
+                    result_hash: [0u8; 32],
+                },
+            });
 
             let call_id_str = result_into
                 .as_ref()

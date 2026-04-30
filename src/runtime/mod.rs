@@ -3268,6 +3268,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prove_records_delegate_envelope() {
+        use super::exec_log::{self, Opcode, Operands};
+
+        let ctx = Context::new();
+        // Contract grants the goal_name capability so check_contracts passes.
+        let contract = Statement::Contract {
+            name: "admin".to_string(),
+            issued_by: "tester".to_string(),
+            capabilities: vec![Permission::CanUse("*".to_string())],
+            budget: None,
+            requires_confirmation: false,
+            expires: None,
+        };
+        eval(&contract, ctx.clone()).await.unwrap();
+
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Delegate {
+                agent_id: "remote_agent".to_string(),
+                goal_name: "do_thing".to_string(),
+                args: HashMap::new(),
+            }],
+            claim: "delegate".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let logs = ctx.exec_logs.lock().unwrap();
+        let log = logs.get("p").expect("log");
+        let entry = log
+            .entries()
+            .iter()
+            .find(|e| matches!(e.operands, Operands::Delegate { .. }))
+            .expect("Delegate entry");
+        assert_eq!(entry.opcode(), Opcode::Delegate);
+        match &entry.operands {
+            Operands::Delegate {
+                callee_hash,
+                goal_hash,
+                ..
+            } => {
+                assert_eq!(*callee_hash, exec_log::hash(b"remote_agent"));
+                assert_eq!(*goal_hash, exec_log::hash(b"do_thing"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prove_records_call_envelope() {
+        use super::exec_log::{self, Opcode, Operands};
+
+        let ctx = Context::new();
+        let contract = Statement::Contract {
+            name: "admin".to_string(),
+            issued_by: "tester".to_string(),
+            capabilities: vec![Permission::CanUse("*".to_string())],
+            budget: None,
+            requires_confirmation: false,
+            expires: None,
+        };
+        eval(&contract, ctx.clone()).await.unwrap();
+
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Call {
+                agent_id: "callee".to_string(),
+                goal_name: "compute".to_string(),
+                args: HashMap::new(),
+                timeout: None,
+                signed_by: None,
+                result_into: None,
+            }],
+            claim: "call".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let logs = ctx.exec_logs.lock().unwrap();
+        let log = logs.get("p").expect("log");
+        let entry = log
+            .entries()
+            .iter()
+            .find(|e| matches!(e.operands, Operands::Call { .. }))
+            .expect("Call entry");
+        assert_eq!(entry.opcode(), Opcode::Call);
+        match &entry.operands {
+            Operands::Call {
+                callee_hash,
+                goal_hash,
+                result_hash,
+                ..
+            } => {
+                assert_eq!(*callee_hash, exec_log::hash(b"callee"));
+                assert_eq!(*goal_hash, exec_log::hash(b"compute"));
+                // result_hash is a placeholder pre-Phase-4 witness wiring.
+                // The constraint in 01-per-statement-airs.md binds it later.
+                assert_eq!(*result_hash, [0u8; 32]);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prove_records_use_wasm_envelope() {
+        use super::exec_log::{self, Opcode, Operands};
+
+        let module_file = write_echo_module();
+        let ctx = Context::new();
+        let contract = Statement::Contract {
+            name: "admin".to_string(),
+            issued_by: "tester".to_string(),
+            capabilities: vec![Permission::CanUse("*".to_string())],
+            budget: None,
+            requires_confirmation: false,
+            expires: None,
+        };
+        eval(&contract, ctx.clone()).await.unwrap();
+
+        let module_path = module_file.path().to_string_lossy().to_string();
+        let stmt = Statement::Prove {
+            statements: vec![Statement::UseWasm {
+                module_path: module_path.clone(),
+                function_name: "echo".to_string(),
+                args: vec![(
+                    "msg".to_string(),
+                    Expression::Literal(AnnotatedValue::from(Value::Text("hello".to_string()))),
+                )],
+                result_into: Some(VariablePath::root("result")),
+            }],
+            claim: "wasm".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let logs = ctx.exec_logs.lock().unwrap();
+        let log = logs.get("p").expect("log");
+        let entry = log
+            .entries()
+            .iter()
+            .find(|e| matches!(e.operands, Operands::UseWasm { .. }))
+            .expect("UseWasm entry");
+        assert_eq!(entry.opcode(), Opcode::UseWasm);
+        match &entry.operands {
+            Operands::UseWasm {
+                module_hash,
+                function_hash,
+                fuel_consumed,
+                ..
+            } => {
+                assert_eq!(*module_hash, exec_log::hash(module_path.as_bytes()));
+                assert_eq!(*function_hash, exec_log::hash(b"echo"));
+                assert!(
+                    *fuel_consumed > 0,
+                    "fuel_consumed must reflect actual WASM execution"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
     async fn prove_records_forget_with_scope() {
         use super::exec_log::{Opcode, Operands};
 
