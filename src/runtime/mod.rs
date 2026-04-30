@@ -3464,6 +3464,86 @@ mod tests {
         }
     }
 
+    // --- Phase 2 Slice 5: ControlFlowAir wired into Prove ---
+
+    #[tokio::test]
+    async fn prove_emits_control_flow_proof_when_log_nonempty() {
+        // Non-empty Prove body → at least one log entry → CF proof present.
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Set {
+                variable: "x".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+            }],
+            claim: "x set".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let proofs = ctx.proofs.lock().unwrap();
+        let proof = proofs.get("p").expect("proof stored");
+        let cf = proof
+            .control_flow
+            .as_ref()
+            .expect("CF proof present for non-empty log");
+        assert!(!cf.proof.is_empty(), "CF proof bytes must be non-empty");
+        assert_eq!(cf.claim_hash, proof.claim_hash);
+    }
+
+    #[tokio::test]
+    async fn prove_omits_control_flow_proof_when_log_empty() {
+        // Empty Prove body → empty log → CF proof absent (degenerate trace).
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![],
+            claim: "nothing".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let proofs = ctx.proofs.lock().unwrap();
+        let proof = proofs.get("p").expect("proof stored");
+        assert!(
+            proof.control_flow.is_none(),
+            "no CF proof for empty log"
+        );
+    }
+
+    #[tokio::test]
+    async fn reveal_rejects_tampered_control_flow_proof() {
+        // Tamper with CF claim_hash post-Prove; Reveal must fail.
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Set {
+                variable: "x".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+            }],
+            claim: "claim".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        // Tamper: flip the CF claim_hash field.
+        {
+            let mut proofs = ctx.proofs.lock().unwrap();
+            let proof = proofs.get_mut("p").unwrap();
+            let cf = proof.control_flow.as_mut().unwrap();
+            cf.claim_hash = cf.claim_hash.wrapping_add(1);
+        }
+
+        let reveal = Statement::Reveal {
+            proof_name: "p".to_string(),
+            claim: "claim".to_string(),
+            to_agent: None,
+            result_into: None,
+        };
+        let err = eval(&reveal, ctx.clone()).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("control"),
+            "expected control-flow rejection, got: {err}"
+        );
+    }
+
     // --- Statement::Reveal ---
     #[tokio::test]
     async fn test_eval_reveal_statement() {

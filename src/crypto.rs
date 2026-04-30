@@ -297,6 +297,12 @@ pub struct StarkProof {
     /// recurrence. Deterministically derived from `claim_hash`, exposed
     /// for ergonomic verification.
     pub multiplier: u64,
+    /// Phase 2 control-flow proof — present iff the execution log
+    /// recorded at least one statement. Empty `Prove` blocks produce
+    /// digest-only envelopes (no control flow to attest to). When
+    /// present, `verify_proof` verifies it alongside the digest layer.
+    #[serde(default)]
+    pub control_flow: Option<ControlFlowProof>,
 }
 
 fn fold_to_u64(bytes: &[u8]) -> u64 {
@@ -401,6 +407,7 @@ pub fn generate_proof(state_bytes: &[u8], claim: &str) -> anyhow::Result<StarkPr
         num_state_bytes: state_bytes.len() as u64,
         trace_length: trace_length as u64,
         multiplier: multiplier.as_int() as u64,
+        control_flow: None,
     })
 }
 
@@ -444,7 +451,17 @@ pub fn verify_proof(proof_data: &StarkProof, claim: &str) -> anyhow::Result<()> 
         DefaultRandomCoin<Blake3_256<BaseElement>>,
         MerkleTree<Blake3_256<BaseElement>>,
     >(proof, pub_inputs, &min_opts)
-    .map_err(|e| anyhow::anyhow!("STARK verification failed: {}", e))
+    .map_err(|e| anyhow::anyhow!("STARK verification failed: {}", e))?;
+
+    // Phase 2: if a control-flow proof was attached, it must verify too.
+    // Absence is permitted (empty `Prove` body has no log to attest to);
+    // presence is mandatory to verify.
+    if let Some(cf) = &proof_data.control_flow {
+        verify_control_flow_proof(cf, claim)
+            .map_err(|e| anyhow::anyhow!("Control-flow verification failed: {}", e))?;
+    }
+
+    Ok(())
 }
 
 /// Computes the polynomial digest of `state_bytes` under the multiplier
@@ -589,7 +606,23 @@ impl ControlFlowProver {
     }
 
     fn build_trace(&self) -> TraceTable<BaseElement> {
-        let needed = self.rows.len().saturating_add(1).max(CFA_MIN_TRACE_LEN);
+        // Always include one "anti-padding" row directly after the real
+        // rows whose branch_taken / goal_status are the OPPOSITE of the
+        // `LogTraceRow::default()` padding. This guarantees both columns
+        // have at least one 0-valued and one 1-valued entry across the
+        // whole trace, so the constraint quotient polynomials reach
+        // their declared degrees. Without this, traces whose real rows
+        // happen to all carry branch_taken=1 (e.g., a single If(true))
+        // would yield constant-1 columns and winterfell would reject
+        // the witness as degenerate.
+        let mut rows = self.rows.clone();
+        rows.push(LogTraceRow {
+            opcode: 0x00, // Nop — accepted by opcode validity
+            branch_taken: 0,
+            goal_status: 0,
+        });
+
+        let needed = rows.len().saturating_add(1).max(CFA_MIN_TRACE_LEN);
         let trace_len = if needed.is_power_of_two() {
             needed
         } else {
@@ -597,7 +630,6 @@ impl ControlFlowProver {
         };
 
         let mut trace = TraceTable::new(CFA_NUM_COLS, trace_len);
-        let rows = self.rows.clone();
         let claim_hash = self.claim_hash;
 
         trace.fill(

@@ -180,11 +180,20 @@ pub struct LogTraceRow {
 }
 
 impl Default for LogTraceRow {
+    /// Padding row used to extend a trace to power-of-two length. Values
+    /// are picked so that every column has at least two distinct values
+    /// across any non-empty trace — winterfell's prover rejects traces
+    /// whose constraint quotient polynomials are degenerate (constant
+    /// zero), which happens whenever a column never varies. We pin
+    /// `opcode = Nop` (still in the valid set) but use `branch_taken = 1`
+    /// and `goal_status = 1` so columns for those witnesses vary against
+    /// the all-zero values typical of Set/Remember/Recall rows. All four
+    /// transition constraints accept these padding values.
     fn default() -> Self {
         Self {
             opcode: Opcode::Nop as u8,
-            branch_taken: 0,
-            goal_status: 0,
+            branch_taken: 1,
+            goal_status: 1,
         }
     }
 }
@@ -1095,12 +1104,14 @@ mod tests {
     }
 
     #[test]
-    fn log_trace_row_default_is_nop_zeroed() {
-        // Padding rows in the AIR will use Default; the default row must
-        // round-trip through opcode-validity as Nop with zero witnesses.
+    fn log_trace_row_default_is_valid_padding() {
+        // Padding rows must (a) carry a valid opcode (Nop) and (b) have
+        // witness values that drive column variation so the AIR's
+        // constraint quotient polynomials reach their declared degree.
+        // See `Default for LogTraceRow` for the rationale.
         let row = LogTraceRow::default();
         assert_eq!(row.opcode, Opcode::Nop as u8);
-        assert_eq!(row.branch_taken, 0);
-        assert_eq!(row.goal_status, 0);
+        assert_eq!(row.branch_taken, 1, "padding must drive branch column variation");
+        assert_eq!(row.goal_status, 1, "padding must drive status column variation");
     }
 }

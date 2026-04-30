@@ -1133,7 +1133,15 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             combined.extend_from_slice(&state_bytes);
             combined.extend_from_slice(&log_bytes);
 
-            let proof = crypto::generate_proof(&combined, claim)?;
+            let mut proof = crypto::generate_proof(&combined, claim)?;
+
+            // Phase 2 Slice 5: also attest to control-flow validity (opcode
+            // set, branch_taken bool, goal_status range) when there's any
+            // recorded execution. Empty logs skip CF — the all-Nop trace
+            // is degenerate for winterfell and there's nothing to attest.
+            if !log.entries().is_empty() {
+                proof.control_flow = Some(crypto::generate_control_flow_proof(&log, claim)?);
+            }
 
             ctx.exec_logs
                 .lock()
