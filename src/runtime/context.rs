@@ -148,8 +148,11 @@ impl Context {
             Err(e) => {
                 // Don't silently regenerate — that would let a corrupted or
                 // tampered file masquerade as "first run" and orphan TOFU
-                // bindings the registry already knows.
-                panic!("Failed to load identity from '{id_file}': {e}");
+                // bindings the registry already knows. Exit cleanly rather
+                // than panic so operators see a readable message instead of
+                // a Rust backtrace prompt.
+                eprintln!("[agentlang] FATAL: failed to load identity from '{id_file}': {e}");
+                std::process::exit(1);
             }
         };
 
