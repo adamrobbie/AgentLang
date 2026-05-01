@@ -274,8 +274,28 @@ impl Prover for ExecutionProver {
 // PUBLIC API
 // ------------------------------------------------------------------------------------------------
 
+/// Wire-format version of `StarkProof`. Bumped whenever the constraint
+/// catalog or the set of public inputs changes in a way that would make
+/// an older verifier accept a proof it should reject (or vice versa).
+///
+/// Verification dispatches on this field, so older proofs keep verifying
+/// after we evolve the AIR — the dispatch entry for the older version
+/// stays alive until we drop support for it explicitly. Unknown versions
+/// are rejected outright (no "best effort" fallback).
+///
+/// History:
+/// - `1` — first explicitly versioned shape. `state_digest` polynomial
+///   binding + optional `control_flow` segment (Phase 2 control-flow AIR).
+pub const CURRENT_PROOF_VERSION: u8 = 1;
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct StarkProof {
+    /// Wire-format version. See [`CURRENT_PROOF_VERSION`] for the version
+    /// log. `#[serde(default)]` lets unversioned blobs deserialize as
+    /// version `0`, which the verifier dispatch then rejects with a clear
+    /// error rather than silently treating them as the current shape.
+    #[serde(default)]
+    pub proof_version: u8,
     /// The serialized winterfell proof bytes.
     pub proof: Vec<u8>,
     /// Full polynomial digest of post-execution state, as a 128-bit field
@@ -401,6 +421,7 @@ pub fn generate_proof(state_bytes: &[u8], claim: &str) -> anyhow::Result<StarkPr
         .map_err(|e| anyhow::anyhow!("STARK proving failed: {}", e))?;
 
     Ok(StarkProof {
+        proof_version: CURRENT_PROOF_VERSION,
         proof: proof.to_bytes(),
         state_digest: pub_inputs.state_digest.as_int(),
         claim_hash: claim_hash.as_int() as u64,
@@ -423,6 +444,17 @@ pub fn generate_proof(state_bytes: &[u8], claim: &str) -> anyhow::Result<StarkPr
 /// `proof.state_digest` against an independently-computed digest of the
 /// expected state (see `digest_state_bytes`).
 pub fn verify_proof(proof_data: &StarkProof, claim: &str) -> anyhow::Result<()> {
+    match proof_data.proof_version {
+        1 => verify_proof_v1(proof_data, claim),
+        v => Err(anyhow::anyhow!(
+            "Unsupported proof version {} (this verifier supports {})",
+            v,
+            CURRENT_PROOF_VERSION
+        )),
+    }
+}
+
+fn verify_proof_v1(proof_data: &StarkProof, claim: &str) -> anyhow::Result<()> {
     let expected_claim_hash = hash_claim(claim);
     if proof_data.claim_hash != expected_claim_hash.as_int() as u64 {
         return Err(anyhow::anyhow!("Proof was not generated for this claim"));
@@ -927,6 +959,55 @@ mod tests {
     fn proof_round_trips_for_matching_claim() {
         let proof = generate_proof(&sample_state(), "balance_above_100").unwrap();
         verify_proof(&proof, "balance_above_100").unwrap();
+    }
+
+    #[test]
+    fn fresh_proof_carries_current_version() {
+        let proof = generate_proof(&sample_state(), "claim").unwrap();
+        assert_eq!(proof.proof_version, CURRENT_PROOF_VERSION);
+    }
+
+    #[test]
+    fn verify_rejects_unversioned_proof() {
+        // Simulates a blob deserialized from an older shape with no
+        // `proof_version` field — `#[serde(default)]` lands it at 0.
+        let mut proof = generate_proof(&sample_state(), "claim").unwrap();
+        proof.proof_version = 0;
+        let err = verify_proof(&proof, "claim").unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported proof version 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_future_version() {
+        let mut proof = generate_proof(&sample_state(), "claim").unwrap();
+        proof.proof_version = 99;
+        let err = verify_proof(&proof, "claim").unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported proof version 99"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn unversioned_proof_round_trips_through_serde() {
+        // The on-disk shape may legitimately omit the field for old proofs;
+        // serde must accept that and the verifier must then reject on
+        // version dispatch — this catches the case where a future field
+        // rename accidentally drops `#[serde(default)]`.
+        let json = r#"{
+            "proof": [],
+            "state_digest": 0,
+            "claim_hash": 0,
+            "num_state_bytes": 0,
+            "trace_length": 0,
+            "multiplier": 0,
+            "control_flow": null
+        }"#;
+        let parsed: StarkProof = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.proof_version, 0);
     }
 
     #[test]

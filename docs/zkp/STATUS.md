@@ -73,11 +73,11 @@ forward constraint into Phase 3+:
 - **`StarkProof.control_flow: Option<ControlFlowProof>` runtime opt-in
   instead of build-time `per_statement_air` feature flag.** Simpler,
   serialization-stable, and lets dogfooding happen per-call.
-  *Phase 3 constraint:* there's no fast rollback for a broken Phase 3
-  CF variant short of reverting the whole field. Open question Q5
-  (`proof_version: u8` + verifier dispatch table) was scheduled for
-  Phase 4; it now needs to land with Phase 3 so we keep the option to
-  evolve constraints without breaking older proofs.
+  *Phase 3 constraint, now mitigated:* `proof_version: u8` + verifier
+  dispatch (open question Q5) was originally scheduled for Phase 4 but
+  landed early so Phase 3 can ship a v2 shape without forcing every
+  prior proof through a hard incompatibility. `CURRENT_PROOF_VERSION = 1`
+  today; Phase 3 will add a v2 entry covering `memory_root_pre/post`.
 - **5-row anti-pad to break subgroup even-symmetry.** Power-of-two
   padding to a multiplicative subgroup of size N can collapse a witness
   column to a degree-N/2 polynomial when the column happens to be
@@ -188,10 +188,12 @@ through the cracks:
   the audit_root field exists on `GoalEnter`/`GoalExit` operands but is
   not constrained across rows. Needs the SHA-256-in-AIR work (item #2)
   or a separate Schwartz-Zippel chain — decided when item #2 is staged.
-- **Proof versioning.** A `proof_version: u8` field in `StarkProof` plus
-  a verifier dispatch table is open question Q5 in the deep dive; needs
-  to ship before any constraint-catalog change that breaks older proofs.
-  Likely lands with Phase 4.
+- **Proof versioning. ✅** `StarkProof.proof_version: u8` + dispatch in
+  `verify_proof` shipped ahead of Phase 3 (open question Q5 closed).
+  `CURRENT_PROOF_VERSION = 1` today. Adding a Phase 3 shape is now a
+  matter of bumping the constant and adding a `2 => verify_proof_v2(...)`
+  arm; pre-v1 (unversioned) blobs hit the catch-all and are rejected
+  with a readable error.
 - **Empty-log degeneracy.** `ControlFlowAir` cannot prove an all-Nop
   trace (winterfell rejects the zero quotient polynomial). Today the
   runtime sidesteps this by emitting CF only when `log.entries() != []`.
