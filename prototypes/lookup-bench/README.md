@@ -86,19 +86,31 @@ will not change the headline degree number.
 
 Implemented in [`src/winterfell_lookup.rs`](src/winterfell_lookup.rs).
 
-### B. Plonky3 lookup gadget
+### B. Plonky3 running-product (single-AIR via `p3-uni-stark`)
 
-Plonky3 ships first-class LogUp lookup support via `p3-uni-stark` +
-`p3-lookup`. The trace setup is the same, but the lookup itself is a
-gadget call rather than hand-rolled column accounting.
+The original framing here was "Plonky3 LogUp gadget", but landing the
+prototype surfaced a structural issue: as of `p3-lookup = 0.5.2`,
+LogUp ships as a constraint-evaluation **gadget** that hooks into
+`PermutationAirBuilder`, not a drop-in prover. The single-AIR prover
+(`p3-uni-stark`) doesn't expose permutation challenges, and the
+multi-AIR provers that do (SP1, Valida, etc.) each maintain their own
+custom-built infrastructure rather than shipping a reusable one.
 
-Implemented in `src/plonky3_lookup.rs` *(stub for next session)*.
+So the prototype implements the **same running-product trick** as
+variant A, but in `p3-air` against `p3-uni-stark`. This gives a true
+apples-to-apples comparison of the two AIR DSLs and the two FRI
+backends. The headline number we *don't* get is "what does Plonky3
+LogUp cost end-to-end" — that's a 1–2 week engineering item on its
+own (custom multi-AIR prover plumbing) and is captured in the
+§Decision below.
+
+Implemented in [`src/plonky3_lookup.rs`](src/plonky3_lookup.rs).
 
 ## Running
 
 ```sh
 cargo run --release --bin winterfell_lookup
-cargo run --release --bin plonky3_lookup    # next session
+cargo run --release --bin plonky3_lookup
 ```
 
 Each prints a measurement table to stdout. Numbers go in §"Results" by
@@ -106,39 +118,84 @@ hand — auto-generating them is out of scope for a spike.
 
 ## Results
 
-Captured 2026-05-01 on the user's reference machine (Apple silicon,
+Captured 2026-05-05 on the user's reference machine (Apple silicon,
 release build, median of 5 prove runs).
 
-| Variant | Transition degree | Prove (N=64) | Prove (N=1024) | Prove (N=4096) | Proof size (N=1024) | Verify (N=1024) | LOC |
+| Variant | Transition degree | Prove (N=64) | Prove (N=1024) | Prove (N=4096) | Proof size (N=1024) | Verify (N=1024) | LOC (file) |
 |---|---|---|---|---|---|---|---|
-| Winterfell running product (main segment) | **2** | 0.88 ms | 13.16 ms | 57.93 ms | 35,955 B | 354 µs | ~100 |
-| Plonky3 LogUp | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ |
+| Winterfell running product (main segment, `f128`) | **2** | 0.88 ms | 13.16 ms | 57.93 ms | 35,955 B | 354 µs | 370 |
+| Plonky3 running product (`p3-uni-stark`, BabyBear) | **2** | 1.44 ms | 15.95 ms | 65.82 ms | 150,306 B | 2.43 ms | 337 |
 
-**Headline degree-budget verdict for winterfell.** With a base
-running-product transition of degree 2 and the Phase 2 Lagrange opcode
-selector contributing degree 10, the gated lookup transition lands at
-degree **12** — which fits inside the blowup-16 ceiling (max constraint
-degree 16) with **4 degrees of slack**. The aux-segment variant carries
-the same algebraic shape, so the soundness-correct version is expected
-to land at the same degree. **Verdict: viable on the current
-`blowup_factor = 16` setting; no FFT-cost doubling required.**
+**Headline degree-budget verdict.** Both variants land at transition
+degree 2. With the Phase 2 Lagrange opcode selector contributing
+degree 10, the gated lookup transition is degree **12** in either
+system — fitting the blowup-16 ceiling with **4 degrees of slack**.
+The aux-segment / soundness-correct versions of either variant carry
+the same algebraic shape and would land at the same degree. **Verdict:
+viable on the current `blowup_factor = 16` setting in both systems;
+no FFT-cost doubling required.**
 
-LOC count is the AIR struct + `evaluate_transition` + periodic-column
-setup, excluding the prover boilerplate winterfell forces every AIR to
-re-implement (the `Prover` trait impl with its associated-type tax adds
-another ~70 lines that aren't really "AIR code").
+**Performance verdict.** Winterfell wins or ties on every measured
+axis at every size we ran:
+
+- Prove time: 10–20 % faster across the board.
+- Proof size: ~4× smaller (35 KB vs 150 KB at N=1024).
+- Verify time: ~7× faster (354 µs vs 2.43 ms at N=1024).
+
+The proof-size gap is the surprise. Plausible cause: Plonky3's
+`MerkleTreeMmcs` packs `[F::Packing; 8]`-leaves with a Poseidon2
+compression, whose witness commitments are larger per query than
+winterfell's Blake3-leaved Merkle paths over `f128`. The 32-query
+config dominates the proof body in both systems, but the per-query
+overhead is much higher on Plonky3 at this trace size. The gap
+narrows as a fraction of the proof at larger N (38 % at N=4096).
+
+LOC counts are full source files (`wc -l`) including ~80 lines of
+header documentation each — comparable but not strictly "AIR DSL
+size." The pure-AIR portions are similar in both: ~30 lines for the
+constraint definition, ~50 lines for boilerplate (winterfell's `Air`
+trait + `Prover` trait, vs. Plonky3's `BaseAir` + `Air<AB>` +
+`StarkConfig` builder).
 
 ## Decision
 
-_Final decision deferred until the Plonky3 LogUp variant lands._ The
-winterfell measurement is decisive on its own terms — degree 12 with
-4 slack is fine — so the only reason to switch to Plonky3 would be a
-materially better proof time, proof size, or developer ergonomics
-profile, not a degree-budget escape hatch.
+**Stay on winterfell for Phase 3 lookup tooling.**
 
-Provisional lean as of 2026-05-01: **stay on winterfell** unless Plonky3
-turns out to be at least 3× faster on the 1024-row case or qualitatively
-simpler to wire into the existing `ControlFlowAir` infrastructure.
+Three independent reasons, any one of which would be sufficient:
 
-Either decision goes back into [`docs/zkp/STATUS.md`](../../docs/zkp/STATUS.md)
-and unblocks Phase 3 implementation.
+1. **Apples-to-apples performance favours winterfell.** On the
+   identical running-product shape, winterfell is 10–20 % faster to
+   prove, 4× smaller in proof size, and 7× faster to verify (see
+   §Results). None of those gaps are close enough to be erased by
+   parameter tuning.
+2. **Lookup-argument tooling on winterfell is first-class today.**
+   Auxiliary trace segments + verifier-supplied randomness are part
+   of the 0.13.x trait set; the soundness-correct variant of this
+   prototype is a one-day extension of what's already there.
+3. **Plonky3 LogUp is a custom-prover effort.** `p3-lookup` ships
+   the LogUp gadget but not a prover that wires it through. Building
+   one (extending `p3-uni-stark` with permutation-segment support,
+   or porting SP1's stack) is a 1–2 engineer-week item, on top of the
+   Phase 3 work itself. We'd be paying that cost to reach feature
+   parity with what winterfell aux-segments already give us.
+
+What would change this decision: a 3× prove-time gap in the *other*
+direction once both sides are running their soundness-correct
+production lookups. That's not impossible — LogUp's multiplicities
+trick can amortise multi-table lookups in ways the Schwartz-Zippel
+running product can't — but the gap would have to be very large to
+overcome the proof-size and verify-time deficits seen here.
+
+**Caveats explicitly worth re-checking when Phase 3 lands:**
+
+- Plonky3 proof-size at larger N. The 38 % gap at N=4096 is closing;
+  if a real Phase 3 Prove body runs >8 K rows, that may flip.
+- Plonky3 prove-time on multi-AIR aggregations. The single-AIR
+  comparison ignores Plonky3's strength at composing many small AIRs
+  (which is where SP1 and Valida win). If REMEMBER/RECALL ends up
+  splitting into per-statement-family AIRs (per `MEMORY.md` Phase 3
+  constraint #3), this comparison stops being load-bearing.
+
+This decision goes back into [`docs/zkp/STATUS.md`](../../docs/zkp/STATUS.md)
+Phase 3 §"Lookup-argument tooling" and unblocks Phase 3
+implementation.

@@ -64,12 +64,13 @@ forward constraint into Phase 3+:
   derives a degree-10 Lagrange polynomial over the 11-element opcode
   alphabet. Soundness: no witness gap. Cost: every opcode-gated
   constraint inherits degree 10.
-  *Phase 3 constraint:* with `blowup_factor=16` (max constraint degree
-  16), the lookup argument has only 6 degrees of headroom before we
-  have to double the blowup (doubles FFT cost). The deep dive's 2-day
-  winterfell-vs-Plonky3 prototype (Q1) must measure lookup-argument
-  *degree*, not just API ergonomics, and is now gating rather than
-  exploratory.
+  *Phase 3 constraint, now closed:* with `blowup_factor=16` (max
+  constraint degree 16), the lookup argument has only 6 degrees of
+  headroom before we have to double the blowup. The 2-day winterfell-
+  vs-Plonky3 prototype landed 2026-05-05 (see Phase 3 §"Lookup-
+  argument tooling" for results) and confirmed both candidate variants
+  land at transition degree 2 — comfortably within the 6-degree budget
+  with 4 degrees of slack. We're staying on `blowup_factor=16`.
 - **`StarkProof.control_flow: Option<ControlFlowProof>` runtime opt-in
   instead of build-time `per_statement_air` feature flag.** Simpler,
   serialization-stable, and lets dogfooding happen per-call.
@@ -105,10 +106,23 @@ Required work, per the deep-dive's §"Memory" and Phase 3 plan:
    `commit_root() -> [u8; 32]` and `prove_membership(path) -> MerkleProof`
    surface. Default candidate: sparse Merkle over (scope, path_hash) →
    value_hash; alternatives in §"Open questions" item 2.
-2. **Lookup-argument tooling.** **2-day prototype** comparing winterfell
-   auxiliary segments vs. a Plonky3 port. This is the gating decision
-   for Phase 3+. The deep dive's risk register flags this as the highest
-   schedule risk; the Phase 2 work didn't move the needle on it.
+2. **Lookup-argument tooling. ✅ Decision made 2026-05-05: winterfell
+   auxiliary segments.** The 2-day prototype lives in
+   [`prototypes/lookup-bench/`](../../prototypes/lookup-bench/).
+   Headline:
+   - Both variants land at transition degree 2, fitting the blowup-16
+     ceiling with 4 degrees of slack after the Phase 2 selector. The
+     degree-budget concern is closed.
+   - On the same running-product shape, winterfell wins on every
+     measured axis at every size: 10–20 % faster prove, 4× smaller
+     proof, 7× faster verify.
+   - Plonky3's LogUp gadget (`p3-lookup`) requires a custom multi-AIR
+     prover that doesn't ship in `p3-uni-stark` — adds 1–2 engineer-
+     weeks of plumbing on top of the Phase 3 work itself.
+   The next implementation iteration is the soundness-correct
+   auxiliary-segment version of the winterfell variant (verifier-
+   supplied randomness instead of public-table-derived challenges) —
+   estimated one engineering day on top of the prototype.
 3. **AIR constraints.** Per-row constraint families:
    - `REMEMBER`: lookup proves `(scope, path_hash) ∉ commit_root_curr`
      (or `∈` with prior value), `commit_root_next` matches the updated
@@ -126,8 +140,9 @@ Required work, per the deep-dive's §"Memory" and Phase 3 plan:
 
 **Open questions to resolve before implementation:**
 
-- Winterfell aux-segments vs Plonky3 port (deep dive Q1) — needs the
-  prototype.
+- ~~Winterfell aux-segments vs Plonky3 port (deep dive Q1) — needs the
+  prototype.~~ **Closed 2026-05-05** in favour of winterfell aux
+  segments; see prototype results above.
 - Memory commitment scheme choice — sparse Merkle by default, but
   long-term backend may prefer something else.
 - How to expose `memory_root_*` to the verifier without leaking memory
