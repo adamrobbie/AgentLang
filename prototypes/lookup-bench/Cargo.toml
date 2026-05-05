@@ -1,0 +1,18 @@
+[package]
+name = "lookup-bench"
+version = "0.0.1"
+edition = "2021"
+publish = false
+description = "Phase 3 prereq spike: winterfell aux-segment vs Plonky3 lookup-argument."
+
+[[bin]]
+name = "winterfell_lookup"
+path = "src/winterfell_lookup.rs"
+
+# Plonky3 variant lands next session.
+# [[bin]]
+# name = "plonky3_lookup"
+# path = "src/plonky3_lookup.rs"
+
+[dependencies]
+winterfell = "0.13.1"
