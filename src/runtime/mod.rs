@@ -1,18 +1,20 @@
-pub mod agent_rpc {
-    tonic::include_proto!("agent");
-}
-
-pub mod registry_rpc {
-    tonic::include_proto!("registry");
-}
+// Re-export the canonical proto modules generated in lib.rs. Generating them
+// here a second time produced parallel copies of every type, so passing a
+// `runtime::registry_rpc::GetSharedRequest` into a client built from
+// `crate::registry_rpc::RegistryServiceClient` failed `IntoRequest`.
+pub use crate::agent_rpc;
+pub use crate::registry_rpc;
 
 pub mod audit;
 pub mod call;
 pub mod context;
 pub mod eval;
+pub mod exec_log;
 pub mod goal;
 pub mod mcp;
 pub mod memory;
+pub mod memory_commit;
+pub mod secret;
 
 pub use audit::*;
 pub use call::*;
@@ -3005,6 +3007,782 @@ mod tests {
         assert!(ctx.proofs.lock().unwrap().contains_key("my_proof"));
     }
 
+    // --- ExecutionLog wiring (ZKP Phase 1) ---
+    #[tokio::test]
+    async fn prove_records_set_into_exec_log() {
+        use super::exec_log::{Opcode, Operands};
+
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Set {
+                variable: "x".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+            }],
+            claim: "x is set".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let logs = ctx.exec_logs.lock().unwrap();
+        let log = logs.get("p").expect("exec_logs[\"p\"] should be populated");
+        let setlike: Vec<&Operands> = log
+            .entries()
+            .iter()
+            .filter(|e| matches!(e.operands, Operands::Set { .. }))
+            .map(|e| &e.operands)
+            .collect();
+        assert_eq!(setlike.len(), 1, "expected exactly one Set entry");
+        assert_eq!(log.entries().last().unwrap().opcode(), Opcode::Set);
+    }
+
+    #[tokio::test]
+    async fn statements_outside_prove_dont_record() {
+        let ctx = Context::new();
+        let stmt = Statement::Set {
+            variable: "x".to_string(),
+            value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let active = ctx.exec_log.lock().unwrap();
+        assert!(active.is_none(), "exec_log must be None outside Prove");
+        let logs = ctx.exec_logs.lock().unwrap();
+        assert!(logs.is_empty(), "no completed exec_logs without a Prove");
+    }
+
+    #[tokio::test]
+    async fn exec_log_active_field_cleared_after_prove() {
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![],
+            claim: "empty".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+        assert!(
+            ctx.exec_log.lock().unwrap().is_none(),
+            "active exec_log must be cleared after Prove returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_proves_keyed_by_name() {
+        let ctx = Context::new();
+        for name in ["a", "b", "c"] {
+            let stmt = Statement::Prove {
+                statements: vec![Statement::Set {
+                    variable: "x".to_string(),
+                    value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+                }],
+                claim: name.to_string(),
+                proof_name: name.to_string(),
+            };
+            eval(&stmt, ctx.clone()).await.unwrap();
+        }
+        let logs = ctx.exec_logs.lock().unwrap();
+        assert!(logs.contains_key("a"));
+        assert!(logs.contains_key("b"));
+        assert!(logs.contains_key("c"));
+        for name in ["a", "b", "c"] {
+            assert_eq!(logs.get(name).unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn prove_records_remember_with_scope() {
+        use super::exec_log::{Opcode, Operands};
+
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Remember {
+                name: "k".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Number(7.0))),
+                scope: MemoryScope::LongTerm,
+                expires: None,
+            }],
+            claim: "remembered".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let logs = ctx.exec_logs.lock().unwrap();
+        let log = logs.get("p").expect("log");
+        let remember = log
+            .entries()
+            .iter()
+            .find(|e| matches!(e.operands, Operands::Remember { .. }))
+            .expect("Remember entry");
+        assert_eq!(remember.opcode(), Opcode::Remember);
+        match remember.operands {
+            Operands::Remember { scope, .. } => assert_eq!(scope, MemoryScope::LongTerm),
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prove_records_if_branch_taken() {
+        use super::exec_log::{Opcode, Operands};
+
+        let ctx = Context::new();
+        // Condition is `true` literal; then-branch must be marked taken.
+        let stmt = Statement::Prove {
+            statements: vec![Statement::If {
+                condition: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))),
+                then_branch: vec![Statement::Set {
+                    variable: "y".to_string(),
+                    value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+                }],
+                else_branch: None,
+            }],
+            claim: "if-true".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let logs = ctx.exec_logs.lock().unwrap();
+        let log = logs.get("p").expect("log");
+        let if_entry = log
+            .entries()
+            .iter()
+            .find(|e| matches!(e.operands, Operands::If { .. }))
+            .expect("If entry");
+        assert_eq!(if_entry.opcode(), Opcode::If);
+        match if_entry.operands {
+            Operands::If { branch_taken, .. } => assert!(branch_taken, "then-branch taken"),
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prove_records_if_branch_not_taken() {
+        use super::exec_log::Operands;
+
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![Statement::If {
+                condition: Expression::Literal(AnnotatedValue::from(Value::Boolean(false))),
+                then_branch: vec![],
+                else_branch: None,
+            }],
+            claim: "if-false".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let logs = ctx.exec_logs.lock().unwrap();
+        let log = logs.get("p").expect("log");
+        let if_entry = log
+            .entries()
+            .iter()
+            .find(|e| matches!(e.operands, Operands::If { .. }))
+            .expect("If entry");
+        match if_entry.operands {
+            Operands::If { branch_taken, .. } => {
+                assert!(!branch_taken, "branch_taken=false when condition is false")
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prove_records_goal_enter_then_body_then_exit() {
+        use super::exec_log::{GoalStatus, Opcode, Operands};
+
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Goal {
+                name: "g".to_string(),
+                body: vec![Statement::Set {
+                    variable: "x".to_string(),
+                    value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+                }],
+                outputs: vec![],
+                result_into: None,
+                retry: None,
+                on_fail: HashMap::new(),
+                deadline: None,
+                wait: None,
+                idempotent: false,
+                audit_trail: false,
+                confirm_with: None,
+                timeout_confirmation: None,
+                fallback: None,
+            }],
+            claim: "goal".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let logs = ctx.exec_logs.lock().unwrap();
+        let log = logs.get("p").expect("log");
+        let opcodes: Vec<Opcode> = log.entries().iter().map(|e| e.opcode()).collect();
+        // Phase 3e: store_goal_result emits a synthetic SET for the
+        // goal-name → result write so the trace replay's running SMT
+        // root matches `MemoryCommit::from_context` post-body. The two
+        // SETs are: body write `x = 1.0`, then `g = Object({"x": 1.0})`.
+        assert_eq!(
+            opcodes,
+            vec![
+                Opcode::GoalEnter,
+                Opcode::Set,
+                Opcode::Set,
+                Opcode::GoalExit
+            ]
+        );
+
+        match log.entries().last().unwrap().operands {
+            Operands::GoalExit { status, .. } => assert_eq!(status, GoalStatus::Success),
+            _ => panic!("expected GoalExit last"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prove_records_recall_with_scope() {
+        use super::exec_log::{Opcode, Operands};
+
+        let ctx = Context::new();
+        ctx.set_variable(
+            "x".to_string(),
+            AnnotatedValue::from(Value::Number(1.0)),
+            MemoryScope::Working,
+        )
+        .await
+        .unwrap();
+
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Recall {
+                name: "x".to_string(),
+                into_var: "y".to_string(),
+                scope: MemoryScope::Working,
+                on_missing: None,
+                fuzzy: false,
+                threshold: None,
+            }],
+            claim: "recall".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let logs = ctx.exec_logs.lock().unwrap();
+        let log = logs.get("p").expect("log");
+        let recall = log
+            .entries()
+            .iter()
+            .find(|e| matches!(e.operands, Operands::Recall { .. }))
+            .expect("Recall entry");
+        assert_eq!(recall.opcode(), Opcode::Recall);
+        match recall.operands {
+            Operands::Recall { scope, .. } => assert_eq!(scope, MemoryScope::Working),
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prove_records_delegate_envelope() {
+        use super::exec_log::{self, Opcode, Operands};
+
+        let ctx = Context::new();
+        // Contract grants the goal_name capability so check_contracts passes.
+        let contract = Statement::Contract {
+            name: "admin".to_string(),
+            issued_by: "tester".to_string(),
+            capabilities: vec![Permission::CanUse("*".to_string())],
+            budget: None,
+            requires_confirmation: false,
+            expires: None,
+        };
+        eval(&contract, ctx.clone()).await.unwrap();
+
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Delegate {
+                agent_id: "remote_agent".to_string(),
+                goal_name: "do_thing".to_string(),
+                args: HashMap::new(),
+            }],
+            claim: "delegate".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let logs = ctx.exec_logs.lock().unwrap();
+        let log = logs.get("p").expect("log");
+        let entry = log
+            .entries()
+            .iter()
+            .find(|e| matches!(e.operands, Operands::Delegate { .. }))
+            .expect("Delegate entry");
+        assert_eq!(entry.opcode(), Opcode::Delegate);
+        match &entry.operands {
+            Operands::Delegate {
+                callee_hash,
+                goal_hash,
+                ..
+            } => {
+                assert_eq!(*callee_hash, exec_log::hash(b"remote_agent"));
+                assert_eq!(*goal_hash, exec_log::hash(b"do_thing"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prove_records_call_envelope() {
+        use super::exec_log::{self, Opcode, Operands};
+
+        let ctx = Context::new();
+        let contract = Statement::Contract {
+            name: "admin".to_string(),
+            issued_by: "tester".to_string(),
+            capabilities: vec![Permission::CanUse("*".to_string())],
+            budget: None,
+            requires_confirmation: false,
+            expires: None,
+        };
+        eval(&contract, ctx.clone()).await.unwrap();
+
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Call {
+                agent_id: "callee".to_string(),
+                goal_name: "compute".to_string(),
+                args: HashMap::new(),
+                timeout: None,
+                signed_by: None,
+                result_into: None,
+            }],
+            claim: "call".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let logs = ctx.exec_logs.lock().unwrap();
+        let log = logs.get("p").expect("log");
+        let entry = log
+            .entries()
+            .iter()
+            .find(|e| matches!(e.operands, Operands::Call { .. }))
+            .expect("Call entry");
+        assert_eq!(entry.opcode(), Opcode::Call);
+        match &entry.operands {
+            Operands::Call {
+                callee_hash,
+                goal_hash,
+                result_hash,
+                ..
+            } => {
+                assert_eq!(*callee_hash, exec_log::hash(b"callee"));
+                assert_eq!(*goal_hash, exec_log::hash(b"compute"));
+                // result_hash is a placeholder pre-Phase-4 witness wiring.
+                // The constraint in 01-per-statement-airs.md binds it later.
+                assert_eq!(*result_hash, [0u8; 32]);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prove_records_use_wasm_envelope() {
+        use super::exec_log::{self, Opcode, Operands};
+
+        let module_file = write_echo_module();
+        let ctx = Context::new();
+        let contract = Statement::Contract {
+            name: "admin".to_string(),
+            issued_by: "tester".to_string(),
+            capabilities: vec![Permission::CanUse("*".to_string())],
+            budget: None,
+            requires_confirmation: false,
+            expires: None,
+        };
+        eval(&contract, ctx.clone()).await.unwrap();
+
+        let module_path = module_file.path().to_string_lossy().to_string();
+        let stmt = Statement::Prove {
+            statements: vec![Statement::UseWasm {
+                module_path: module_path.clone(),
+                function_name: "echo".to_string(),
+                args: vec![(
+                    "msg".to_string(),
+                    Expression::Literal(AnnotatedValue::from(Value::Text("hello".to_string()))),
+                )],
+                result_into: Some(VariablePath::root("result")),
+            }],
+            claim: "wasm".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let logs = ctx.exec_logs.lock().unwrap();
+        let log = logs.get("p").expect("log");
+        let entry = log
+            .entries()
+            .iter()
+            .find(|e| matches!(e.operands, Operands::UseWasm { .. }))
+            .expect("UseWasm entry");
+        assert_eq!(entry.opcode(), Opcode::UseWasm);
+        match &entry.operands {
+            Operands::UseWasm {
+                module_hash,
+                function_hash,
+                fuel_consumed,
+                ..
+            } => {
+                assert_eq!(*module_hash, exec_log::hash(module_path.as_bytes()));
+                assert_eq!(*function_hash, exec_log::hash(b"echo"));
+                assert!(
+                    *fuel_consumed > 0,
+                    "fuel_consumed must reflect actual WASM execution"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prove_records_forget_with_scope() {
+        use super::exec_log::{Opcode, Operands};
+
+        let ctx = Context::new();
+        ctx.set_variable(
+            "x".to_string(),
+            AnnotatedValue::from(Value::Number(1.0)),
+            MemoryScope::Working,
+        )
+        .await
+        .unwrap();
+
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Forget {
+                name: "x".to_string(),
+                scope: MemoryScope::Working,
+            }],
+            claim: "forget".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let logs = ctx.exec_logs.lock().unwrap();
+        let log = logs.get("p").expect("log");
+        let forget = log
+            .entries()
+            .iter()
+            .find(|e| matches!(e.operands, Operands::Forget { .. }))
+            .expect("Forget entry");
+        assert_eq!(forget.opcode(), Opcode::Forget);
+        match forget.operands {
+            Operands::Forget { scope, .. } => assert_eq!(scope, MemoryScope::Working),
+            _ => unreachable!(),
+        }
+    }
+
+    // --- Phase 2 Slice 5: ControlFlowAir wired into Prove ---
+
+    #[tokio::test]
+    async fn prove_emits_control_flow_proof_when_log_nonempty() {
+        // Non-empty Prove body → at least one log entry → CF proof present.
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Set {
+                variable: "x".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+            }],
+            claim: "x set".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let proofs = ctx.proofs.lock().unwrap();
+        let stored = proofs.get("p").expect("proof stored");
+        let proof = &stored.proof;
+        let cf = proof
+            .control_flow
+            .as_ref()
+            .expect("CF proof present for non-empty log");
+        assert!(!cf.proof.is_empty(), "CF proof bytes must be non-empty");
+        assert_eq!(cf.claim_hash, proof.claim_hash);
+    }
+
+    #[tokio::test]
+    async fn prove_omits_control_flow_proof_when_log_empty() {
+        // Empty Prove body → empty log → CF proof absent (degenerate trace).
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![],
+            claim: "nothing".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let proofs = ctx.proofs.lock().unwrap();
+        let stored = proofs.get("p").expect("proof stored");
+        assert!(
+            stored.proof.control_flow.is_none(),
+            "no CF proof for empty log"
+        );
+    }
+
+    #[tokio::test]
+    async fn prove_goal_if_else_round_trips_through_reveal() {
+        // Phase 2 Slice 8: end-to-end nested control-flow round-trip.
+        // Shape: Prove { Goal { If(true) { Set yes } else { Set no } } }
+        // Expected log: GoalEnter → If(branch_taken=true) → Set → GoalExit
+        // Both the STARK digest proof and the ControlFlowAir proof must
+        // verify cleanly through Statement::Reveal.
+        use super::exec_log::{Opcode, Operands};
+        let _guard = ractor_test_guard().await;
+        ensure_ractor_started();
+
+        let ctx = Context::new();
+        let inner_if = Statement::If {
+            condition: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))),
+            then_branch: vec![Statement::Set {
+                variable: "branch".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Text(
+                    "yes".to_string(),
+                ))),
+            }],
+            else_branch: Some(vec![Statement::Set {
+                variable: "branch".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Text(
+                    "no".to_string(),
+                ))),
+            }]),
+        };
+        let goal = Statement::Goal {
+            name: "decide".to_string(),
+            body: vec![inner_if],
+            outputs: vec![],
+            result_into: None,
+            retry: None,
+            on_fail: HashMap::new(),
+            deadline: None,
+            wait: None,
+            idempotent: false,
+            audit_trail: true,
+            confirm_with: None,
+            timeout_confirmation: None,
+            fallback: None,
+        };
+        let prove = Statement::Prove {
+            statements: vec![goal],
+            claim: "decision".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&prove, ctx.clone()).await.unwrap();
+
+        // Check the recorded log shape: GoalEnter, If(branch_taken=true),
+        // Set (body), Set (goal-result), GoalExit — in that order. The
+        // trailing Set is the synthetic store_goal_result write that
+        // pairs with the implicit working_variables mutation so trace
+        // replay's running SMT root matches `MemoryCommit::from_context`
+        // post-body (Phase 3e-rootcarry).
+        {
+            let logs = ctx.exec_logs.lock().unwrap();
+            let log = logs.get("p").expect("log stored under proof_name");
+            let opcodes: Vec<Opcode> = log.entries().iter().map(|e| e.opcode()).collect();
+            assert_eq!(
+                opcodes,
+                vec![
+                    Opcode::GoalEnter,
+                    Opcode::If,
+                    Opcode::Set,
+                    Opcode::Set,
+                    Opcode::GoalExit
+                ],
+                "expected nested Goal/If/Set/Set/GoalExit log shape"
+            );
+            let if_entry = log
+                .entries()
+                .iter()
+                .find(|e| matches!(e.operands, Operands::If { .. }))
+                .unwrap();
+            match if_entry.operands {
+                Operands::If { branch_taken, .. } => {
+                    assert!(branch_taken, "true literal selects then-branch");
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        // CF proof must be present and bound to the same claim.
+        {
+            let proofs = ctx.proofs.lock().unwrap();
+            let stored = proofs.get("p").expect("proof stored");
+            let proof = &stored.proof;
+            let cf = proof
+                .control_flow
+                .as_ref()
+                .expect("CF proof present for non-empty log");
+            assert_eq!(cf.claim_hash, proof.claim_hash);
+        }
+
+        // Round-trip: Reveal must verify both the STARK digest AND the
+        // attached control-flow proof.
+        let reveal = Statement::Reveal {
+            proof_name: "p".to_string(),
+            claim: "decision".to_string(),
+            to_agent: None,
+            result_into: None,
+        };
+        eval(&reveal, ctx.clone())
+            .await
+            .expect("Reveal must verify a well-formed nested CF proof");
+    }
+
+    #[tokio::test]
+    async fn reveal_rejects_tampered_control_flow_proof() {
+        // Tamper with CF claim_hash post-Prove; Reveal must fail.
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Set {
+                variable: "x".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+            }],
+            claim: "claim".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        // Tamper: flip the CF claim_hash field.
+        {
+            let mut proofs = ctx.proofs.lock().unwrap();
+            let stored = proofs.get_mut("p").unwrap();
+            let cf = stored.proof.control_flow.as_mut().unwrap();
+            cf.claim_hash = cf.claim_hash.wrapping_add(1);
+        }
+
+        let reveal = Statement::Reveal {
+            proof_name: "p".to_string(),
+            claim: "claim".to_string(),
+            to_agent: None,
+            result_into: None,
+        };
+        let err = eval(&reveal, ctx.clone()).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("control"),
+            "expected control-flow rejection, got: {err}"
+        );
+    }
+
+    // --- Phase 3b: memory-root envelope binding ---
+    //
+    // Verify that:
+    //   (a) generated proofs carry `proof_version = 2` and the memory-root
+    //       fields are populated with the (currently empty-SMT) roots the
+    //       runtime observed,
+    //   (b) Reveal succeeds when the prover-claimed roots match the
+    //       runtime-observed roots,
+    //   (c) Reveal rejects mismatches on either pre or post root —
+    //       runtime-side binding is the integrity gate until 3e moves it
+    //       into the AIR.
+
+    #[tokio::test]
+    async fn prove_emits_v2_envelope_with_set_induced_post_root() {
+        // Phase 3c-runtime + option (Y): SET writes to working_variables
+        // and is therefore visible to `MemoryCommit::from_context`.
+        // A Prove body that runs SET on a fresh Context must produce
+        //   pre  == empty *tree* root (no vars before SET runs)
+        //   post != empty *tree* root (the SET-written value lands in
+        //                              the SMT)
+        // and the StoredProof envelope must mirror the StarkProof
+        // envelope (3b's integrity check).
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Set {
+                variable: "x".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+            }],
+            claim: "claim".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let proofs = ctx.proofs.lock().unwrap();
+        let stored = proofs.get("p").expect("proof stored");
+        assert_eq!(stored.proof.proof_version, 2);
+        let empty_root = super::memory_commit::empty_root();
+        // Empty *tree* root is the 256-deep recurrence — explicitly
+        // *not* `[0u8; 32]`. Asserting this catches the regression
+        // where eval.rs reaches for `empty_subtree_roots()[0]` (the
+        // leaf-level empty hash) instead of the helper.
+        assert_ne!(empty_root, [0u8; 32]);
+        assert_eq!(stored.proof.memory_root_pre, empty_root);
+        assert_ne!(
+            stored.proof.memory_root_post, empty_root,
+            "SET inside Prove must drive the post-root away from empty"
+        );
+        // Envelope-integrity invariant from 3b: StarkProof and
+        // StoredProof carry the same root pair regardless of value.
+        assert_eq!(stored.memory_root_pre, stored.proof.memory_root_pre);
+        assert_eq!(stored.memory_root_post, stored.proof.memory_root_post);
+    }
+
+    #[tokio::test]
+    async fn reveal_rejects_tampered_memory_root_pre() {
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Set {
+                variable: "x".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+            }],
+            claim: "claim".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        // Tamper: flip a byte of the prover-claimed pre-root inside the
+        // StarkProof envelope. The runtime-observed root in StoredProof
+        // is unchanged, so Reveal must reject the mismatch.
+        {
+            let mut proofs = ctx.proofs.lock().unwrap();
+            let stored = proofs.get_mut("p").unwrap();
+            stored.proof.memory_root_pre[0] ^= 0xff;
+        }
+
+        let reveal = Statement::Reveal {
+            proof_name: "p".to_string(),
+            claim: "claim".to_string(),
+            to_agent: None,
+            result_into: None,
+        };
+        let err = eval(&reveal, ctx.clone()).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("pre-root"),
+            "expected memory pre-root mismatch, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reveal_rejects_tampered_memory_root_post() {
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Set {
+                variable: "x".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+            }],
+            claim: "claim".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        {
+            let mut proofs = ctx.proofs.lock().unwrap();
+            let stored = proofs.get_mut("p").unwrap();
+            stored.proof.memory_root_post[31] ^= 0xff;
+        }
+
+        let reveal = Statement::Reveal {
+            proof_name: "p".to_string(),
+            claim: "claim".to_string(),
+            to_agent: None,
+            result_into: None,
+        };
+        let err = eval(&reveal, ctx.clone()).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("post-root"),
+            "expected memory post-root mismatch, got: {err}"
+        );
+    }
+
     // --- Statement::Reveal ---
     #[tokio::test]
     async fn test_eval_reveal_statement() {
@@ -3754,4 +4532,232 @@ mod tests {
 
     // --- parser: IF ELSE branch (lines 243-245) ---
     // (parser function tests are in parser.rs)
+
+    // ──────────────────────────────────────────────────────────────────────
+    // WASM marshaling end-to-end (security audit §2.4)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Tiny WAT module with a bump allocator + an `echo` function that
+    /// returns its input pointer unchanged. Used by the marshaling tests:
+    /// AgentLang allocates memory and writes the payload, calls echo, and
+    /// then re-reads the NUL-terminated bytes from the returned pointer.
+    /// If the trailing NUL is missing, the read overflows into uninit
+    /// heap and the test fails — which is exactly what the pre-fix code
+    /// would produce.
+    const WASM_ECHO_MODULE: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (global $heap_top (mut i32) (i32.const 1024))
+          (func (export "alloc") (param $size i32) (result i32)
+            (local $ptr i32)
+            (local.set $ptr (global.get $heap_top))
+            (global.set $heap_top
+              (i32.add (global.get $heap_top) (local.get $size)))
+            (local.get $ptr))
+          (func (export "echo") (param $ptr i32) (result i32)
+            (local.get $ptr)))
+    "#;
+
+    fn write_echo_module() -> tempfile::NamedTempFile {
+        let mut f = tempfile::Builder::new()
+            .suffix(".wat")
+            .tempfile()
+            .expect("tempfile");
+        std::io::Write::write_all(&mut f, WASM_ECHO_MODULE.as_bytes()).unwrap();
+        f
+    }
+
+    #[tokio::test]
+    async fn test_wasm_string_round_trip_is_nul_terminated() {
+        let module_file = write_echo_module();
+        let ctx = Context::new();
+
+        let stmt = Statement::UseWasm {
+            module_path: module_file.path().to_string_lossy().to_string(),
+            function_name: "echo".to_string(),
+            args: vec![(
+                "msg".to_string(),
+                Expression::Literal(AnnotatedValue::from(Value::Text("hello".to_string()))),
+            )],
+            result_into: Some(VariablePath::root("result")),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let val = ctx
+            .get_variable("result", MemoryScope::Working)
+            .await
+            .unwrap();
+        // Without the trailing NUL fix, the return-side string scan would
+        // either run off into zeroed (or uninit) memory and produce
+        // "hello..." with junk, or fall back to Number(ptr).
+        assert_eq!(val.value, Value::Text("hello".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_wasm_list_marshaling_via_json() {
+        let module_file = write_echo_module();
+        let ctx = Context::new();
+
+        let list = Value::List(vec![
+            AnnotatedValue::from(Value::Number(1.0)),
+            AnnotatedValue::from(Value::Number(2.0)),
+            AnnotatedValue::from(Value::Number(3.0)),
+        ]);
+
+        let stmt = Statement::UseWasm {
+            module_path: module_file.path().to_string_lossy().to_string(),
+            function_name: "echo".to_string(),
+            args: vec![(
+                "items".to_string(),
+                Expression::Literal(AnnotatedValue::from(list)),
+            )],
+            result_into: Some(VariablePath::root("result")),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let val = ctx
+            .get_variable("result", MemoryScope::Working)
+            .await
+            .unwrap();
+        // List was JSON-encoded on the way in; echo returns the same ptr;
+        // AgentLang reads back the NUL-terminated JSON string. The point
+        // of the test is that the JSON round-trips intact.
+        let s = match val.value {
+            Value::Text(s) => s,
+            other => panic!("expected Text JSON, got {:?}", other),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
+        // Value enum is externally tagged: List(Vec<AnnotatedValue>) →
+        // {"List": [{"value": {"Number": 1.0}, ...}, ...]}
+        let items = parsed["List"].as_array().expect("List array");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["value"]["Number"], serde_json::json!(1.0));
+        assert_eq!(items[1]["value"]["Number"], serde_json::json!(2.0));
+        assert_eq!(items[2]["value"]["Number"], serde_json::json!(3.0));
+    }
+
+    #[tokio::test]
+    async fn test_wasm_object_marshaling_via_json() {
+        let module_file = write_echo_module();
+        let ctx = Context::new();
+
+        let mut fields = HashMap::new();
+        fields.insert(
+            "city".to_string(),
+            AnnotatedValue::from(Value::Text("Paris".to_string())),
+        );
+        let obj = Value::Object(fields);
+
+        let stmt = Statement::UseWasm {
+            module_path: module_file.path().to_string_lossy().to_string(),
+            function_name: "echo".to_string(),
+            args: vec![(
+                "trip".to_string(),
+                Expression::Literal(AnnotatedValue::from(obj)),
+            )],
+            result_into: Some(VariablePath::root("result")),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let val = ctx
+            .get_variable("result", MemoryScope::Working)
+            .await
+            .unwrap();
+        let s = match val.value {
+            Value::Text(s) => s,
+            other => panic!("expected Text JSON, got {:?}", other),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
+        // Externally tagged: Object(HashMap<String, AnnotatedValue>) →
+        // {"Object": {"city": {"value": {"Text": "Paris"}, ...}}}
+        assert_eq!(parsed["Object"]["city"]["value"]["Text"], serde_json::json!("Paris"));
+    }
+
+    // ----------------------------------------------------------------------
+    // Phase 2 Slice 2 — Prove digest binds the execution log
+    //
+    // After Slice 2, two Prove blocks that arrive at the same final state
+    // via different statement traces must produce *different* state_digests.
+    // The AIR consumes (state_bytes ++ canonical_log_bytes), so a divergent
+    // log path is observable in the proof.
+    // ----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn prove_digest_binds_execution_path_not_just_final_state() {
+        let mk_proof = |stmts: Vec<Statement>| async move {
+            let ctx = Context::new();
+            let stmt = Statement::Prove {
+                statements: stmts,
+                claim: "x_is_two".to_string(),
+                proof_name: "p".to_string(),
+            };
+            eval(&stmt, ctx.clone()).await.unwrap();
+            let proofs = ctx.proofs.lock().unwrap();
+            proofs.get("p").cloned().expect("proof stored").proof
+        };
+
+        // Path A: x := 1 then x := 2 — log has 2 Set entries.
+        let proof_a = mk_proof(vec![
+            Statement::Set {
+                variable: "x".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+            },
+            Statement::Set {
+                variable: "x".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Number(2.0))),
+            },
+        ])
+        .await;
+
+        // Path B: x := 2 directly — log has 1 Set entry.
+        let proof_b = mk_proof(vec![Statement::Set {
+            variable: "x".to_string(),
+            value: Expression::Literal(AnnotatedValue::from(Value::Number(2.0))),
+        }])
+        .await;
+
+        // Both reach the same final working state (x = 2.0), so under the
+        // pre-Phase-2 AIR the digests would match. Phase 2 must distinguish.
+        assert_ne!(
+            proof_a.state_digest, proof_b.state_digest,
+            "two Prove paths reaching the same final state must produce \
+             distinct digests once the log is bound into the AIR input"
+        );
+
+        // Both must still verify on their own claim — Phase 2 doesn't break
+        // the AIR's existing soundness, it just enriches what's bound.
+        crate::crypto::verify_proof(&proof_a, "x_is_two").unwrap();
+        crate::crypto::verify_proof(&proof_b, "x_is_two").unwrap();
+    }
+
+    #[tokio::test]
+    async fn prove_digest_changes_when_log_changes_even_with_empty_state() {
+        // No Set statements in either Prove → both leave working state
+        // unchanged. Path A logs an If(true, then-empty); Path B logs nothing.
+        // After Slice 2 the digests must differ on log_bytes alone.
+        let mk_proof = |stmts: Vec<Statement>| async move {
+            let ctx = Context::new();
+            let stmt = Statement::Prove {
+                statements: stmts,
+                claim: "control_flow_only".to_string(),
+                proof_name: "p".to_string(),
+            };
+            eval(&stmt, ctx.clone()).await.unwrap();
+            let proofs = ctx.proofs.lock().unwrap();
+            proofs.get("p").cloned().expect("proof stored").proof
+        };
+
+        let with_if = mk_proof(vec![Statement::If {
+            condition: Expression::Literal(AnnotatedValue::from(Value::Boolean(true))),
+            then_branch: vec![],
+            else_branch: None,
+        }])
+        .await;
+        let empty = mk_proof(vec![]).await;
+
+        assert_ne!(
+            with_if.state_digest, empty.state_digest,
+            "log differences alone (no state mutation) must change the digest"
+        );
+    }
 }

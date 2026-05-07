@@ -1,7 +1,9 @@
 use super::audit::{AuditChain, Event, format_value_safe};
+use super::exec_log;
 use super::memory::{JsonFileBackend, MemoryBackend};
-use super::registry_rpc::registry_service_client::RegistryServiceClient;
 use super::registry_rpc::{GetSharedRequest, PutSharedRequest};
+use super::secret;
+use crate::tls;
 use crate::ast::*;
 use crate::crypto;
 use anyhow::{Result, anyhow};
@@ -52,7 +54,9 @@ pub struct Context {
     pub audit_chain: Arc<Mutex<AuditChain>>,
     pub session_key: Arc<aead::LessSafeKey>,
     pub wasm_engine: Engine,
-    pub proofs: Arc<Mutex<HashMap<String, crypto::StarkProof>>>,
+    pub proofs: Arc<Mutex<HashMap<String, crypto::StoredProof>>>,
+    pub exec_log: Arc<Mutex<Option<exec_log::ExecutionLog>>>,
+    pub exec_logs: Arc<Mutex<HashMap<String, exec_log::ExecutionLog>>>,
     pub goals: Arc<Mutex<HashMap<String, GoalDefinition>>>,
     pub tools: Arc<Mutex<HashMap<String, ToolDefinition>>>,
     pub tool_handlers: Arc<Mutex<HashMap<String, ToolHandlerFn>>>,
@@ -94,17 +98,30 @@ impl Context {
         if let Ok(env_key) = std::env::var("AGENTLANG_MASTER_KEY") {
             let hash = digest::digest(&digest::SHA256, env_key.as_bytes());
             key_bytes.copy_from_slice(hash.as_ref());
-        } else if let Ok(existing_key) = fs::read(&key_file) {
-            let existing_key: Vec<u8> = existing_key;
-            if existing_key.len() == 32 {
-                key_bytes.copy_from_slice(&existing_key);
+        } else {
+            // Skip the strict-mode guard in tests: Context::new is created
+            // by many parallel tests that don't manage env vars, and the
+            // strict_mode() probe is process-global. Strict-mode behavior
+            // is exercised directly in secret::tests.
+            #[cfg(not(test))]
+            if secret::strict_mode() {
+                panic!(
+                    "AGENTLANG_REQUIRE_ENCRYPTED_KEYS is set but AGENTLANG_MASTER_KEY is unset; \
+                     refusing to fall back to plaintext session key at '{key_file}'"
+                );
+            }
+            if let Ok(existing_key) = fs::read(&key_file) {
+                let existing_key: Vec<u8> = existing_key;
+                if existing_key.len() == 32 {
+                    key_bytes.copy_from_slice(&existing_key);
+                } else {
+                    rand::rng().fill_bytes(&mut key_bytes);
+                    let _ = fs::write(key_file, key_bytes);
+                }
             } else {
                 rand::rng().fill_bytes(&mut key_bytes);
                 let _ = fs::write(key_file, key_bytes);
             }
-        } else {
-            rand::rng().fill_bytes(&mut key_bytes);
-            let _ = fs::write(key_file, key_bytes);
         }
         let unbound_key = aead::UnboundKey::new(&aead::AES_256_GCM, &key_bytes).unwrap();
 
@@ -112,25 +129,31 @@ impl Context {
         let id_file = unique_test_path("agent-id");
         #[cfg(not(test))]
         let id_file = "agent.id".to_string();
-        let identity = if let Ok(existing_id) = fs::read(&id_file) {
-            let existing_id: Vec<u8> = existing_id;
-            if existing_id.len() == 32 {
-                let bytes: [u8; 32] = existing_id.try_into().unwrap();
+        let identity = match secret::read_identity(&id_file) {
+            Ok(Some(bytes)) => {
                 let signing_key = SigningKey::from_bytes(&bytes);
                 let verifying_key = VerifyingKey::from(&signing_key);
                 Identity {
                     signing_key,
                     verifying_key,
                 }
-            } else {
+            }
+            Ok(None) => {
                 let id = Identity::generate();
-                let _ = fs::write(id_file, id.signing_key.to_bytes());
+                if let Err(e) = secret::write_identity(&id_file, &id.signing_key.to_bytes()) {
+                    eprintln!("[agentlang] WARNING: failed to persist identity: {e}");
+                }
                 id
             }
-        } else {
-            let id = Identity::generate();
-            let _ = fs::write(id_file, id.signing_key.to_bytes());
-            id
+            Err(e) => {
+                // Don't silently regenerate — that would let a corrupted or
+                // tampered file masquerade as "first run" and orphan TOFU
+                // bindings the registry already knows. Exit cleanly rather
+                // than panic so operators see a readable message instead of
+                // a Rust backtrace prompt.
+                eprintln!("[agentlang] FATAL: failed to load identity from '{id_file}': {e}");
+                std::process::exit(1);
+            }
         };
 
         let default_agent_id = hex::encode(&identity.verifying_key.to_bytes()[..4]);
@@ -183,6 +206,8 @@ impl Context {
             session_key: Arc::new(aead::LessSafeKey::new(unbound_key)),
             wasm_engine,
             proofs: Arc::new(Mutex::new(HashMap::new())),
+            exec_log: Arc::new(Mutex::new(None)),
+            exec_logs: Arc::new(Mutex::new(HashMap::new())),
             goals: Arc::new(Mutex::new(HashMap::new())),
             tools: Arc::new(Mutex::new(HashMap::new())),
             tool_handlers: Arc::new(Mutex::new(HashMap::new())),
@@ -200,6 +225,20 @@ impl Default for Context {
 }
 
 impl Context {
+    /// Append `entry` to the active execution log if one is open. No-op
+    /// outside `Statement::Prove`. Used by Phase 1 wiring; Phase 2 trace
+    /// builders will read the completed log from `exec_logs`.
+    pub fn record_log(&self, entry: exec_log::LogEntry) {
+        if let Some(log) = self
+            .exec_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            log.record(entry);
+        }
+    }
+
     pub async fn get_variable(&self, name: &str, scope: MemoryScope) -> Result<AnnotatedValue> {
         match scope {
             MemoryScope::Working => self
@@ -230,7 +269,7 @@ impl Context {
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
                 for reg_addr in registries {
-                    if let Ok(mut client) = RegistryServiceClient::connect(reg_addr).await
+                    if let Ok(mut client) = tls::connect_registry(&reg_addr).await
                         && let Ok(res) = client
                             .get_shared_state(GetSharedRequest {
                                 key: name.to_string(),
@@ -343,7 +382,7 @@ impl Context {
                     .clone();
                 let mut success = false;
                 for reg_addr in registries {
-                    if let Ok(mut client) = RegistryServiceClient::connect(reg_addr).await
+                    if let Ok(mut client) = tls::connect_registry(&reg_addr).await
                         && let Ok(res) = client
                             .put_shared_state(PutSharedRequest {
                                 key: name.clone(),

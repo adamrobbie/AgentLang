@@ -3,6 +3,7 @@ pub mod ast;
 pub mod crypto;
 pub mod parser;
 pub mod runtime;
+pub mod tls;
 
 use anyhow::Result;
 use ed25519_dalek::{Verifier, VerifyingKey};
@@ -20,7 +21,6 @@ pub mod registry_rpc {
 
 use agent_rpc::agent_service_server::{AgentService, AgentServiceServer};
 use agent_rpc::{CallRequest, CallResponse};
-use registry_rpc::registry_service_client::RegistryServiceClient;
 use registry_rpc::registry_service_server::{RegistryService, RegistryServiceServer};
 use registry_rpc::{
     GetSharedRequest, GetSharedResponse, LookupRequest, LookupResponse, PutSharedRequest,
@@ -81,14 +81,28 @@ impl RegistryService for MyRegistryService {
             ));
         }
 
+        // Trust-on-first-use: the first registration of an agent_id binds it
+        // to a public key. Re-registration with the same key is allowed (so
+        // the rightful holder can update its endpoint after a restart), but
+        // a different key is rejected — otherwise any caller with their own
+        // keypair could re-register a well-known agent_id like
+        // "PrimaryOrchestrator" and silently steer all CALL traffic to a
+        // malicious endpoint.
+        let mut agents = self.agents.lock().unwrap();
+        if let Some((_, existing_key)) = agents.get(&req.agent_id)
+            && existing_key != &req.public_key
+        {
+            return Err(Status::permission_denied(format!(
+                "Agent ID '{}' is already bound to a different public key",
+                req.agent_id
+            )));
+        }
+
         println!(
             "  [Registry] Registering agent '{}' at {}",
             req.agent_id, req.endpoint
         );
-        self.agents
-            .lock()
-            .unwrap()
-            .insert(req.agent_id, (req.endpoint, req.public_key));
+        agents.insert(req.agent_id, (req.endpoint, req.public_key));
         Ok(Response::new(RegisterResponse { success: true }))
     }
 
@@ -112,7 +126,7 @@ impl RegistryService for MyRegistryService {
         let ttl = if req.ttl == 0 { 3 } else { req.ttl };
         if ttl > 1 {
             for peer in &self.peer_registries {
-                if let Ok(mut client) = RegistryServiceClient::connect(peer.clone()).await {
+                if let Ok(mut client) = tls::connect_registry(peer).await {
                     let federated_req = LookupRequest {
                         agent_id: req.agent_id.clone(),
                         ttl: ttl - 1,
@@ -189,7 +203,7 @@ impl AgentService for MyAgentService {
 
         let mut lookup_res = None;
         for reg_addr in &self.registries {
-            if let Ok(mut client) = RegistryServiceClient::connect(reg_addr.clone()).await
+            if let Ok(mut client) = tls::connect_registry(reg_addr).await
                 && let Ok(res) = client
                     .lookup_agent(LookupRequest {
                         agent_id: req.caller_id.clone(),
@@ -300,8 +314,16 @@ impl AgentService for MyAgentService {
     }
 }
 
+fn server_builder() -> Result<Server> {
+    let mut builder = Server::builder();
+    if let Some(cfg) = tls::server_config()? {
+        builder = builder.tls_config(cfg)?;
+    }
+    Ok(builder)
+}
+
 pub async fn start_registry(service: MyRegistryService, addr: std::net::SocketAddr) -> Result<()> {
-    Server::builder()
+    server_builder()?
         .add_service(RegistryServiceServer::new(service))
         .serve(addr)
         .await?;
@@ -309,7 +331,7 @@ pub async fn start_registry(service: MyRegistryService, addr: std::net::SocketAd
 }
 
 pub async fn start_agent(service: MyAgentService, addr: std::net::SocketAddr) -> Result<()> {
-    Server::builder()
+    server_builder()?
         .add_service(AgentServiceServer::new(service))
         .serve(addr)
         .await?;
@@ -320,7 +342,107 @@ pub async fn start_agent(service: MyAgentService, addr: std::net::SocketAddr) ->
 mod tests {
     use super::*;
     use ed25519_dalek::Signer;
+    use std::fs;
     use tonic::Request;
+
+    /// Helper: pick a free port by binding to 0 then closing. There is a tiny
+    /// race window between releasing and re-binding, but for test purposes
+    /// it's fine — much safer than hardcoding a port.
+    fn pick_free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    fn clear_tls_env() {
+        unsafe {
+            std::env::remove_var("AGENTLANG_TLS_CERT");
+            std::env::remove_var("AGENTLANG_TLS_KEY");
+            std::env::remove_var("AGENTLANG_TLS_CA");
+        }
+    }
+
+    /// End-to-end: a registry started with TLS env vars set must accept a
+    /// TLS-secured `https://` registration round trip from a client that
+    /// trusts the same self-signed CA, and reject a plaintext `http://`
+    /// connection to the same port.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn registry_over_tls_round_trip() {
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.key_pair.serialize_pem();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cert_path = tmp.path().join("cert.pem");
+        let key_path = tmp.path().join("key.pem");
+        fs::write(&cert_path, &cert_pem).unwrap();
+        fs::write(&key_path, &key_pem).unwrap();
+
+        clear_tls_env();
+        unsafe {
+            std::env::set_var("AGENTLANG_TLS_CERT", &cert_path);
+            std::env::set_var("AGENTLANG_TLS_KEY", &key_path);
+            std::env::set_var("AGENTLANG_TLS_CA", &cert_path);
+        }
+
+        let port = pick_free_port();
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let registry = MyRegistryService::new();
+        tokio::spawn(async move {
+            let _ = start_registry(registry, addr).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let url = format!("https://localhost:{}", port);
+        let mut client = tls::connect_registry(&url)
+            .await
+            .expect("TLS client connect must succeed against TLS-enabled registry");
+
+        let ctx = runtime::Context::new();
+        let agent_id = "tls_agent".to_string();
+        let endpoint = "http://localhost:1".to_string();
+        let payload = format!("{}:{}", agent_id, endpoint);
+        let signature = ctx
+            .identity
+            .signing_key
+            .sign(payload.as_bytes())
+            .to_bytes()
+            .to_vec();
+
+        let res = client
+            .register_agent(Request::new(RegisterRequest {
+                agent_id: agent_id.clone(),
+                endpoint: endpoint.clone(),
+                public_key: ctx.identity.verifying_key.to_bytes().to_vec(),
+                signature,
+            }))
+            .await
+            .expect("register over TLS must succeed")
+            .into_inner();
+        assert!(res.success);
+
+        // Same registry, plaintext URL → an actual RPC must fail. (Tonic's
+        // `Endpoint::connect()` is lazy and only opens the TCP socket, so we
+        // exercise a real RPC to force the HTTP/2 negotiation against the
+        // TLS-only listener.)
+        let plaintext_url = format!("http://localhost:{}", port);
+        let mut plaintext_client = tls::connect_registry(&plaintext_url)
+            .await
+            .expect("TCP connect to a TLS server still succeeds (handshake is lazy)");
+        let lookup_res = plaintext_client
+            .lookup_agent(Request::new(LookupRequest {
+                agent_id: "anything".to_string(),
+                ttl: 0,
+            }))
+            .await;
+        assert!(
+            lookup_res.is_err(),
+            "plaintext RPC against TLS-only server must fail"
+        );
+
+        clear_tls_env();
+    }
 
     #[tokio::test]
     async fn test_registry_local_ops() {
@@ -409,6 +531,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_federated_lookup_logic() {
         let mut reg1 = MyRegistryService::new();
         let reg2 = MyRegistryService::new();
@@ -459,6 +582,108 @@ mod tests {
         assert_eq!(res.endpoint, endpoint);
     }
 
+    /// TOFU: re-registering an existing agent_id with a *different* public key
+    /// must be rejected, otherwise any holder of any keypair could hijack
+    /// well-known IDs like "PrimaryOrchestrator".
+    #[tokio::test]
+    async fn test_register_agent_rejects_pubkey_change() {
+        let registry = MyRegistryService::new();
+        let agent_id = "victim_agent".to_string();
+        let endpoint = "http://localhost:1".to_string();
+
+        let original = runtime::Context::new();
+        let payload = format!("{}:{}", agent_id, endpoint);
+        let sig = original
+            .identity
+            .signing_key
+            .sign(payload.as_bytes())
+            .to_bytes()
+            .to_vec();
+        registry
+            .register_agent(Request::new(RegisterRequest {
+                agent_id: agent_id.clone(),
+                endpoint: endpoint.clone(),
+                public_key: original.identity.verifying_key.to_bytes().to_vec(),
+                signature: sig,
+            }))
+            .await
+            .expect("first registration should succeed");
+
+        // Attacker has its own valid keypair and signs a valid payload — but
+        // for an agent_id that is already bound to someone else's key.
+        let attacker = runtime::Context::new();
+        let hijack_endpoint = "http://attacker:9".to_string();
+        let hijack_payload = format!("{}:{}", agent_id, hijack_endpoint);
+        let hijack_sig = attacker
+            .identity
+            .signing_key
+            .sign(hijack_payload.as_bytes())
+            .to_bytes()
+            .to_vec();
+        let res = registry
+            .register_agent(Request::new(RegisterRequest {
+                agent_id: agent_id.clone(),
+                endpoint: hijack_endpoint,
+                public_key: attacker.identity.verifying_key.to_bytes().to_vec(),
+                signature: hijack_sig,
+            }))
+            .await;
+        let err = res.expect_err("hijack registration must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        // Original endpoint must still resolve.
+        let lookup = registry
+            .lookup_agent(Request::new(LookupRequest {
+                agent_id,
+                ttl: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(lookup.found);
+        assert_eq!(lookup.endpoint, endpoint);
+    }
+
+    /// Same agent re-registering with the *same* public key but a new
+    /// endpoint must succeed — that's the legitimate restart-on-new-port
+    /// path and must not be blocked by the TOFU check.
+    #[tokio::test]
+    async fn test_register_agent_allows_endpoint_update_with_same_key() {
+        let registry = MyRegistryService::new();
+        let ctx = runtime::Context::new();
+        let agent_id = "mobile_agent".to_string();
+        let pub_key = ctx.identity.verifying_key.to_bytes().to_vec();
+
+        for endpoint in ["http://localhost:1", "http://localhost:2"] {
+            let payload = format!("{}:{}", agent_id, endpoint);
+            let sig = ctx
+                .identity
+                .signing_key
+                .sign(payload.as_bytes())
+                .to_bytes()
+                .to_vec();
+            registry
+                .register_agent(Request::new(RegisterRequest {
+                    agent_id: agent_id.clone(),
+                    endpoint: endpoint.to_string(),
+                    public_key: pub_key.clone(),
+                    signature: sig,
+                }))
+                .await
+                .expect("re-registration with same key must succeed");
+        }
+
+        let lookup = registry
+            .lookup_agent(Request::new(LookupRequest {
+                agent_id,
+                ttl: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(lookup.endpoint, "http://localhost:2");
+    }
+
     #[tokio::test]
     async fn test_registry_error_paths() {
         let registry = MyRegistryService::new();
@@ -497,6 +722,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_agent_service_successful_call() {
         let ctx = runtime::Context::new();
         // Register a goal
@@ -596,6 +822,7 @@ mod tests {
     /// call_goal with numeric, boolean, and text args covers the arg-parsing
     /// branches (lines 238-256 in lib.rs).
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_agent_service_call_with_typed_args() {
         let ctx = runtime::Context::new();
         {
@@ -683,8 +910,123 @@ mod tests {
         assert!(res.success);
     }
 
+    /// Proves that args sent over CallRequest are readable from inside the
+    /// goal body — not just absorbed by the parser. The goal copies the
+    /// injected `num_arg` into the variable named after the goal, which is
+    /// what the RPC handler returns to the caller.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_agent_service_args_visible_in_goal_body() {
+        use ast::{Expression, MemoryScope, Statement, VariablePath};
+
+        let ctx = runtime::Context::new();
+        {
+            let mut goals = ctx.goals.lock().unwrap();
+            goals.insert(
+                "echo_arg".to_string(),
+                ast::GoalDefinition {
+                    body: vec![Statement::Remember {
+                        // Different name from the goal so it isn't filtered
+                        // out by collect_changed_working_values.
+                        name: "captured".to_string(),
+                        value: Expression::VariableRef(VariablePath::root("num_arg")),
+                        scope: MemoryScope::Working,
+                        expires: None,
+                    }],
+                    outputs: vec![],
+                    result_into: None,
+                    retry: None,
+                    on_fail: HashMap::new(),
+                    deadline: None,
+                    wait: None,
+                    idempotent: false,
+                    audit_trail: false,
+                    confirm_with: None,
+                    timeout_confirmation: None,
+                    fallback: None,
+                },
+            );
+        }
+
+        let registry = MyRegistryService::new();
+        let caller_ctx = runtime::Context::new();
+        let caller_id = "caller_arg_visible".to_string();
+        let endpoint = "http://localhost:9".to_string();
+        let payload = format!("{}:{}", caller_id, endpoint);
+        let signature = caller_ctx
+            .identity
+            .signing_key
+            .sign(payload.as_bytes())
+            .to_bytes()
+            .to_vec();
+
+        registry
+            .register_agent(Request::new(RegisterRequest {
+                agent_id: caller_id.clone(),
+                endpoint,
+                public_key: caller_ctx.identity.verifying_key.to_bytes().to_vec(),
+                signature,
+            }))
+            .await
+            .unwrap();
+
+        let reg_addr = "http://[::1]:50117".to_string();
+        let socket_addr: std::net::SocketAddr = "[::1]:50117".parse().unwrap();
+        tokio::spawn(async move {
+            let _ = start_registry(registry, socket_addr).await;
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let service = MyAgentService {
+            ctx: ctx.clone(),
+            registries: vec![reg_addr],
+        };
+
+        let goal_name = "echo_arg".to_string();
+        let call_payload = format!("{}:{}", goal_name, caller_id);
+        let call_signature = caller_ctx
+            .identity
+            .signing_key
+            .sign(call_payload.as_bytes())
+            .to_bytes()
+            .to_vec();
+
+        let mut args = HashMap::new();
+        args.insert("num_arg".to_string(), "42".to_string());
+
+        let req = CallRequest {
+            goal_name: goal_name.clone(),
+            args,
+            caller_id,
+            signature: call_signature,
+        };
+
+        let res = service
+            .call_goal(Request::new(req))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(res.success, "goal should succeed; got: {}", res.result_json);
+
+        let returned: ast::AnnotatedValue = serde_json::from_str(&res.result_json)
+            .expect("result must deserialize as AnnotatedValue");
+        let fields = match &returned.value {
+            ast::Value::Object(f) => f,
+            other => panic!("expected Object envelope, got {:?}", other),
+        };
+        let captured = fields
+            .get("captured")
+            .expect("`captured` should be in the result envelope — body read num_arg from working scope");
+        assert_eq!(
+            captured.value,
+            ast::Value::Number(42.0),
+            "injected arg num_arg=42 must be readable inside the goal body"
+        );
+    }
+
     /// Goal body that fails should return success=false with an error payload.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_agent_service_goal_body_fails() {
         let ctx = runtime::Context::new();
         {
@@ -779,6 +1121,7 @@ mod tests {
 
     /// Caller is found in registry but goal is not registered → Status::not_found
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_agent_service_goal_not_found() {
         let ctx = runtime::Context::new(); // no goals registered
 

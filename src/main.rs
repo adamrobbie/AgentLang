@@ -26,12 +26,18 @@ enum Commands {
     Registry {
         #[arg(short, long, default_value = "50050")]
         port: u16,
+        /// Bind address (IPv4 or IPv6 literal, no brackets)
+        #[arg(short, long, default_value = "::1")]
+        bind: String,
     },
     /// Start a local agent and optionally run a script
     Agent {
         /// The port this agent will listen on
         #[arg(short, long, default_value = "50051")]
         port: u16,
+        /// Bind address (IPv4 or IPv6 literal, no brackets)
+        #[arg(short, long, default_value = "::1")]
+        bind: String,
         /// The Agent ID
         #[arg(short, long, default_value = "PrimaryOrchestrator")]
         id: String,
@@ -55,23 +61,31 @@ async fn main() -> Result<()> {
     runtime::ensure_ractor_started();
 
     match cli.command {
-        Commands::Registry { port } => run_registry(port).await?,
-        Commands::Agent { port, id, script, registry, mcp_servers } => run_agent(port, id, script, registry, mcp_servers).await?,
+        Commands::Registry { port, bind } => run_registry(port, bind).await?,
+        Commands::Agent { port, bind, id, script, registry, mcp_servers } => run_agent(port, bind, id, script, registry, mcp_servers).await?,
         Commands::Demo => run_demo().await?,
     }
 
     Ok(())
 }
 
-async fn run_registry(port: u16) -> Result<()> {
-    let addr = format!("[::1]:{}", port).parse()?;
+fn format_bind(bind: &str, port: u16) -> String {
+    if bind.contains(':') {
+        format!("[{}]:{}", bind, port)
+    } else {
+        format!("{}:{}", bind, port)
+    }
+}
+
+async fn run_registry(port: u16, bind: String) -> Result<()> {
+    let addr = format_bind(&bind, port).parse()?;
     println!("Starting Registry on {}", addr);
     let registry = MyRegistryService::new();
     start_registry(registry, addr).await?;
     Ok(())
 }
 
-async fn run_agent(port: u16, id: String, script_path: Option<String>, registry_addr: String, mcp_servers: Vec<String>) -> Result<()> {
+async fn run_agent(port: u16, bind: String, id: String, script_path: Option<String>, registry_addr: String, mcp_servers: Vec<String>) -> Result<()> {
     let ctx = runtime::Context::new();
     
     // Load MCP Servers if provided
@@ -137,22 +151,23 @@ async fn run_agent(port: u16, id: String, script_path: Option<String>, registry_
         registries: vec![registry_addr.clone()],
     };
     
-    let addr = format!("[::1]:{}", port).parse()?;
-    
+    let addr = format_bind(&bind, port).parse()?;
+    let endpoint_host = if bind.contains(':') { format!("[{}]", bind) } else { bind.clone() };
+
     let id_clone = id.clone();
     tokio::spawn(async move {
         println!("Starting Agent {} on {}", id_clone, addr);
         let _ = start_agent(service, addr).await;
     });
-    
+
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
     // Register
-    let endpoint = format!("http://[::1]:{}", port);
+    let endpoint = format!("http://{}:{}", endpoint_host, port);
     let payload = format!("{}:{}", id, endpoint);
     let signature = ctx.identity.signing_key.sign(payload.as_bytes()).to_bytes().to_vec();
 
-    let mut client = AgentLang::registry_rpc::registry_service_client::RegistryServiceClient::connect(registry_addr.clone()).await?;
+    let mut client = AgentLang::tls::connect_registry(&registry_addr).await?;
     client.register_agent(RegisterRequest {
         agent_id: id.clone(),
         endpoint,
@@ -259,11 +274,7 @@ async fn run_demo() -> Result<()> {
             .to_bytes()
             .to_vec();
 
-        let mut client =
-            AgentLang::registry_rpc::registry_service_client::RegistryServiceClient::connect(
-                registry_addr.to_string(),
-            )
-            .await?;
+        let mut client = AgentLang::tls::connect_registry(registry_addr).await?;
         client
             .register_agent(RegisterRequest {
                 agent_id: agent_id.clone(),
@@ -363,11 +374,7 @@ async fn run_demo() -> Result<()> {
             .to_bytes()
             .to_vec();
 
-        let mut client =
-            AgentLang::registry_rpc::registry_service_client::RegistryServiceClient::connect(
-                registry_addr.to_string(),
-            )
-            .await?;
+        let mut client = AgentLang::tls::connect_registry(registry_addr).await?;
         client
             .register_agent(RegisterRequest {
                 agent_id: agent_id.clone(),

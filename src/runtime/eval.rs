@@ -1,27 +1,85 @@
 use super::agent_rpc::CallRequest;
-use super::agent_rpc::agent_service_client::AgentServiceClient;
 use super::audit::{AgentError, Event};
 use super::call::{
     build_completed_call_envelope, build_failed_call_envelope, build_pending_call_envelope,
     store_call_result,
 };
 use super::context::{Context, ContractInfo};
+use super::exec_log::{self, LogEntry, Operands};
+use super::memory_commit;
 use super::goal::{build_goal_result, classify_goal_failure, store_goal_result};
 use super::memory::{
     ensure_value_safe_for_irreversible_action, inherit_metadata, propagate_container_metadata,
     resolve_path, sanitize_recalled_value,
 };
 use super::registry_rpc::LookupRequest;
-use super::registry_rpc::registry_service_client::RegistryServiceClient;
 use crate::ast::*;
 use crate::crypto;
+use crate::tls;
 use anyhow::{Result, anyhow};
 use async_recursion::async_recursion;
 use ed25519_dalek::Signer;
-use ring::digest;
 use std::collections::HashMap;
 use tokio::time::{Duration, sleep};
-use wasmtime::{Linker, Module, Store, Val, ValType};
+use wasmtime::{Instance, Linker, Module, Store, Val, ValType};
+
+/// Serializes the working-variables map to a deterministic, sortable byte
+/// representation used as input to the execution-digest STARK trace.
+///
+/// Format: each variable contributes one `key:Debug(value)|` segment, sorted
+/// by key. The format is intentionally textual so that floating-point and
+/// non-canonical structured values still produce stable bytes — the digest
+/// binds to whatever representation reaches this point. Two distinct states
+/// will produce different bytes (the audit's tamper-evidence guarantee);
+/// two equivalent-but-differently-ordered states will not, because of the
+/// sort.
+pub(crate) fn build_state_bytes(ctx: &Context) -> Vec<u8> {
+    // Magic prefix is constant across all Prove invocations. It serves two
+    // purposes: (a) domain-separates AgentLang state digests from any other
+    // byte stream that might collide, and (b) guarantees the trace polynomial
+    // is non-trivial even when the working-variable map is empty — winterfell
+    // rejects degenerate (constant) trace polys at the composer stage.
+    let mut out = String::from("agentlang-prove-v1|");
+    let vars = ctx
+        .working_variables
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut keys: Vec<_> = vars.keys().collect();
+    keys.sort();
+    for k in keys {
+        let v = vars.get(k).unwrap();
+        out.push_str(&format!("{}:{:?}|", k, v.value));
+    }
+    out.into_bytes()
+}
+
+/// Allocates `bytes.len() + 1` in the WASM module's linear memory via the
+/// module-exported `alloc` function and writes the bytes followed by a
+/// trailing NUL. Returns the pointer (i32) of the allocation. The trailing
+/// NUL is critical: without it, callees that scan for string termination
+/// (or AgentLang's own NUL-terminated return-string detection) read past
+/// the payload into uninitialized memory.
+fn write_nul_terminated(
+    store: &mut Store<()>,
+    instance: &Instance,
+    bytes: &[u8],
+) -> Result<i32> {
+    let memory = instance
+        .get_memory(&mut *store, "memory")
+        .ok_or_else(|| anyhow!("Memory export not found for string passing"))?;
+    let alloc_func = instance
+        .get_func(&mut *store, "alloc")
+        .ok_or_else(|| anyhow!("'alloc' export required to pass strings to WASM"))?;
+
+    let total_len = bytes.len() + 1;
+    let mut alloc_res = vec![Val::I32(0)];
+    alloc_func.call(&mut *store, &[Val::I32(total_len as i32)], &mut alloc_res)?;
+    let ptr = alloc_res[0].i32().unwrap();
+
+    memory.write(&mut *store, ptr as usize, bytes)?;
+    memory.write(&mut *store, ptr as usize + bytes.len(), &[0u8])?;
+    Ok(ptr)
+}
 
 #[async_recursion]
 pub async fn eval_expression(expr: &Expression, ctx: &Context) -> Result<AnnotatedValue> {
@@ -186,6 +244,20 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 sleep(Duration::from_secs_f64(*delay)).await;
             }
 
+            let audit_root_at_entry = exec_log::hash(
+                ctx.audit_chain
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .last_hash
+                    .as_bytes(),
+            );
+            ctx.record_log(LogEntry {
+                operands: Operands::GoalEnter {
+                    name_hash: exec_log::hash(name.as_bytes()),
+                    audit_root: audit_root_at_entry,
+                },
+            });
+
             let max_retries = retry.unwrap_or(0);
             use tokio::task::JoinSet;
 
@@ -269,6 +341,26 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 }
             };
 
+            let exit_status = match &result {
+                Ok(_) => exec_log::GoalStatus::Success,
+                Err(e) if e.to_string().contains("timed out") => exec_log::GoalStatus::Timeout,
+                Err(_) => exec_log::GoalStatus::Failure,
+            };
+            let audit_root_at_exit = exec_log::hash(
+                ctx.audit_chain
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .last_hash
+                    .as_bytes(),
+            );
+            ctx.record_log(LogEntry {
+                operands: Operands::GoalExit {
+                    name_hash: exec_log::hash(name.as_bytes()),
+                    status: exit_status,
+                    audit_root: audit_root_at_exit,
+                },
+            });
+
             if let Err(e) = result {
                 let failure_type = classify_goal_failure(&e);
 
@@ -288,6 +380,12 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
         }
         Statement::Set { variable, value } => {
             let val = eval_expression(value, &ctx).await?;
+            ctx.record_log(LogEntry {
+                operands: Operands::Set {
+                    name_hash: exec_log::hash(variable.as_bytes()),
+                    value_hash: exec_log::hash(format!("{:?}", val.value).as_bytes()),
+                },
+            });
             ctx.set_variable(variable.clone(), val, MemoryScope::Working)
                 .await?;
             Ok(())
@@ -298,14 +396,20 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             else_branch,
         } => {
             let cond = eval_expression(condition, &ctx).await?;
-            let is_true = match cond.value {
-                Value::Boolean(b) => b,
-                Value::Number(n) => n != 0.0,
+            let is_true = match &cond.value {
+                Value::Boolean(b) => *b,
+                Value::Number(n) => *n != 0.0,
                 Value::Text(s) => !s.is_empty(),
                 Value::List(l) => !l.is_empty(),
                 Value::Object(o) => !o.is_empty(),
                 Value::Null => false,
             };
+            ctx.record_log(LogEntry {
+                operands: Operands::If {
+                    cond_hash: exec_log::hash(format!("{:?}", cond.value).as_bytes()),
+                    branch_taken: is_true,
+                },
+            });
             if is_true {
                 for stmt in then_branch {
                     eval(stmt, ctx.clone()).await?;
@@ -629,6 +733,26 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 rpc_args.insert(k.clone(), format!("{:?}", val.value));
             }
 
+            // Args bytes are canonical because rpc_args is what travels in the
+            // RPC envelope; sorting keys keeps the hash insertion-order-free.
+            let mut sorted: Vec<(&String, &String)> = rpc_args.iter().collect();
+            sorted.sort_by_key(|(k, _)| k.as_str());
+            let args_bytes: Vec<u8> = sorted
+                .iter()
+                .flat_map(|(k, v)| format!("{}={}|", k, v).into_bytes())
+                .collect();
+            ctx.record_log(LogEntry {
+                operands: Operands::Delegate {
+                    callee_hash: exec_log::hash(agent_id.as_bytes()),
+                    goal_hash: exec_log::hash(goal_name.as_bytes()),
+                    args_hash: exec_log::hash(&args_bytes),
+                    // Delegate is fire-and-forget; the RPC outcome lives in
+                    // a spawned task. result_hash stays zero until Phase 4
+                    // wires a witness channel for the response.
+                    result_hash: [0u8; 32],
+                },
+            });
+
             let caller_id = ctx
                 .agent_id
                 .lock()
@@ -648,8 +772,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                         .clone();
 
                     for reg_addr in registries {
-                        if let Ok(mut reg_client) =
-                            RegistryServiceClient::connect(reg_addr.clone()).await
+                        if let Ok(mut reg_client) = tls::connect_registry(&reg_addr).await
                             && let Ok(res) = reg_client
                                 .lookup_agent(LookupRequest {
                                     agent_id: agent_id_clone.clone(),
@@ -675,7 +798,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                             .to_vec();
 
                         if let Ok(mut agent_client) =
-                            AgentServiceClient::connect(lookup_data.endpoint.clone()).await
+                            tls::connect_agent(&lookup_data.endpoint).await
                         {
                             let _ = agent_client
                                 .call_goal(CallRequest {
@@ -749,6 +872,14 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                     &format!("write shared memory '{}'", name),
                 )?;
             }
+            ctx.record_log(LogEntry {
+                operands: Operands::Remember {
+                    scope: *scope,
+                    path_hash: exec_log::hash(name.as_bytes()),
+                    value_hash: exec_log::hash(format!("{:?}", val.value).as_bytes()),
+                    ttl: expires.map(|secs| secs as u64),
+                },
+            });
             ctx.set_variable(name.clone(), val, *scope).await?;
 
             // Schedule automatic removal after the requested duration.
@@ -830,12 +961,26 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             match result {
                 Ok(val) => {
                     let recalled = sanitize_recalled_value(val, *scope);
+                    ctx.record_log(LogEntry {
+                        operands: Operands::Recall {
+                            scope: *scope,
+                            path_hash: exec_log::hash(name.as_bytes()),
+                            value_hash: exec_log::hash(format!("{:?}", recalled.value).as_bytes()),
+                        },
+                    });
                     ctx.set_variable(into_var.clone(), recalled, MemoryScope::Working)
                         .await?;
                 }
                 Err(_) => {
                     if let Some(expr) = on_missing {
                         let val = eval_expression(expr, &ctx).await?;
+                        ctx.record_log(LogEntry {
+                            operands: Operands::Recall {
+                                scope: *scope,
+                                path_hash: exec_log::hash(name.as_bytes()),
+                                value_hash: exec_log::hash(format!("{:?}", val.value).as_bytes()),
+                            },
+                        });
                         ctx.set_variable(into_var.clone(), val, MemoryScope::Working)
                             .await?;
                     } else {
@@ -846,6 +991,12 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             Ok(())
         }
         Statement::Forget { name, scope } => {
+            ctx.record_log(LogEntry {
+                operands: Operands::Forget {
+                    scope: *scope,
+                    path_hash: exec_log::hash(name.as_bytes()),
+                },
+            });
             match scope {
                 MemoryScope::Working => {
                     ctx.working_variables
@@ -957,39 +1108,94 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             claim,
             proof_name,
         } => {
+            *ctx.exec_log.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(exec_log::ExecutionLog::new());
+
+            // Phase 3c-runtime: capture the memory commitment root from
+            // actual Context state before and after the Prove body.
+            // `from_context` enumerates Working/Session/LongTerm; Shared
+            // is intentionally excluded (3a option a — RPC-routed,
+            // outside the SMT). Per option (Y), `working_variables`
+            // covers both REMEMBER{Working} and SET writes, so both
+            // opcodes contribute to the pre/post roots without special-
+            // casing here. The AIR-side binding (C8) lands in 3e; until
+            // then this is consumed by the Reveal-side envelope-
+            // integrity check from 3b.
+            // Sub-phase 3d: capture the *commit* (not just its root) so we
+            // can replay it through `LogTrace::from_log_and_commit` to
+            // populate the trace's `mroot` column. The pre-root extracted
+            // here still lands in the StarkProof envelope and is the
+            // value the Reveal-side equality check verifies against.
+            let commit_pre = memory_commit::MemoryCommit::from_context(&ctx)?;
+            let memory_root_pre = commit_pre.root();
+
             for stmt in statements {
                 eval(stmt, ctx.clone()).await?;
             }
 
-            let mut state_repr = String::new();
-            {
-                let vars = ctx
-                    .working_variables
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let mut keys: Vec<_> = vars.keys().collect();
-                keys.sort();
-                for k in keys {
-                    let v = vars.get(k).unwrap();
-                    state_repr.push_str(&format!("{}:{:?}|", k, v.value));
-                }
+            let memory_root_post = memory_commit::MemoryCommit::from_context(&ctx)?.root();
+
+            let log = ctx
+                .exec_log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .unwrap_or_default();
+
+            // Phase 2: the AIR's polynomial digest now consumes both the
+            // post-execution state bytes AND the canonical execution log.
+            // The 8-byte big-endian state length prefix makes the boundary
+            // unambiguous so two (state, log) pairs cannot encode to the
+            // same byte stream by chance.
+            let state_bytes = build_state_bytes(&ctx);
+            let log_bytes = log.canonical_bytes();
+            let mut combined = Vec::with_capacity(8 + state_bytes.len() + log_bytes.len());
+            combined.extend_from_slice(&(state_bytes.len() as u64).to_be_bytes());
+            combined.extend_from_slice(&state_bytes);
+            combined.extend_from_slice(&log_bytes);
+
+            let mut proof = crypto::generate_proof(&combined, claim)?;
+            proof.memory_root_pre = memory_root_pre;
+            proof.memory_root_post = memory_root_post;
+
+            // Phase 2 Slice 5: also attest to control-flow validity (opcode
+            // set, branch_taken bool, goal_status range) when there's any
+            // recorded execution. Empty logs skip CF — the all-Nop trace
+            // is degenerate for winterfell and there's nothing to attest.
+            if !log.entries().is_empty() {
+                // Phase 3d: thread the pre-execution commit through the
+                // trace builder so `CFA_MROOT_COL` carries the running
+                // SMT root entering each row. `commit_pre` is consumed
+                // by the replay; we already extracted `memory_root_pre`
+                // above for the envelope.
+                //
+                // Phase 3e-boundary: also pass the post-execution root
+                // so the AIR's `mroot[last]` boundary assertion binds
+                // to the same value `Statement::Reveal` will cross-
+                // check against the prover's envelope.
+                proof.control_flow = Some(crypto::generate_control_flow_proof_with_commit(
+                    &log,
+                    commit_pre,
+                    memory_root_post,
+                    claim,
+                )?);
             }
 
-            let hash = digest::digest(&digest::SHA256, state_repr.as_bytes());
-            let hash_bytes = hash.as_ref();
-            let mut steps =
-                32 + (u32::from_be_bytes(hash_bytes[0..4].try_into().unwrap()) % 64) as usize;
-
-            // Winterfell requires power-of-two trace length
-            if !steps.is_power_of_two() {
-                steps = steps.next_power_of_two();
-            }
-
-            let proof = crypto::generate_proof(steps, claim)?;
+            ctx.exec_logs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(proof_name.clone(), log);
             ctx.proofs
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(proof_name.clone(), proof);
+                .insert(
+                    proof_name.clone(),
+                    crypto::StoredProof {
+                        proof,
+                        memory_root_pre,
+                        memory_root_post,
+                    },
+                );
             Ok(())
         }
         Statement::Reveal {
@@ -998,7 +1204,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             to_agent: _,
             result_into,
         } => {
-            let proof = {
+            let stored = {
                 let proofs = ctx.proofs.lock().unwrap_or_else(|e| e.into_inner());
                 proofs
                     .get(proof_name)
@@ -1006,7 +1212,26 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                     .ok_or_else(|| anyhow!("Proof '{}' not found", proof_name))?
             };
 
-            crypto::verify_proof(&proof, claim)?;
+            // Phase 3b: bind the prover-claimed memory roots to what the
+            // runtime actually observed at Prove start/end. A malicious
+            // prover could otherwise fabricate `memory_root_pre`/`post`
+            // values inside the StarkProof envelope — the AIR-side
+            // enforcement only kicks in at 3e, so until then this
+            // runtime-side equality check is the integrity gate. Once 3e
+            // lands, this stays as belt-and-suspenders against accidental
+            // envelope corruption between Prove and Reveal.
+            if stored.proof.memory_root_pre != stored.memory_root_pre {
+                return Err(anyhow!(
+                    "Memory pre-root in proof envelope does not match runtime-observed root"
+                ));
+            }
+            if stored.proof.memory_root_post != stored.memory_root_post {
+                return Err(anyhow!(
+                    "Memory post-root in proof envelope does not match runtime-observed root"
+                ));
+            }
+
+            crypto::verify_proof(&stored.proof, claim)?;
 
             if let Some(path) = result_into {
                 let reveal_val = AnnotatedValue::from(Value::Text(format!(
@@ -1048,19 +1273,18 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 let wasm_val = match (p_type, &val.value) {
                     (ValType::I32, Value::Number(n)) => Val::I32(*n as i32),
                     (ValType::I32, Value::Text(s)) => {
-                        let memory = instance
-                            .get_memory(&mut store, "memory")
-                            .ok_or_else(|| anyhow!("Memory export not found for string passing"))?;
-                        let alloc_func =
-                            instance.get_func(&mut store, "alloc").ok_or_else(|| {
-                                anyhow!("'alloc' export required to pass strings to WASM")
-                            })?;
-
-                        let mut alloc_res = vec![Val::I32(0)];
-                        alloc_func.call(&mut store, &[Val::I32(s.len() as i32)], &mut alloc_res)?;
-                        let ptr = alloc_res[0].i32().unwrap();
-
-                        memory.write(&mut store, ptr as usize, s.as_bytes())?;
+                        let ptr = write_nul_terminated(&mut store, &instance, s.as_bytes())?;
+                        Val::I32(ptr)
+                    }
+                    // Lists and objects are marshaled as JSON-encoded
+                    // NUL-terminated strings under the same alloc convention
+                    // as Text. Callees parse the payload with their JSON
+                    // library of choice (serde, parson, etc.). This is the
+                    // pragmatic ABI until wit-bindgen / Component Model
+                    // bindings are wired up.
+                    (ValType::I32, Value::List(_)) | (ValType::I32, Value::Object(_)) => {
+                        let json = serde_json::to_string(&val.value)?;
+                        let ptr = write_nul_terminated(&mut store, &instance, json.as_bytes())?;
                         Val::I32(ptr)
                     }
                     (ValType::I64, Value::Number(n)) => Val::I64(*n as i64),
@@ -1082,7 +1306,32 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             let result_types: Vec<ValType> = func.ty(&store).results().collect();
             let mut results = vec![Val::I32(0); result_types.len()];
 
+            // Capture pre-call fuel and a stable byte-image of the inputs so
+            // the envelope binds (module, function, inputs, outputs, fuel)
+            // even though Wasmtime owns the actual execution off-trace.
+            let fuel_before = store.get_fuel().unwrap_or(0);
+            let input_bytes: Vec<u8> = wasm_args
+                .iter()
+                .flat_map(|v| format!("{:?}|", v).into_bytes())
+                .collect();
+
             func.call(&mut store, &wasm_args, &mut results)?;
+
+            let fuel_after = store.get_fuel().unwrap_or(0);
+            let fuel_consumed = fuel_before.saturating_sub(fuel_after);
+            let output_bytes: Vec<u8> = results
+                .iter()
+                .flat_map(|v| format!("{:?}|", v).into_bytes())
+                .collect();
+            ctx.record_log(LogEntry {
+                operands: Operands::UseWasm {
+                    module_hash: exec_log::hash(module_path.as_bytes()),
+                    function_hash: exec_log::hash(function_name.as_bytes()),
+                    input_hash: exec_log::hash(&input_bytes),
+                    output_hash: exec_log::hash(&output_bytes),
+                    fuel_consumed,
+                },
+            });
 
             let res_val = if let Some(res) = results.first() {
                 match res {
@@ -1131,6 +1380,19 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             if let Some(path) = result_into {
                 ctx.set_variable_path(path, mock_result, MemoryScope::Working)
                     .await?;
+                // Phase 3e: pair the working_variables write with a SET
+                // log entry so trace replay's running SMT root matches
+                // `MemoryCommit::from_context` after this row. The SMT
+                // leaf is keyed on `path.root`'s name + post-merge value,
+                // so re-read it after the write to capture exactly what
+                // `from_context` will hash.
+                let stored = ctx.get_variable(&path.root, MemoryScope::Working).await?;
+                ctx.record_log(LogEntry {
+                    operands: Operands::Set {
+                        name_hash: exec_log::hash(path.root.as_bytes()),
+                        value_hash: exec_log::hash(format!("{:?}", stored.value).as_bytes()),
+                    },
+                });
             }
             Ok(())
         }
@@ -1154,6 +1416,25 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 rpc_args.insert(k.clone(), serde_json::to_string(&val)?);
                 evaluated_args.insert(k.clone(), val);
             }
+
+            // Sort by key so the args hash is independent of HashMap order.
+            let mut sorted: Vec<(&String, &String)> = rpc_args.iter().collect();
+            sorted.sort_by_key(|(k, _)| k.as_str());
+            let args_bytes: Vec<u8> = sorted
+                .iter()
+                .flat_map(|(k, v)| format!("{}={}|", k, v).into_bytes())
+                .collect();
+            ctx.record_log(LogEntry {
+                operands: Operands::Call {
+                    callee_hash: exec_log::hash(agent_id.as_bytes()),
+                    goal_hash: exec_log::hash(goal_name.as_bytes()),
+                    args_hash: exec_log::hash(&args_bytes),
+                    // Call's RPC outcome resolves on a oneshot in a spawned
+                    // task; result_hash stays zero until Phase 4 wires a
+                    // witness channel for the response.
+                    result_hash: [0u8; 32],
+                },
+            });
 
             let call_id_str = result_into
                 .as_ref()
@@ -1195,8 +1476,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                         .clone();
 
                     for reg_addr in registries {
-                        if let Ok(mut reg_client) =
-                            RegistryServiceClient::connect(reg_addr.clone()).await
+                        if let Ok(mut reg_client) = tls::connect_registry(&reg_addr).await
                             && let Ok(res) = reg_client
                                 .lookup_agent(LookupRequest {
                                     agent_id: agent_id_clone.clone(),
@@ -1227,8 +1507,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                         .to_bytes()
                         .to_vec();
 
-                    let mut agent_client =
-                        AgentServiceClient::connect(lookup_data.endpoint.clone()).await?;
+                    let mut agent_client = tls::connect_agent(&lookup_data.endpoint).await?;
 
                     let rpc_call = agent_client.call_goal(CallRequest {
                         goal_name: goal_name_clone.clone(),

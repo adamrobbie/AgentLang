@@ -1,0 +1,43 @@
+[package]
+name = "lookup-bench"
+version = "0.0.1"
+edition = "2021"
+publish = false
+description = "Phase 3 prereq spike: winterfell aux-segment vs Plonky3 lookup-argument."
+
+[[bin]]
+name = "winterfell_lookup"
+path = "src/winterfell_lookup.rs"
+
+[[bin]]
+name = "winterfell_aux_lookup"
+path = "src/winterfell_aux_lookup.rs"
+
+[[bin]]
+name = "plonky3_lookup"
+path = "src/plonky3_lookup.rs"
+
+[dependencies]
+winterfell = "0.13.1"
+
+# Plonky3 stack pinned to the 0.5.x line. p3-uni-stark is a single-AIR
+# prover; LogUp via p3-lookup requires a custom multi-AIR prover (SP1,
+# Valida, etc. build their own). For apples-to-apples comparison with
+# the winterfell variant we use the same running-product trick wired
+# into p3-uni-stark directly — see src/plonky3_lookup.rs's header for
+# the rationale and a note on what a real LogUp port would entail.
+p3-air = "0.5.2"
+p3-baby-bear = "0.5.2"
+p3-challenger = "0.5.2"
+p3-commit = "0.5.2"
+p3-dft = "0.5.2"
+p3-field = "0.5.2"
+p3-fri = "0.5.2"
+p3-keccak = "0.5.2"
+p3-matrix = "0.5.2"
+p3-merkle-tree = "0.5.2"
+p3-poseidon2 = "0.5.2"
+p3-symmetric = "0.5.2"
+p3-uni-stark = "0.5.2"
+postcard = { version = "1", features = ["alloc"] }
+rand = "0.10"
