@@ -1168,8 +1168,16 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                 // SMT root entering each row. `commit_pre` is consumed
                 // by the replay; we already extracted `memory_root_pre`
                 // above for the envelope.
+                //
+                // Phase 3e-boundary: also pass the post-execution root
+                // so the AIR's `mroot[last]` boundary assertion binds
+                // to the same value `Statement::Reveal` will cross-
+                // check against the prover's envelope.
                 proof.control_flow = Some(crypto::generate_control_flow_proof_with_commit(
-                    &log, commit_pre, claim,
+                    &log,
+                    commit_pre,
+                    memory_root_post,
+                    claim,
                 )?);
             }
 

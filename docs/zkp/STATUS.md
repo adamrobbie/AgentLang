@@ -97,10 +97,10 @@ forward constraint into Phase 3+:
 
 ### Phase 3 — Memory commitment + REMEMBER/RECALL lookup ⏳
 
-**Sub-phases 3a + 3b + 3c-runtime + 3c-AIR + 3d + 3e-aux-shape
-shipped.** 3e-boundary, 3e-rootcarry, 3e-lookup-trace, 3e-lookup-table,
-and 3f–3h still ahead — the remaining 3e sub-pieces (the actual lookup
-argument) stay the highest schedule risk in the roadmap.
+**Sub-phases 3a + 3b + 3c-runtime + 3c-AIR + 3d + 3e-aux-shape +
+3e-boundary shipped.** 3e-rootcarry, 3e-lookup-trace, 3e-lookup-table,
+and 3f–3h still ahead — the remaining 3e sub-pieces (row-carry +
+lookup argument) stay the highest schedule risk in the roadmap.
 Implementation plan drafted 2026-05-06 in
 [`phase3-implementation-plan.md`](phase3-implementation-plan.md) — that
 doc walks the work in 8 sub-phases (3a–3h) against concrete file:line
@@ -327,6 +327,60 @@ opcode/branch/status/depth rejection, claim-tamper) all exercise the
 multi-segment proving + verification path. Library suite: 399 passing
 (unchanged from 3d — the trace-shape evolution carries no behavioral
 delta yet).
+
+**Sub-phase 3e-boundary — mroot[0]/mroot[last] AIR boundaries ✅** (2026-05-07)
+
+`ControlFlowPublicInputs` grows two fields: `memory_root_pre` and
+`memory_root_post`, both `BaseElement` (folded `Hash32 → u128 → f128`
+via `exec_log::fold_to_u128`). `ControlFlowAir`'s main-segment
+assertion count rises from 3 to 5; the new boundaries are
+`Assertion::single(CFA_MROOT_COL, 0, memory_root_pre)` and
+`Assertion::single(CFA_MROOT_COL, last, memory_root_post)`.
+
+`generate_control_flow_proof_with_commit(log, starting_commit,
+memory_root_post: [u8; 32], claim)` accepts the post root as an
+explicit parameter. `Statement::Prove` already computes
+`memory_root_post` via `MemoryCommit::from_context(&ctx)` after the
+body; the same value flows into the AIR's public input, the trace's
+anti-pad/padding `mroot` cells, the `StarkProof` envelope, and the
+`StoredProof` runtime wrapper — all from one source. The runtime-side
+3b `Statement::Reveal` equality check (`stored.proof.memory_root_post
+!= stored.memory_root_post`) and the new in-AIR boundary now both
+guard the same byte sequence.
+
+`verify_control_flow_proof(proof, claim, memory_root_pre,
+memory_root_post)` takes the pre/post bytes; `verify_proof_v1`
+forwards `proof_data.memory_root_pre`/`memory_root_post` from the
+envelope. Folding to `BaseElement` happens inside the verifier, the
+same way the prover did, so public inputs match the trace's mroot
+column at the boundary rows.
+
+Trace tail handling: anti-pad rows (the five Nop/IF/GoalEnter/IF/
+GoalExit synthetic rows after the last real row) and Nop-padding
+rows past them now carry `memory_root_post`-folded in their `mroot`
+cell. Real rows still carry the 3d before-row replay value; for the
+last real row, that's the SMT root *entering* it, after which the
+running root becomes `memory_root_post` for the rest of the trace.
+3e-rootcarry will additionally enforce this row-by-row through the
+gated carry constraint — for now, only the endpoints are bound.
+
+Known security gap (deliberate, scoped to this sub-phase): the
+`fold_to_u128` truncation drops bytes [16..32] of the `Hash32`. A
+prover can swap the high half of either pre or post root with any
+other value and the boundary still accepts. Two new tests document
+this: `cf_3e_boundary_rejects_tampered_memory_root_post` confirms a
+change to byte 0 IS caught; `cf_3e_boundary_fold_lossiness_documented`
+confirms a change to byte 31 IS NOT, by design. 3e-lookup-trace's
+α/β randomization mixes the full 32 bytes and recovers the soundness
+margin to ~95 bits.
+
+Test coverage: 4 new `crypto::tests` (`cf_3e_boundary_round_trips_with
+_nonzero_pre_post`, `cf_3e_boundary_rejects_tampered_memory_root_pre`,
+`cf_3e_boundary_rejects_tampered_memory_root_post`,
+`cf_3e_boundary_fold_lossiness_documented`). All 7 existing
+control-flow tests updated to pass `[0u8; 32]` for pre/post (their
+hand-built traces use `mroot=0` throughout). Library suite: 403
+passing (up from 399).
 
 Required work, per the deep-dive's §"Memory" and Phase 3 plan:
 

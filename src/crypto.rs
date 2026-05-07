@@ -542,9 +542,27 @@ fn verify_proof_v1(proof_data: &StarkProof, claim: &str) -> anyhow::Result<()> {
     // Phase 2: if a control-flow proof was attached, it must verify too.
     // Absence is permitted (empty `Prove` body has no log to attest to);
     // presence is mandatory to verify.
+    //
+    // 3e-boundary: the v1-shape envelope carries `memory_root_pre`/
+    // `memory_root_post` (defaulted to `[0u8; 32]` for pre-3b proofs
+    // via `#[serde(default)]`). The control-flow proof's AIR pins
+    // `mroot[0]`/`mroot[last]` to those values; v1-shape proofs whose
+    // envelope roots are zero match traces whose `mroot` column is all
+    // zero (the legacy `generate_control_flow_proof` path used by
+    // hand-built tests). Real-Prove envelopes (3c-runtime+) carry
+    // non-zero roots and the AIR binds the trace's running mroot to
+    // them. Forwarding the envelope bytes here is what closes the
+    // verifier-side half of the binding: the same bytes that
+    // `Statement::Reveal` cross-checks against `StoredProof` are
+    // also what the AIR checks against the trace.
     if let Some(cf) = &proof_data.control_flow {
-        verify_control_flow_proof(cf, claim)
-            .map_err(|e| anyhow::anyhow!("Control-flow verification failed: {}", e))?;
+        verify_control_flow_proof(
+            cf,
+            claim,
+            proof_data.memory_root_pre,
+            proof_data.memory_root_post,
+        )
+        .map_err(|e| anyhow::anyhow!("Control-flow verification failed: {}", e))?;
     }
 
     Ok(())
@@ -578,7 +596,7 @@ pub fn digest_state_bytes(state_bytes: &[u8], claim: &str) -> u128 {
 // goal_status range, and claim_hash carry. Not yet bound to the digest
 // AIR's input — Phase 3 (sha256-in-air) will close that gap.
 
-use crate::runtime::exec_log::{ExecutionLog, LogTrace, LogTraceRow};
+use crate::runtime::exec_log::{ExecutionLog, LogTrace, LogTraceRow, fold_to_u128};
 use crate::runtime::memory_commit::MemoryCommit;
 
 /// Stable opcode bytes the AIR accepts. Must mirror `Opcode` discriminants
@@ -691,11 +709,23 @@ fn opcode_indicator<E: FieldElement<BaseField = BaseElement>>(opcode: E, target:
 
 pub struct ControlFlowPublicInputs {
     pub claim_hash: BaseElement,
+    /// Folded `memory_root_pre` (first 16 bytes of `Hash32` big-endian).
+    /// 3e-boundary asserts `mroot[0]` equals this. The folding is lossy
+    /// vs. the source SHA-256 by ~64 bits; 3e-lookup-trace's α/β
+    /// randomization is what recovers the soundness margin against a
+    /// prover crafting two distinct memory states whose folded roots
+    /// collide.
+    pub memory_root_pre: BaseElement,
+    /// Folded `memory_root_post`. 3e-boundary asserts `mroot[last]`
+    /// equals this. Combined with `memory_root_pre` and 3e-rootcarry's
+    /// gated carry constraint, this binds the running mroot column
+    /// end-to-end to the prover's claimed pre/post envelope.
+    pub memory_root_post: BaseElement,
 }
 
 impl ToElements<BaseElement> for ControlFlowPublicInputs {
     fn to_elements(&self) -> Vec<BaseElement> {
-        vec![self.claim_hash]
+        vec![self.claim_hash, self.memory_root_pre, self.memory_root_post]
     }
 }
 
@@ -731,14 +761,16 @@ impl Air for ControlFlowAir {
         // blowup-16 ceiling). Both fit because the aux constraint shape
         // stays "one column, one transition" — only its degree changes.
         let aux_degrees = vec![winterfell::TransitionConstraintDegree::new(1)];
-        // Three main boundary assertions:
+        // Five main boundary assertions:
         //   - claim_hash at row 0 binds the trace to the claim
         //   - depth at row 0 = 0 (clean stack on entry)
         //   - depth at last row = 0 (every Enter matched by an Exit)
+        //   - mroot at row 0 = memory_root_pre (3e-boundary)
+        //   - mroot at last row = memory_root_post (3e-boundary)
         // One aux boundary assertion:
         //   - Z[0] = 1 (running product initialised). Combined with the
         //     transition above, pins Z to the constant 1 today.
-        let context = AirContext::new_multi_segment(trace_info, main_degrees, aux_degrees, 3, 1, options);
+        let context = AirContext::new_multi_segment(trace_info, main_degrees, aux_degrees, 5, 1, options);
         Self {
             context,
             pub_inputs,
@@ -751,6 +783,15 @@ impl Air for ControlFlowAir {
             Assertion::single(CFA_CLAIM_COL, 0, self.pub_inputs.claim_hash),
             Assertion::single(CFA_DEPTH_COL, 0, BaseElement::ZERO),
             Assertion::single(CFA_DEPTH_COL, last, BaseElement::ZERO),
+            // 3e-boundary: pin the running-mroot column to the public
+            // pre/post roots. With 3e-rootcarry's gated carry constraint
+            // (deferred), the interior cells are forced to lie on the
+            // line connecting these two boundaries via memory rows only.
+            // Until 3e-rootcarry lands, only the endpoints are bound —
+            // a tampering prover could still scribble inside the column,
+            // but no row reads from it yet so that's not exploitable.
+            Assertion::single(CFA_MROOT_COL, 0, self.pub_inputs.memory_root_pre),
+            Assertion::single(CFA_MROOT_COL, last, self.pub_inputs.memory_root_post),
         ]
     }
 
@@ -841,14 +882,24 @@ pub struct ControlFlowProver {
     options: ProofOptions,
     rows: Vec<LogTraceRow>,
     claim_hash: BaseElement,
+    memory_root_pre: BaseElement,
+    memory_root_post: BaseElement,
 }
 
 impl ControlFlowProver {
-    fn new(options: ProofOptions, rows: Vec<LogTraceRow>, claim_hash: BaseElement) -> Self {
+    fn new(
+        options: ProofOptions,
+        rows: Vec<LogTraceRow>,
+        claim_hash: BaseElement,
+        memory_root_pre: BaseElement,
+        memory_root_post: BaseElement,
+    ) -> Self {
         Self {
             options,
             rows,
             claim_hash,
+            memory_root_pre,
+            memory_root_post,
         }
     }
 
@@ -913,16 +964,29 @@ impl ControlFlowProver {
         let d_after_real_plus_one_u32 = (d_after_real + 1).max(0) as u32;
 
         let mut rows = real_rows;
-        // Anti-pad rows leave the Phase 3c-AIR memory columns at zero
-        // (their `Default::default()` values). Memory-column anti-pad
-        // is sub-phase 3f's job: until the lookup constraints in 3e
-        // turn on, no row drives the future memory selector off zero,
-        // so a zeroed memory tail can't shift the lookup product.
+        // Anti-pad rows leave the Phase 3c-AIR memory operand columns
+        // (scope/path/value) at zero — they're non-memory opcodes
+        // (Nop/IF/GoalEnter/GoalExit). Memory-column anti-pad that
+        // drives the future selector off zero on at least one row is
+        // sub-phase 3f's job.
+        //
+        // 3e-boundary: the `mroot` cell on every anti-pad and padding
+        // row carries `memory_root_post` (folded). The trace's last
+        // real row's mroot is the SMT root entering that row (3d's
+        // before-row semantics); after its effect lands, the running
+        // root is `memory_root_post`. Anti-pad and padding rows are
+        // non-memory ops, so the running root stays at
+        // `memory_root_post` through the trace tail. Setting these
+        // cells explicitly makes the `mroot[last]` boundary assertion
+        // succeed by construction; 3e-rootcarry will additionally
+        // enforce it row-by-row through the gated carry constraint.
+        let pad_mroot = self.memory_root_post.as_int();
         rows.push(LogTraceRow {
             opcode: 0x00, // Nop
             branch_taken: 0,
             goal_status: 0,
             depth: d_after_real_u32,
+            mroot: pad_mroot,
             ..LogTraceRow::default()
         });
         rows.push(LogTraceRow {
@@ -930,6 +994,7 @@ impl ControlFlowProver {
             branch_taken: 1,
             goal_status: 0,
             depth: d_after_real_u32,
+            mroot: pad_mroot,
             ..LogTraceRow::default()
         });
         rows.push(LogTraceRow {
@@ -937,6 +1002,7 @@ impl ControlFlowProver {
             branch_taken: 0,
             goal_status: 0,
             depth: d_after_real_u32,
+            mroot: pad_mroot,
             ..LogTraceRow::default()
         });
         rows.push(LogTraceRow {
@@ -944,6 +1010,7 @@ impl ControlFlowProver {
             branch_taken: 1,
             goal_status: 0,
             depth: d_after_real_plus_one_u32,
+            mroot: pad_mroot,
             ..LogTraceRow::default()
         });
         rows.push(LogTraceRow {
@@ -951,6 +1018,7 @@ impl ControlFlowProver {
             branch_taken: 0,
             goal_status: 3, // Timeout — chosen to break gs column even-symmetry
             depth: d_after_real_plus_one_u32,
+            mroot: pad_mroot,
             ..LogTraceRow::default()
         });
 
@@ -963,6 +1031,12 @@ impl ControlFlowProver {
 
         let claim_hash = self.claim_hash;
         let pad_depth = BaseElement::new(d_after_real_u32 as u128);
+        // Nop-padding rows past the anti-pad sequence carry the same
+        // post-execution mroot as the anti-pad rows themselves, so the
+        // `mroot[last]` boundary against `memory_root_post` is
+        // satisfied by construction. See the anti-pad block above for
+        // the full rationale.
+        let pad_mroot_be = self.memory_root_post;
 
         // Build columns directly. We can't reuse `TraceTable::fill`
         // anymore because the multi-segment `TraceInfo` it builds
@@ -1003,7 +1077,17 @@ impl ControlFlowProver {
             scope_col.push(BaseElement::new(row.scope as u128));
             path_col.push(BaseElement::new(row.path));
             value_col.push(BaseElement::new(row.value));
-            mroot_col.push(BaseElement::new(row.mroot));
+            // Real and anti-pad rows already carry their authentic mroot
+            // (3d before-row replay for real rows, `pad_mroot` set in
+            // each anti-pad literal for the trailing five). Past the
+            // anti-pad block, `unwrap_or_default()` would zero this
+            // cell — override with `pad_mroot_be` so the boundary at
+            // `mroot[last]` holds.
+            mroot_col.push(if row_opt.is_some() {
+                BaseElement::new(row.mroot)
+            } else {
+                pad_mroot_be
+            });
         }
 
         // Assemble columns by their named index so the layout invariant
@@ -1052,6 +1136,8 @@ impl Prover for ControlFlowProver {
     fn get_pub_inputs(&self, _trace: &Self::Trace) -> ControlFlowPublicInputs {
         ControlFlowPublicInputs {
             claim_hash: self.claim_hash,
+            memory_root_pre: self.memory_root_pre,
+            memory_root_post: self.memory_root_post,
         }
     }
 
@@ -1129,43 +1215,83 @@ pub struct ControlFlowProof {
 /// production `Statement::Prove` path goes through
 /// [`generate_control_flow_proof_with_commit`] which populates `mroot`
 /// from a real running commit.
+///
+/// 3e-boundary public inputs: `memory_root_pre`/`memory_root_post` are
+/// both `BaseElement::ZERO`, matching the all-zero `mroot` column. The
+/// 3e boundary assertions are still in force — they just bind to zero
+/// here instead of a real folded SMT root.
 pub fn generate_control_flow_proof(
     log: &ExecutionLog,
     claim: &str,
 ) -> anyhow::Result<ControlFlowProof> {
     let trace = LogTrace::from(log);
-    generate_control_flow_proof_from_rows(trace.rows, claim)
+    generate_control_flow_proof_from_rows(
+        trace.rows,
+        claim,
+        BaseElement::ZERO,
+        BaseElement::ZERO,
+    )
 }
 
-/// Sub-phase 3d: builds a ControlFlowProof whose `CFA_MROOT_COL` carries
+/// Sub-phase 3d/3e: builds a ControlFlowProof whose `CFA_MROOT_COL` carries
 /// the running SMT root from `starting_commit` advanced by each memory
 /// operation in `log`. `starting_commit` should be `MemoryCommit::from_context`
 /// taken at Prove start so `rows[0].mroot` matches `memory_root_pre`.
 ///
-/// Witness only — sub-phase 3e adds the boundary assertions and lookup
-/// running product that make the column verifiable. Until then, the
-/// column cells exist for the AIR's transition evaluation to read but
-/// no constraint references them, so a tampering prover gets no
-/// in-AIR rejection from `mroot` alone. Reveal-side envelope-integrity
-/// (3b) plus the runtime equality check is still the integrity gate.
+/// `memory_root_post` is the runtime-computed post-execution SMT root
+/// (i.e., `MemoryCommit::from_context(&ctx).root()` after the body
+/// finishes). The trace's anti-pad and padding rows carry this exact
+/// value in their `mroot` cell, and the 3e-boundary assertion at
+/// `mroot[last]` pins it to the AIR's public input. The runtime-side
+/// 3b envelope check (`Statement::Reveal`) cross-asserts the same
+/// value against the prover's claimed `StarkProof.memory_root_post`,
+/// closing the loop until 3e-rootcarry adds in-AIR row-by-row carry.
+///
+/// In 3e-boundary, only the column endpoints are constrained — interior
+/// cells aren't yet read by any transition. 3e-rootcarry adds the
+/// gated row-carry constraint; 3e-lookup-trace then attests memory
+/// rows against the table-side SMT mutations.
 pub fn generate_control_flow_proof_with_commit(
     log: &ExecutionLog,
     starting_commit: MemoryCommit,
+    memory_root_post: [u8; 32],
     claim: &str,
 ) -> anyhow::Result<ControlFlowProof> {
+    let memory_root_pre_be =
+        BaseElement::new(fold_to_u128(&starting_commit.root()));
+    let memory_root_post_be = BaseElement::new(fold_to_u128(&memory_root_post));
     let trace = LogTrace::from_log_and_commit(log, starting_commit);
-    generate_control_flow_proof_from_rows(trace.rows, claim)
+    generate_control_flow_proof_from_rows(
+        trace.rows,
+        claim,
+        memory_root_pre_be,
+        memory_root_post_be,
+    )
 }
 
 /// Test/internal helper: prove over a hand-built row list. Used to construct
 /// invalid traces for negative tests; production callers should go through
-/// `generate_control_flow_proof`, which derives rows from a real log.
+/// `generate_control_flow_proof_with_commit`, which derives rows from a
+/// real log + commit.
+///
+/// `memory_root_pre`/`memory_root_post` are the folded pre/post roots
+/// the AIR's 3e-boundary assertions will bind `mroot[0]`/`mroot[last]`
+/// to. Hand-built test traces with `mroot=0` everywhere should pass
+/// `BaseElement::ZERO` for both.
 pub fn generate_control_flow_proof_from_rows(
     rows: Vec<LogTraceRow>,
     claim: &str,
+    memory_root_pre: BaseElement,
+    memory_root_post: BaseElement,
 ) -> anyhow::Result<ControlFlowProof> {
     let claim_hash = hash_claim(claim);
-    let prover = ControlFlowProver::new(control_flow_proof_options(), rows, claim_hash);
+    let prover = ControlFlowProver::new(
+        control_flow_proof_options(),
+        rows,
+        claim_hash,
+        memory_root_pre,
+        memory_root_post,
+    );
     let trace = prover.build_trace();
     let trace_length = trace.length();
 
@@ -1180,9 +1306,19 @@ pub fn generate_control_flow_proof_from_rows(
     })
 }
 
+/// Verifies a ControlFlow proof against the claim string and the
+/// pre/post memory roots the prover committed to.
+///
+/// `memory_root_pre`/`memory_root_post` should be the same byte arrays
+/// the prover used (i.e., `StarkProof.memory_root_pre`/`memory_root_post`).
+/// The verifier folds them to `BaseElement` exactly the way the prover
+/// did so the public-input vector matches the prover's `get_pub_inputs`
+/// output and the 3e-boundary assertions evaluate consistently.
 pub fn verify_control_flow_proof(
     proof_data: &ControlFlowProof,
     claim: &str,
+    memory_root_pre: [u8; 32],
+    memory_root_post: [u8; 32],
 ) -> anyhow::Result<()> {
     let expected_claim_hash = hash_claim(claim);
     if proof_data.claim_hash != expected_claim_hash.as_int() as u64 {
@@ -1196,6 +1332,8 @@ pub fn verify_control_flow_proof(
 
     let pub_inputs = ControlFlowPublicInputs {
         claim_hash: expected_claim_hash,
+        memory_root_pre: BaseElement::new(fold_to_u128(&memory_root_pre)),
+        memory_root_post: BaseElement::new(fold_to_u128(&memory_root_post)),
     };
     let min_opts = AcceptableOptions::MinConjecturedSecurity(95);
 
@@ -1443,7 +1581,10 @@ mod tests {
     fn control_flow_proof_round_trips() {
         let log = nonempty_log();
         let proof = generate_control_flow_proof(&log, "control-flow").unwrap();
-        verify_control_flow_proof(&proof, "control-flow").unwrap();
+        // generate_control_flow_proof uses zero pre/post — the legacy
+        // mroot=0 path. Verifier folds the same zero bytes for the
+        // 3e-boundary check.
+        verify_control_flow_proof(&proof, "control-flow", [0u8; 32], [0u8; 32]).unwrap();
     }
 
     // NOTE: An empty log produces an all-Nop trace whose constraint
@@ -1459,7 +1600,7 @@ mod tests {
     fn control_flow_proof_fails_for_wrong_claim() {
         let log = nonempty_log();
         let proof = generate_control_flow_proof(&log, "claim-A").unwrap();
-        let err = verify_control_flow_proof(&proof, "claim-B").unwrap_err();
+        let err = verify_control_flow_proof(&proof, "claim-B", [0u8; 32], [0u8; 32]).unwrap_err();
         assert!(
             err.to_string().contains("not generated for this claim"),
             "unexpected error: {err}"
@@ -1472,11 +1613,21 @@ mod tests {
     ///   3. prove() succeeds but verify() returns Err (release builds)
     /// Any of these counts as "the system rejected the bad witness".
     fn assert_bad_rows_rejected(rows: Vec<LogTraceRow>, claim: &str) {
+        // Hand-built test traces have mroot=0 throughout — pass
+        // BaseElement::ZERO for the 3e-boundary public inputs so the
+        // legitimate boundary at `mroot[0]`/`mroot[last]` succeeds.
+        // The test still exercises whichever other constraint the bad
+        // row violates (opcode set, branch bool, status range, etc.).
         // Suppress winterfell's panic stderr output for cleaner test logs.
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            generate_control_flow_proof_from_rows(rows, claim)
+            generate_control_flow_proof_from_rows(
+                rows,
+                claim,
+                BaseElement::ZERO,
+                BaseElement::ZERO,
+            )
         }));
         std::panic::set_hook(prev_hook);
 
@@ -1484,7 +1635,7 @@ mod tests {
             Err(_) => {} // panic during prove — rejected
             Ok(Err(_)) => {} // prove returned Err — rejected
             Ok(Ok(proof)) => assert!(
-                verify_control_flow_proof(&proof, claim).is_err(),
+                verify_control_flow_proof(&proof, claim, [0u8; 32], [0u8; 32]).is_err(),
                 "bad witness produced a verifying proof"
             ),
         }
@@ -1543,7 +1694,7 @@ mod tests {
         let log = nonempty_log();
         let mut proof = generate_control_flow_proof(&log, "claim").unwrap();
         proof.claim_hash = proof.claim_hash.wrapping_add(1);
-        assert!(verify_control_flow_proof(&proof, "claim").is_err());
+        assert!(verify_control_flow_proof(&proof, "claim", [0u8; 32], [0u8; 32]).is_err());
     }
 
     // ----------------------------------------------------------------------
@@ -1578,7 +1729,7 @@ mod tests {
     fn control_flow_proof_accepts_balanced_goal() {
         let log = balanced_goal_log();
         let proof = generate_control_flow_proof(&log, "balanced").unwrap();
-        verify_control_flow_proof(&proof, "balanced").unwrap();
+        verify_control_flow_proof(&proof, "balanced", [0u8; 32], [0u8; 32]).unwrap();
     }
 
     #[test]
@@ -1631,7 +1782,101 @@ mod tests {
             },
         });
         let proof = generate_control_flow_proof(&log, "if-true").unwrap();
-        verify_control_flow_proof(&proof, "if-true").unwrap();
+        verify_control_flow_proof(&proof, "if-true", [0u8; 32], [0u8; 32]).unwrap();
+    }
+
+    // ----------------------------------------------------------------------
+    // Phase 3e-boundary — mroot[0]/mroot[last] boundary assertions
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn cf_3e_boundary_round_trips_with_nonzero_pre_post() {
+        // Real-shape exercise: starting commit non-empty, log mutates
+        // the SMT, post root differs from pre. Both 3e-boundary
+        // assertions must accept this end-to-end.
+        let mut starting = MemoryCommit::new();
+        starting.apply_remember(MemoryScope::LongTerm, &[1u8; 32], [9u8; 32]);
+        let pre_root = starting.root();
+
+        let mut log = ExecutionLog::new();
+        log.record(LogEntry {
+            operands: Operands::Remember {
+                scope: MemoryScope::Working,
+                path_hash: [2u8; 32],
+                value_hash: [3u8; 32],
+                ttl: None,
+            },
+        });
+        // Compute the post root by applying the same mutation to a
+        // clone of `starting`. The replay inside the prover will
+        // produce the identical final root; passing it as
+        // `memory_root_post` matches the trace's anti-pad/padding tail.
+        let mut post_commit = starting.clone();
+        post_commit.apply_remember(MemoryScope::Working, &[2u8; 32], [3u8; 32]);
+        let post_root = post_commit.root();
+
+        let proof = generate_control_flow_proof_with_commit(
+            &log, starting, post_root, "boundary-roundtrip",
+        )
+        .unwrap();
+        verify_control_flow_proof(&proof, "boundary-roundtrip", pre_root, post_root)
+            .expect("3e-boundary must accept consistent pre/post");
+    }
+
+    #[test]
+    fn cf_3e_boundary_rejects_tampered_memory_root_pre() {
+        // The verifier reconstructs `memory_root_pre` from the bytes
+        // it's given. Tampering with those bytes shifts the AIR's
+        // boundary value, the trace's `mroot[0]` no longer matches,
+        // and verification rejects.
+        let log = nonempty_log();
+        let proof = generate_control_flow_proof(&log, "tamper-pre").unwrap();
+        // Generated with empty starting commit (mroot=0 path) → AIR
+        // pub_inputs.memory_root_pre = ZERO. Pass non-zero bytes here
+        // to force a mismatch.
+        let mut tampered_pre = [0u8; 32];
+        tampered_pre[0] = 0xFF;
+        assert!(
+            verify_control_flow_proof(&proof, "tamper-pre", tampered_pre, [0u8; 32]).is_err(),
+            "verifier must reject when claimed memory_root_pre disagrees with trace"
+        );
+    }
+
+    #[test]
+    fn cf_3e_boundary_rejects_tampered_memory_root_post() {
+        let log = nonempty_log();
+        let proof = generate_control_flow_proof(&log, "tamper-post").unwrap();
+        // Tamper a byte in the first 16 of the post-root: `fold_to_u128`
+        // takes the first 16 bytes BE, so changes to bytes [16..32] are
+        // not visible to the AIR's folded boundary check (that's the
+        // ~64-bit lossiness 3e-lookup-trace's α/β randomization will
+        // recover; here, we deliberately tamper the visible half).
+        let mut tampered_post = [0u8; 32];
+        tampered_post[0] = 0xFF;
+        assert!(
+            verify_control_flow_proof(&proof, "tamper-post", [0u8; 32], tampered_post).is_err(),
+            "verifier must reject when claimed memory_root_post disagrees with trace"
+        );
+    }
+
+    #[test]
+    fn cf_3e_boundary_fold_lossiness_documented() {
+        // Companion to the tamper test above: changes in bytes [16..32]
+        // of either pre or post root are NOT detected at 3e-boundary.
+        // This is the 64-bit fold lossiness, deliberate at this stage.
+        // 3e-lookup-trace closes the gap by mixing α/β over the full
+        // 32 bytes via a Schwartz-Zippel-style randomization.
+        //
+        // This test exists to flag the gap explicitly so a future
+        // edit that changes the fold (e.g., to all 32 bytes via
+        // multi-element packing) updates this test instead of
+        // silently shifting the security claim.
+        let log = nonempty_log();
+        let proof = generate_control_flow_proof(&log, "fold-lossy").unwrap();
+        let mut hidden_change = [0u8; 32];
+        hidden_change[31] = 0xFF;
+        verify_control_flow_proof(&proof, "fold-lossy", [0u8; 32], hidden_change)
+            .expect("byte 31 of post lives outside the folded prefix — 3e-boundary alone can't catch this");
     }
 
     #[test]
