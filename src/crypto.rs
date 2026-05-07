@@ -628,7 +628,11 @@ const CFA_MIN_TRACE_LEN: usize = 8;
 
 const OPCODE_GOAL_ENTER: u128 = 0x01;
 const OPCODE_GOAL_EXIT: u128 = 0x02;
+const OPCODE_SET: u128 = 0x10;
 const OPCODE_IF: u128 = 0x11;
+const OPCODE_REMEMBER: u128 = 0x20;
+const OPCODE_RECALL: u128 = 0x21;
+const OPCODE_FORGET: u128 = 0x22;
 
 // ---- Phase 3e-aux-shape: multi-segment trace plumbing -------------------
 //
@@ -746,6 +750,13 @@ impl Air for ControlFlowAir {
         //   claim_hash carry: next - current               → degree 1
         //   depth recurrence: degree-10 indicator polys    → degree 10
         //   branch-IF binding: branch_taken*(opcode-IF)    → degree 2
+        //   mroot gated carry: (1 - is_mem)*(Δmroot)       → degree 11
+        //     where is_mem = I_SET + I_REM + I_RECALL + I_FORGET, each a
+        //     degree-10 Lagrange indicator over `VALID_OPCODES`. Per the
+        //     Phase 3 plan's option (Y) memo, SET joins the memory
+        //     selector because runtime SET writes mutate the SMT exactly
+        //     like REMEMBER{Working}; excluding it would let the AIR's
+        //     mroot column diverge from the runtime SMT on SET rows.
         let main_degrees = vec![
             winterfell::TransitionConstraintDegree::new(11),
             winterfell::TransitionConstraintDegree::new(2),
@@ -753,13 +764,16 @@ impl Air for ControlFlowAir {
             winterfell::TransitionConstraintDegree::new(1),
             winterfell::TransitionConstraintDegree::new(10),
             winterfell::TransitionConstraintDegree::new(2),
+            winterfell::TransitionConstraintDegree::new(11),
         ];
-        // Aux constraint degree: trivial Z carry (next - curr = 0). 3e-
-        // rootcarry replaces this with `(1 - is_mem(opcode)) * (mroot_next
-        // - mroot_curr)` (degree 11); 3e-lookup-trace replaces it again
-        // with the gated running-product recurrence (degree 12 under the
-        // blowup-16 ceiling). Both fit because the aux constraint shape
-        // stays "one column, one transition" — only its degree changes.
+        // Aux constraint degree: trivial Z carry (next - curr = 0). The
+        // gated mroot carry (3e-rootcarry) lives on the *main* segment
+        // because mroot, opcode, and the Lagrange indicators are all
+        // main-trace columns. The aux segment becomes load-bearing in
+        // 3e-lookup-trace, where Z carries a running product keyed on
+        // α/β over the (scope, path, value, mroot) memory tuple — a
+        // recurrence whose recurrence factor depends on aux randomness
+        // and so must live in the aux segment by construction.
         let aux_degrees = vec![winterfell::TransitionConstraintDegree::new(1)];
         // Five main boundary assertions:
         //   - claim_hash at row 0 binds the trace to the claim
@@ -783,13 +797,13 @@ impl Air for ControlFlowAir {
             Assertion::single(CFA_CLAIM_COL, 0, self.pub_inputs.claim_hash),
             Assertion::single(CFA_DEPTH_COL, 0, BaseElement::ZERO),
             Assertion::single(CFA_DEPTH_COL, last, BaseElement::ZERO),
-            // 3e-boundary: pin the running-mroot column to the public
-            // pre/post roots. With 3e-rootcarry's gated carry constraint
-            // (deferred), the interior cells are forced to lie on the
-            // line connecting these two boundaries via memory rows only.
-            // Until 3e-rootcarry lands, only the endpoints are bound —
-            // a tampering prover could still scribble inside the column,
-            // but no row reads from it yet so that's not exploitable.
+            // 3e-boundary + 3e-rootcarry: pin the running-mroot column to
+            // the public pre/post roots, and (via constraint 7) force every
+            // non-memory row to carry mroot unchanged. Together these say
+            // "mroot[0]=pre, mroot[last]=post, and the only rows that may
+            // mutate mroot are memory ops". Memory-row mutations themselves
+            // remain unbound until 3e-lookup-trace ties them to the
+            // table-side SMT mutations.
             Assertion::single(CFA_MROOT_COL, 0, self.pub_inputs.memory_root_pre),
             Assertion::single(CFA_MROOT_COL, last, self.pub_inputs.memory_root_post),
         ]
@@ -843,6 +857,34 @@ impl Air for ControlFlowAir {
         //    prover claiming `branch_taken=1` on (e.g.) a Set or Remember
         //    row to forge a witness-driven branch decision elsewhere.
         result[5] = bt * (opcode - E::from(BaseElement::new(OPCODE_IF)));
+
+        // 7) 3e-rootcarry: non-memory rows must propagate `mroot` unchanged.
+        //    is_mem(opcode) = I_SET + I_REMEMBER + I_RECALL + I_FORGET, each
+        //    a degree-10 Lagrange indicator. The (1 - is_mem) factor is
+        //    degree 10; (mroot_next - mroot_curr) is degree 1; product is
+        //    degree 11 (within the blowup-16 ceiling).
+        //
+        //    Memory rows zero out the gate, so they're free to mutate the
+        //    running root — 3e-lookup-trace will constrain *what* the
+        //    mutation may be by tying memory-row tuples to the table-side
+        //    SMT mutations via a running-product lookup argument. Until
+        //    then, an interior mutation on a memory row is unbound; but
+        //    the 3e-boundary endpoints still pin the running root to the
+        //    public pre/post envelope, so a prover can't escape the
+        //    declared pre→post path entirely.
+        //
+        //    Wrap transition (last → row 0) is exempted by winterfell's
+        //    `num_transition_exemptions=1` default, so this constraint
+        //    doesn't fire on the boundary where mroot[last] = post and
+        //    mroot[0] = pre would otherwise spuriously trigger it.
+        let i_set = opcode_indicator(opcode, OPCODE_SET);
+        let i_remember = opcode_indicator(opcode, OPCODE_REMEMBER);
+        let i_recall = opcode_indicator(opcode, OPCODE_RECALL);
+        let i_forget = opcode_indicator(opcode, OPCODE_FORGET);
+        let is_mem = i_set + i_remember + i_recall + i_forget;
+        let mroot_curr = cur[CFA_MROOT_COL];
+        let mroot_next = next[CFA_MROOT_COL];
+        result[6] = (E::ONE - is_mem) * (mroot_next - mroot_curr);
     }
 
     fn evaluate_aux_transition<F, E>(
@@ -904,7 +946,7 @@ impl ControlFlowProver {
     }
 
     fn build_trace(&self) -> ControlFlowTrace {
-        // The trace gets five appended "anti-padding" rows after the
+        // The trace gets seven appended "anti-padding" rows after the
         // real ones, then default Nop rows out to a power-of-two length.
         //
         // Anti-pad layout (in order):
@@ -934,6 +976,28 @@ impl ControlFlowProver {
         //                collapses to degree (N/2 − 1) and winterfell's
         //                degree-4 gs-range constraint quotient comes up
         //                short of the expected bound.
+        //   row R+5  : Remember, branch=0, status=0, mroot=pad_mroot
+        //              — opens the mroot gate (is_mem=1) so the running
+        //                mroot can mutate to a sentinel on the next row.
+        //   row R+6  : Forget, branch=0, status=0, mroot=sentinel
+        //              — also opens the gate; mutates mroot back to
+        //                pad_mroot for the padding tail. Net SMT effect
+        //                is intentionally a round-trip — the witness is
+        //                synthetic, not a real memory operation. Its
+        //                purpose is purely to push the `mroot` column
+        //                polynomial off the constant-zero degenerate
+        //                shape that all-zero-mroot traces would
+        //                otherwise produce. Without this, the
+        //                3e-rootcarry constraint polynomial collapses to
+        //                identically-zero on legacy mroot=0 test traces
+        //                and winterfell rejects the prover with a
+        //                "transition constraint degrees didn't match"
+        //                assertion (declared degree 11, actual 0).
+        //                3e-lookup-trace will need to either include
+        //                these tuples in the table-side (treating the
+        //                round-trip as a real Remember+Forget pair) or
+        //                introduce an `is_real` selector column —
+        //                tracked as 3e-lookup-trace's problem.
         //
         // Both IFs are valid under Slice 7's binding constraint
         // `branch_taken * (opcode - IF) = 0`. After the anti-pad
@@ -964,23 +1028,33 @@ impl ControlFlowProver {
         let d_after_real_plus_one_u32 = (d_after_real + 1).max(0) as u32;
 
         let mut rows = real_rows;
-        // Anti-pad rows leave the Phase 3c-AIR memory operand columns
-        // (scope/path/value) at zero — they're non-memory opcodes
-        // (Nop/IF/GoalEnter/GoalExit). Memory-column anti-pad that
-        // drives the future selector off zero on at least one row is
-        // sub-phase 3f's job.
+        // Anti-pad rows R+0..R+4 are non-memory opcodes
+        // (Nop/IF/GoalEnter/IF/GoalExit), so they leave the Phase 3c-AIR
+        // memory operand columns (scope/path/value) at zero. Anti-pad
+        // rows R+5/R+6 are memory opcodes (Remember/Forget) that synth
+        // a round-trip mroot mutation — see the comment at the top of
+        // this fn for the rationale. Their operand columns carry
+        // arbitrary witness values; no constraint reads them yet.
         //
-        // 3e-boundary: the `mroot` cell on every anti-pad and padding
-        // row carries `memory_root_post` (folded). The trace's last
-        // real row's mroot is the SMT root entering that row (3d's
-        // before-row semantics); after its effect lands, the running
-        // root is `memory_root_post`. Anti-pad and padding rows are
-        // non-memory ops, so the running root stays at
-        // `memory_root_post` through the trace tail. Setting these
-        // cells explicitly makes the `mroot[last]` boundary assertion
-        // succeed by construction; 3e-rootcarry will additionally
-        // enforce it row-by-row through the gated carry constraint.
-        let pad_mroot = self.memory_root_post.as_int();
+        // 3e-boundary + 3e-rootcarry: the `mroot` cell on most anti-pad
+        // rows and every padding row carries `memory_root_post`
+        // (folded). The trace's last real row's mroot is the SMT root
+        // entering that row (3d's before-row semantics); after its
+        // effect lands, the running root is `memory_root_post`. Rows
+        // R+0..R+4 (non-memory anti-pad) carry that value unchanged.
+        // R+5 (Remember, memory op) opens the mroot gate and the
+        // running root jumps to a sentinel value at R+6. R+6 (Forget,
+        // memory op) closes the round-trip back to `memory_root_post`,
+        // which then carries through every padding row to satisfy the
+        // `mroot[last]` boundary assertion.
+        let pad_mroot_be = self.memory_root_post;
+        let pad_mroot = pad_mroot_be.as_int();
+        // Sentinel mroot value at R+6 — chosen to differ from
+        // `pad_mroot` so the mroot column polynomial isn't constant.
+        // BaseElement addition wraps the field, so this never collides
+        // with `pad_mroot` regardless of its value.
+        let mroot_sentinel_be = pad_mroot_be + BaseElement::ONE;
+        let mroot_sentinel = mroot_sentinel_be.as_int();
         rows.push(LogTraceRow {
             opcode: 0x00, // Nop
             branch_taken: 0,
@@ -1021,6 +1095,30 @@ impl ControlFlowProver {
             mroot: pad_mroot,
             ..LogTraceRow::default()
         });
+        // R+5: Remember (memory op, is_mem=1). Carry into this row
+        // requires mroot[R+5] = mroot[R+4] = pad_mroot. The row's
+        // is_mem=1 opens the gate, freeing mroot[R+6] to take an
+        // arbitrary value (the sentinel below).
+        rows.push(LogTraceRow {
+            opcode: 0x20, // Remember
+            branch_taken: 0,
+            goal_status: 0,
+            depth: d_after_real_u32,
+            mroot: pad_mroot,
+            ..LogTraceRow::default()
+        });
+        // R+6: Forget (memory op, is_mem=1). Its mroot cell is the
+        // sentinel (mutated by R+5). is_mem=1 opens the gate again,
+        // letting mroot snap back to pad_mroot at R+7 (the first
+        // padding row).
+        rows.push(LogTraceRow {
+            opcode: 0x22, // Forget
+            branch_taken: 0,
+            goal_status: 0,
+            depth: d_after_real_u32,
+            mroot: mroot_sentinel,
+            ..LogTraceRow::default()
+        });
 
         let needed = rows.len().saturating_add(1).max(CFA_MIN_TRACE_LEN);
         let trace_len = if needed.is_power_of_two() {
@@ -1031,12 +1129,10 @@ impl ControlFlowProver {
 
         let claim_hash = self.claim_hash;
         let pad_depth = BaseElement::new(d_after_real_u32 as u128);
-        // Nop-padding rows past the anti-pad sequence carry the same
-        // post-execution mroot as the anti-pad rows themselves, so the
-        // `mroot[last]` boundary against `memory_root_post` is
-        // satisfied by construction. See the anti-pad block above for
-        // the full rationale.
-        let pad_mroot_be = self.memory_root_post;
+        // `pad_mroot_be` already bound above (it's the BaseElement form
+        // of `memory_root_post`). Nop-padding rows past the anti-pad
+        // sequence reuse it so the `mroot[last]` boundary against
+        // `memory_root_post` is satisfied by construction.
 
         // Build columns directly. We can't reuse `TraceTable::fill`
         // anymore because the multi-segment `TraceInfo` it builds
@@ -1877,6 +1973,153 @@ mod tests {
         hidden_change[31] = 0xFF;
         verify_control_flow_proof(&proof, "fold-lossy", [0u8; 32], hidden_change)
             .expect("byte 31 of post lives outside the folded prefix — 3e-boundary alone can't catch this");
+    }
+
+    // ----------------------------------------------------------------------
+    // Phase 3e-rootcarry — non-memory rows must propagate `mroot` unchanged
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn cf_3e_rootcarry_rejects_tampered_non_memory_row() {
+        // Build a valid trace via `from_log_and_commit`, then tamper the
+        // `mroot` of a non-memory row (GoalEnter at row 1) so the carry
+        // constraint between row 1 and row 2 fires:
+        //   step 1→2: is_mem(GoalEnter) = 0 → gate CLOSED
+        //   constraint: mroot[2] == mroot[1]
+        // The untampered mroot[2] (recorded under replay) no longer equals
+        // the tampered mroot[1] → C7 must reject.
+        //
+        // Boundary at mroot[0] still binds to pre-fold (row 0 is Set, also
+        // a memory op, so step 0→1's gate is OPEN — tampering doesn't
+        // surface there). This isolates the carry constraint, not the
+        // boundary one (which is exercised by cf_3e_boundary_* tests).
+        let mut starting = MemoryCommit::new();
+        starting.apply_remember(MemoryScope::LongTerm, &[1u8; 32], [9u8; 32]);
+        let pre_root = starting.root();
+
+        let mut log = ExecutionLog::new();
+        log.record(LogEntry {
+            operands: Operands::Set {
+                name_hash: [3u8; 32],
+                value_hash: [4u8; 32],
+            },
+        });
+        log.record(LogEntry {
+            operands: Operands::GoalEnter {
+                name_hash: [5u8; 32],
+                audit_root: [6u8; 32],
+            },
+        });
+        log.record(LogEntry {
+            operands: Operands::Set {
+                name_hash: [7u8; 32],
+                value_hash: [8u8; 32],
+            },
+        });
+        // Pair the GoalEnter with a matching GoalExit so the trace's
+        // depth column lands back at 0 at the boundary — otherwise the
+        // last-row depth assertion (CFA_DEPTH_COL) fires before C7
+        // gets a chance to evaluate.
+        log.record(LogEntry {
+            operands: Operands::GoalExit {
+                name_hash: [5u8; 32],
+                status: crate::runtime::exec_log::GoalStatus::Success,
+                audit_root: [6u8; 32],
+            },
+        });
+
+        let mut post_commit = starting.clone();
+        post_commit.apply_remember(MemoryScope::Working, &[3u8; 32], [4u8; 32]);
+        post_commit.apply_remember(MemoryScope::Working, &[7u8; 32], [8u8; 32]);
+        let post_root = post_commit.root();
+
+        let trace = LogTrace::from_log_and_commit(&log, starting);
+        let mut rows = trace.rows;
+        // Tamper row 1's mroot. Row 0 (Set) and row 2 (Set) untouched,
+        // so the boundary at mroot[0] still matches `pre_root` and the
+        // memory-op gate at step 0→1 doesn't catch the change.
+        rows[1].mroot ^= 0xDEAD_BEEFu128;
+
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            generate_control_flow_proof_from_rows(
+                rows,
+                "rootcarry-tamper",
+                BaseElement::new(fold_to_u128(&pre_root)),
+                BaseElement::new(fold_to_u128(&post_root)),
+            )
+        }));
+        std::panic::set_hook(prev_hook);
+
+        match result {
+            Err(_) => {} // panic during prove — rejected
+            Ok(Err(_)) => {} // prove returned Err — rejected
+            Ok(Ok(proof)) => assert!(
+                verify_control_flow_proof(&proof, "rootcarry-tamper", pre_root, post_root)
+                    .is_err(),
+                "tampered non-memory row's mroot must be rejected"
+            ),
+        }
+    }
+
+    #[test]
+    fn cf_3e_rootcarry_accepts_untampered_replay_trace() {
+        // Sanity twin of the negative test: the same log + commit produces
+        // a trace that round-trips cleanly. Guards against regressions
+        // where the C7 constraint accidentally fires on a *valid* trace
+        // (e.g., if the is_mem indicator polynomial picks up an opcode it
+        // shouldn't, or if the anti-pad rows' mroot column drifts off
+        // `memory_root_post`).
+        let mut starting = MemoryCommit::new();
+        starting.apply_remember(MemoryScope::LongTerm, &[1u8; 32], [9u8; 32]);
+        let pre_root = starting.root();
+
+        let mut log = ExecutionLog::new();
+        log.record(LogEntry {
+            operands: Operands::Set {
+                name_hash: [3u8; 32],
+                value_hash: [4u8; 32],
+            },
+        });
+        log.record(LogEntry {
+            operands: Operands::GoalEnter {
+                name_hash: [5u8; 32],
+                audit_root: [6u8; 32],
+            },
+        });
+        log.record(LogEntry {
+            operands: Operands::Set {
+                name_hash: [7u8; 32],
+                value_hash: [8u8; 32],
+            },
+        });
+        // Pair the GoalEnter with a matching GoalExit so the trace's
+        // depth column lands back at 0 at the boundary — otherwise the
+        // last-row depth assertion (CFA_DEPTH_COL) fires before C7
+        // gets a chance to evaluate.
+        log.record(LogEntry {
+            operands: Operands::GoalExit {
+                name_hash: [5u8; 32],
+                status: crate::runtime::exec_log::GoalStatus::Success,
+                audit_root: [6u8; 32],
+            },
+        });
+
+        let mut post_commit = starting.clone();
+        post_commit.apply_remember(MemoryScope::Working, &[3u8; 32], [4u8; 32]);
+        post_commit.apply_remember(MemoryScope::Working, &[7u8; 32], [8u8; 32]);
+        let post_root = post_commit.root();
+
+        let proof = generate_control_flow_proof_with_commit(
+            &log,
+            starting,
+            post_root,
+            "rootcarry-roundtrip",
+        )
+        .expect("valid replay must produce a proof");
+        verify_control_flow_proof(&proof, "rootcarry-roundtrip", pre_root, post_root)
+            .expect("untampered rootcarry trace must verify");
     }
 
     #[test]

@@ -3216,9 +3216,18 @@ mod tests {
         let logs = ctx.exec_logs.lock().unwrap();
         let log = logs.get("p").expect("log");
         let opcodes: Vec<Opcode> = log.entries().iter().map(|e| e.opcode()).collect();
+        // Phase 3e: store_goal_result emits a synthetic SET for the
+        // goal-name → result write so the trace replay's running SMT
+        // root matches `MemoryCommit::from_context` post-body. The two
+        // SETs are: body write `x = 1.0`, then `g = Object({"x": 1.0})`.
         assert_eq!(
             opcodes,
-            vec![Opcode::GoalEnter, Opcode::Set, Opcode::GoalExit]
+            vec![
+                Opcode::GoalEnter,
+                Opcode::Set,
+                Opcode::Set,
+                Opcode::GoalExit
+            ]
         );
 
         match log.entries().last().unwrap().operands {
@@ -3561,15 +3570,25 @@ mod tests {
         eval(&prove, ctx.clone()).await.unwrap();
 
         // Check the recorded log shape: GoalEnter, If(branch_taken=true),
-        // Set, GoalExit — in that order.
+        // Set (body), Set (goal-result), GoalExit — in that order. The
+        // trailing Set is the synthetic store_goal_result write that
+        // pairs with the implicit working_variables mutation so trace
+        // replay's running SMT root matches `MemoryCommit::from_context`
+        // post-body (Phase 3e-rootcarry).
         {
             let logs = ctx.exec_logs.lock().unwrap();
             let log = logs.get("p").expect("log stored under proof_name");
             let opcodes: Vec<Opcode> = log.entries().iter().map(|e| e.opcode()).collect();
             assert_eq!(
                 opcodes,
-                vec![Opcode::GoalEnter, Opcode::If, Opcode::Set, Opcode::GoalExit],
-                "expected nested Goal/If/Set/GoalExit log shape"
+                vec![
+                    Opcode::GoalEnter,
+                    Opcode::If,
+                    Opcode::Set,
+                    Opcode::Set,
+                    Opcode::GoalExit
+                ],
+                "expected nested Goal/If/Set/Set/GoalExit log shape"
             );
             let if_entry = log
                 .entries()

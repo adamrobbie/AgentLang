@@ -1,6 +1,6 @@
 # AgentLang ZKP — Implementation Status
 
-**Last updated:** 2026-04-30
+**Last updated:** 2026-05-07
 **Branch:** `security-hardening-1` (5 commits ahead of `main` as of push)
 
 This is a snapshot of where the per-statement-AIR roadmap actually stands
@@ -98,9 +98,9 @@ forward constraint into Phase 3+:
 ### Phase 3 — Memory commitment + REMEMBER/RECALL lookup ⏳
 
 **Sub-phases 3a + 3b + 3c-runtime + 3c-AIR + 3d + 3e-aux-shape +
-3e-boundary shipped.** 3e-rootcarry, 3e-lookup-trace, 3e-lookup-table,
-and 3f–3h still ahead — the remaining 3e sub-pieces (row-carry +
-lookup argument) stay the highest schedule risk in the roadmap.
+3e-boundary + 3e-rootcarry shipped.** 3e-lookup-trace, 3e-lookup-table,
+and 3f–3h still ahead — the remaining 3e sub-pieces (lookup argument)
+stay the highest schedule risk in the roadmap.
 Implementation plan drafted 2026-05-06 in
 [`phase3-implementation-plan.md`](phase3-implementation-plan.md) — that
 doc walks the work in 8 sub-phases (3a–3h) against concrete file:line
@@ -381,6 +381,64 @@ _nonzero_pre_post`, `cf_3e_boundary_rejects_tampered_memory_root_pre`,
 control-flow tests updated to pass `[0u8; 32]` for pre/post (their
 hand-built traces use `mroot=0` throughout). Library suite: 403
 passing (up from 399).
+
+**Sub-phase 3e-rootcarry — gated row-by-row mroot carry ✅** (2026-05-07)
+
+`ControlFlowAir` grows a 7th main transition constraint:
+`(1 - is_mem(opcode)) * (mroot_next - mroot_curr) = 0`, declared at
+degree 11. The selector `is_mem = I_SET + I_REMEMBER + I_RECALL +
+I_FORGET` follows option (Y) — `Statement::Set` joins the memory
+opcodes per the 2026-05-06 plan decision (memory file
+`zkp_set_joins_memory_selector.md`). Each `opcode_indicator` is the
+degree-10 Lagrange polynomial defined in 3c-AIR, so the gate stays
+within the blowup-16 ceiling with 5 degrees of headroom.
+
+Combined with the 3e-boundary endpoints, every row pair now satisfies
+either `mroot_next = mroot_curr` (gate closed) or has the gate open
+to a memory mutation. The trace's `mroot[last]` was already pinned to
+`memory_root_post` by 3e-boundary, so the row-by-row carry now closes
+the loop: a malicious prover can no longer hide a non-memory-row mroot
+mutation inside the trace.
+
+Two trace-shape changes were necessary to keep the constraint
+satisfiable:
+
+- **Synthetic SET log entries from goal/call result writes.**
+  `store_goal_result` (`runtime/goal.rs`), `store_call_result`
+  (`runtime/call.rs`), and `Statement::UseWasm`'s `result_into` write
+  (`runtime/eval.rs`) all mutate `working_variables` via
+  `ctx.set_variable*`, but historically did so without recording an
+  exec-log entry. That left `LogTrace::from_log_and_commit` replay
+  unaware of the writes, so the replay's running SMT root diverged
+  from `MemoryCommit::from_context` post-body — breaking C7 at the
+  step (last_real → anti-pad). Each of these now emits a paired
+  `Operands::Set` log entry hashed from the same `(name, value)` bytes
+  `from_context` will walk. Affected runtime tests had their expected
+  log shapes updated (e.g., `prove_records_goal_enter_then_body_then_exit`
+  now expects `[GoalEnter, Set, Set, GoalExit]`).
+- **Anti-pad extended from 5 to 7 rows.** Hand-built test traces use
+  `mroot=0` throughout, which would make the C7 constraint polynomial
+  identically zero and trip winterfell's degenerate-witness rejection
+  ("transition constraint degrees didn't match"). The anti-pad now
+  appends a `Remember` row at `pad_mroot` and a `Forget` row at
+  `pad_mroot + 1` (sentinel), both `is_mem=1` so the gate is open and
+  the column is free to vary. The Forget row's `is_mem=1` also lets
+  `mroot[R+7]` snap back to `pad_mroot` for the padding tail without
+  violating the carry. Net SMT effect on the running root: `+1, -1`,
+  so `mroot[last]` still equals `pad_mroot = memory_root_post` for
+  the boundary at the trace's end.
+
+Test coverage: 2 new `crypto::tests`
+(`cf_3e_rootcarry_rejects_tampered_non_memory_row` —
+tamper a non-memory row's mroot in a real-replay trace, expect
+rejection; `cf_3e_rootcarry_accepts_untampered_replay_trace` —
+sanity twin guarding against C7 firing on valid traces). 4 runtime
+tests (`prove_records_goal_enter_then_body_then_exit`,
+`prove_goal_if_else_round_trips_through_reveal`,
+`prove_records_call_envelope`, `prove_records_use_wasm_envelope`)
+updated for the new log shapes. Library suite: 405 passing (up from
+403). All 8 existing `crypto::tests` round-trip the now-7-row
+anti-pad without changes.
 
 Required work, per the deep-dive's §"Memory" and Phase 3 plan:
 

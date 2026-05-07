@@ -1,5 +1,6 @@
 use super::audit::AgentError;
 use super::context::Context;
+use super::exec_log::{self, LogEntry, Operands};
 use super::memory::{propagate_container_metadata, resolve_path};
 use crate::ast::*;
 use anyhow::Result;
@@ -95,11 +96,32 @@ pub async fn store_goal_result(
         None
     };
 
+    // Phase 3e: store_goal_result mutates `working_variables` exactly
+    // like `Statement::Set`, but historically did so without recording
+    // an exec-log entry. That left replay (`LogTrace::from_log_and_commit`)
+    // unaware of the write, so the replay's running SMT root diverged
+    // from `MemoryCommit::from_context` post-body — breaking the C7
+    // root-carry constraint at step (last_real → anti-pad). Emit a SET
+    // log entry per write so the AIR's `mroot` column ends at the same
+    // root the envelope advertises.
+    ctx.record_log(LogEntry {
+        operands: Operands::Set {
+            name_hash: exec_log::hash(goal_name.as_bytes()),
+            value_hash: exec_log::hash(format!("{:?}", result.value).as_bytes()),
+        },
+    });
     ctx.set_variable(goal_name.to_string(), result, MemoryScope::Working)
         .await?;
 
     if let Some(value) = flat_result {
-        ctx.set_variable(format!("{}.result", goal_name), value, MemoryScope::Working)
+        let result_name = format!("{}.result", goal_name);
+        ctx.record_log(LogEntry {
+            operands: Operands::Set {
+                name_hash: exec_log::hash(result_name.as_bytes()),
+                value_hash: exec_log::hash(format!("{:?}", value.value).as_bytes()),
+            },
+        });
+        ctx.set_variable(result_name, value, MemoryScope::Working)
             .await?;
     }
 

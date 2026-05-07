@@ -1380,6 +1380,19 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             if let Some(path) = result_into {
                 ctx.set_variable_path(path, mock_result, MemoryScope::Working)
                     .await?;
+                // Phase 3e: pair the working_variables write with a SET
+                // log entry so trace replay's running SMT root matches
+                // `MemoryCommit::from_context` after this row. The SMT
+                // leaf is keyed on `path.root`'s name + post-merge value,
+                // so re-read it after the write to capture exactly what
+                // `from_context` will hash.
+                let stored = ctx.get_variable(&path.root, MemoryScope::Working).await?;
+                ctx.record_log(LogEntry {
+                    operands: Operands::Set {
+                        name_hash: exec_log::hash(path.root.as_bytes()),
+                        value_hash: exec_log::hash(format!("{:?}", stored.value).as_bytes()),
+                    },
+                });
             }
             Ok(())
         }
