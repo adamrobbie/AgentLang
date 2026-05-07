@@ -286,7 +286,13 @@ impl Prover for ExecutionProver {
 /// History:
 /// - `1` — first explicitly versioned shape. `state_digest` polynomial
 ///   binding + optional `control_flow` segment (Phase 2 control-flow AIR).
-pub const CURRENT_PROOF_VERSION: u8 = 1;
+/// - `2` — adds `memory_root_pre`/`memory_root_post`. Phase 3b: the fields
+///   are present in the wire shape but the AIR does not yet bind them
+///   (that lands in 3e). Phase 3b consumers see them as runtime-side
+///   metadata that the [`StoredProof`] wrapper cross-checks against
+///   what the runtime actually observed, closing the envelope-integrity
+///   loop ahead of in-AIR enforcement.
+pub const CURRENT_PROOF_VERSION: u8 = 2;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct StarkProof {
@@ -323,6 +329,36 @@ pub struct StarkProof {
     /// present, `verify_proof` verifies it alongside the digest layer.
     #[serde(default)]
     pub control_flow: Option<ControlFlowProof>,
+    /// Memory commitment root captured by the prover *before* executing
+    /// the `Prove` body. Phase 3b carries this in the envelope only;
+    /// Phase 3e will enforce it as a public input the AIR's first row
+    /// pins. `generate_proof` defaults this to `[0u8; 32]`; the runtime
+    /// (`Statement::Prove`) overrides it with the empty-SMT root or the
+    /// actual pre-state root once Phase 3c lands the Context-level
+    /// commitment.
+    #[serde(default)]
+    pub memory_root_pre: [u8; 32],
+    /// Memory commitment root captured by the prover *after* executing
+    /// the `Prove` body. Same status as `memory_root_pre` in 3b.
+    #[serde(default)]
+    pub memory_root_post: [u8; 32],
+}
+
+/// Runtime-side proof envelope. Wraps a [`StarkProof`] with the memory
+/// roots the runtime *actually observed* at Prove start/end.
+///
+/// `Statement::Reveal` cross-checks the prover-claimed roots inside the
+/// `StarkProof` against these runtime-observed roots before invoking
+/// `verify_proof`. That binding closes the loop a malicious prover could
+/// otherwise exploit by claiming arbitrary `memory_root_pre`/`post`
+/// values inside the proof envelope. Phase 3b ships the binding ahead
+/// of in-AIR enforcement (3e) so the wire shape and dispatch path stay
+/// stable when the AIR-side constraints turn on.
+#[derive(Clone)]
+pub struct StoredProof {
+    pub proof: StarkProof,
+    pub memory_root_pre: [u8; 32],
+    pub memory_root_post: [u8; 32],
 }
 
 fn fold_to_u64(bytes: &[u8]) -> u64 {
@@ -429,6 +465,11 @@ pub fn generate_proof(state_bytes: &[u8], claim: &str) -> anyhow::Result<StarkPr
         trace_length: trace_length as u64,
         multiplier: multiplier.as_int() as u64,
         control_flow: None,
+        // Phase 3b: defaults; the runtime overrides these in
+        // `Statement::Prove` with the empty-SMT root (3b/3c) or the
+        // actual pre/post memory roots once 3c wires Context state.
+        memory_root_pre: [0u8; 32],
+        memory_root_post: [0u8; 32],
     })
 }
 
@@ -446,12 +487,25 @@ pub fn generate_proof(state_bytes: &[u8], claim: &str) -> anyhow::Result<StarkPr
 pub fn verify_proof(proof_data: &StarkProof, claim: &str) -> anyhow::Result<()> {
     match proof_data.proof_version {
         1 => verify_proof_v1(proof_data, claim),
+        2 => verify_proof_v2(proof_data, claim),
         v => Err(anyhow::anyhow!(
             "Unsupported proof version {} (this verifier supports {})",
             v,
             CURRENT_PROOF_VERSION
         )),
     }
+}
+
+/// Phase 3b: v2 currently mirrors v1 — the `memory_root_pre`/`post`
+/// envelope fields are present on the wire but the AIR does not yet
+/// enforce them. The Phase 3 binding lives runtime-side via
+/// [`StoredProof`]: `Statement::Reveal` asserts the prover-claimed
+/// roots match what the runtime observed before calling this verifier.
+/// Phase 3e replaces this body with an AIR-level memory_root boundary
+/// check; the v1 dispatch arm stays alive so older proofs keep
+/// verifying after that change.
+fn verify_proof_v2(proof_data: &StarkProof, claim: &str) -> anyhow::Result<()> {
+    verify_proof_v1(proof_data, claim)
 }
 
 fn verify_proof_v1(proof_data: &StarkProof, claim: &str) -> anyhow::Result<()> {
@@ -525,6 +579,7 @@ pub fn digest_state_bytes(state_bytes: &[u8], claim: &str) -> u128 {
 // AIR's input — Phase 3 (sha256-in-air) will close that gap.
 
 use crate::runtime::exec_log::{ExecutionLog, LogTrace, LogTraceRow};
+use crate::runtime::memory_commit::MemoryCommit;
 
 /// Stable opcode bytes the AIR accepts. Must mirror `Opcode` discriminants
 /// in `runtime::exec_log`. Pinned by `opcode_byte_values_are_stable`.
@@ -537,12 +592,82 @@ const CFA_BRANCH_COL: usize = 1;
 const CFA_STATUS_COL: usize = 2;
 const CFA_CLAIM_COL: usize = 3;
 const CFA_DEPTH_COL: usize = 4;
-const CFA_NUM_COLS: usize = 5;
+// ---- Phase 3c-AIR memory-row witness columns ----------------------------
+// Witness only — no transition constraint references these columns yet.
+// Sub-phase 3d wires the running SMT root through the prover so
+// `CFA_MROOT_COL` carries real values; sub-phase 3e adds the auxiliary
+// segment Z column and the gated `(scope, path, value, mroot)` lookup
+// against the table-side memory commitment. Adding the witness columns
+// now keeps the trace-shape evolution decoupled from constraint work,
+// so the existing Phase 2 constraint suite stays green across this
+// landing and 3d/3e can ship as targeted constraint deltas.
+const CFA_SCOPE_COL: usize = 5;
+const CFA_PATH_COL: usize = 6;
+const CFA_VALUE_COL: usize = 7;
+const CFA_MROOT_COL: usize = 8;
+const CFA_NUM_COLS: usize = 9;
 const CFA_MIN_TRACE_LEN: usize = 8;
 
 const OPCODE_GOAL_ENTER: u128 = 0x01;
 const OPCODE_GOAL_EXIT: u128 = 0x02;
 const OPCODE_IF: u128 = 0x11;
+
+// ---- Phase 3e-aux-shape: multi-segment trace plumbing -------------------
+//
+// The Phase 3 lookup/root-carry constraints all live on an *auxiliary*
+// trace segment whose contents are committed after the main trace, so
+// the prover can't grind their values to satisfy the lookup product.
+// Until the lookup actually lands, the aux segment carries a single
+// trivial column `Z = 1` constrained by `Z_next - Z_curr = 0` (degree 1)
+// with boundary `Z[0] = 1`. This pins the column to a constant — useless
+// on its own, but it gets the multi-segment plumbing in place so
+// 3e-rootcarry / 3e-lookup-trace can ship as constraint-only edits.
+//
+// `TraceTable<BaseElement>`'s constructor always builds a single-segment
+// `TraceInfo`, which `AirContext::new_multi_segment` rejects. We have to
+// thread our own multi-segment `TraceInfo` through, which means a custom
+// `Trace` impl over `ColMatrix`. The shape (main_width=9, aux_width=1,
+// num_aux_rand=1, no periodic columns) is what 3e-rootcarry will keep
+// and 3e-lookup-trace will extend (likely to num_aux_rand=2 for α/β).
+
+/// Width of the auxiliary segment. One trivial Z column today; stays at
+/// 1 through 3e-rootcarry and 3e-lookup-trace (the running product fits
+/// in the same column — only the recurrence changes).
+const CFA_AUX_WIDTH: usize = 1;
+/// Aux randomness count requested from the public coin. We don't read
+/// it in the trivial-Z carry, but winterfell still needs a non-zero
+/// allocation when an aux segment is present, and 3e-lookup-trace will
+/// bump this to 2 (α and β over the memory tuple).
+const CFA_AUX_RAND_COUNT: usize = 1;
+
+/// Custom `Trace` impl carrying a multi-segment `TraceInfo`. Mirrors
+/// the `LookupAuxTrace` pattern from `prototypes/lookup-bench` —
+/// committed-once `ColMatrix` of main columns plus a `TraceInfo` that
+/// reports the aux-segment width to winterfell. The aux Z column is
+/// built at prove time inside `ControlFlowProver::build_aux_trace`.
+#[derive(Clone)]
+pub struct ControlFlowTrace {
+    info: TraceInfo,
+    main: ColMatrix<BaseElement>,
+}
+
+impl Trace for ControlFlowTrace {
+    type BaseField = BaseElement;
+
+    fn info(&self) -> &TraceInfo {
+        &self.info
+    }
+
+    fn main_segment(&self) -> &ColMatrix<Self::BaseField> {
+        &self.main
+    }
+
+    fn read_main_frame(&self, row_idx: usize, frame: &mut EvaluationFrame<Self::BaseField>) {
+        let next_row_idx = (row_idx + 1) % self.info.length();
+        self.main.read_row_into(row_idx, frame.current_mut());
+        self.main.read_row_into(next_row_idx, frame.next_mut());
+    }
+}
 
 /// Lagrange indicator polynomial that is 1 at `target` and 0 at every
 /// other valid opcode. Degree 10 over the 11-element opcode alphabet.
@@ -584,14 +709,14 @@ impl Air for ControlFlowAir {
     type PublicInputs = ControlFlowPublicInputs;
 
     fn new(trace_info: TraceInfo, pub_inputs: Self::PublicInputs, options: ProofOptions) -> Self {
-        // Constraint degrees:
+        // Main constraint degrees:
         //   opcode validity:  product of 11 linear factors → degree 11
         //   branch_taken bool: x*(x-1)                     → degree 2
         //   goal_status range: x*(x-1)*(x-2)*(x-3)         → degree 4
         //   claim_hash carry: next - current               → degree 1
         //   depth recurrence: degree-10 indicator polys    → degree 10
         //   branch-IF binding: branch_taken*(opcode-IF)    → degree 2
-        let degrees = vec![
+        let main_degrees = vec![
             winterfell::TransitionConstraintDegree::new(11),
             winterfell::TransitionConstraintDegree::new(2),
             winterfell::TransitionConstraintDegree::new(4),
@@ -599,11 +724,21 @@ impl Air for ControlFlowAir {
             winterfell::TransitionConstraintDegree::new(10),
             winterfell::TransitionConstraintDegree::new(2),
         ];
-        // Three boundary assertions:
+        // Aux constraint degree: trivial Z carry (next - curr = 0). 3e-
+        // rootcarry replaces this with `(1 - is_mem(opcode)) * (mroot_next
+        // - mroot_curr)` (degree 11); 3e-lookup-trace replaces it again
+        // with the gated running-product recurrence (degree 12 under the
+        // blowup-16 ceiling). Both fit because the aux constraint shape
+        // stays "one column, one transition" — only its degree changes.
+        let aux_degrees = vec![winterfell::TransitionConstraintDegree::new(1)];
+        // Three main boundary assertions:
         //   - claim_hash at row 0 binds the trace to the claim
         //   - depth at row 0 = 0 (clean stack on entry)
         //   - depth at last row = 0 (every Enter matched by an Exit)
-        let context = AirContext::new(trace_info, degrees, 3, options);
+        // One aux boundary assertion:
+        //   - Z[0] = 1 (running product initialised). Combined with the
+        //     transition above, pins Z to the constant 1 today.
+        let context = AirContext::new_multi_segment(trace_info, main_degrees, aux_degrees, 3, 1, options);
         Self {
             context,
             pub_inputs,
@@ -669,6 +804,34 @@ impl Air for ControlFlowAir {
         result[5] = bt * (opcode - E::from(BaseElement::new(OPCODE_IF)));
     }
 
+    fn evaluate_aux_transition<F, E>(
+        &self,
+        _main_frame: &EvaluationFrame<F>,
+        aux_frame: &EvaluationFrame<E>,
+        _periodic_values: &[F],
+        _aux_rand_elements: &AuxRandElements<E>,
+        result: &mut [E],
+    ) where
+        F: FieldElement<BaseField = Self::BaseField>,
+        E: FieldElement<BaseField = Self::BaseField> + winterfell::math::ExtensionOf<F>,
+    {
+        // 3e-aux-shape: trivial Z carry. With Z[0]=1 boundary this pins Z
+        // to the constant 1 — no soundness work yet. 3e-rootcarry swaps
+        // this for the gated mroot-carry constraint; 3e-lookup-trace
+        // swaps it again for the running-product recurrence. The aux-
+        // segment plumbing it lands here is identical for all three.
+        let z_curr = aux_frame.current()[0];
+        let z_next = aux_frame.next()[0];
+        result[0] = z_next - z_curr;
+    }
+
+    fn get_aux_assertions<E: FieldElement<BaseField = Self::BaseField>>(
+        &self,
+        _aux_rand_elements: &AuxRandElements<E>,
+    ) -> Vec<Assertion<E>> {
+        vec![Assertion::single(0, 0, E::ONE)]
+    }
+
     fn context(&self) -> &AirContext<Self::BaseField> {
         &self.context
     }
@@ -689,7 +852,7 @@ impl ControlFlowProver {
         }
     }
 
-    fn build_trace(&self) -> TraceTable<BaseElement> {
+    fn build_trace(&self) -> ControlFlowTrace {
         // The trace gets five appended "anti-padding" rows after the
         // real ones, then default Nop rows out to a power-of-two length.
         //
@@ -750,35 +913,45 @@ impl ControlFlowProver {
         let d_after_real_plus_one_u32 = (d_after_real + 1).max(0) as u32;
 
         let mut rows = real_rows;
+        // Anti-pad rows leave the Phase 3c-AIR memory columns at zero
+        // (their `Default::default()` values). Memory-column anti-pad
+        // is sub-phase 3f's job: until the lookup constraints in 3e
+        // turn on, no row drives the future memory selector off zero,
+        // so a zeroed memory tail can't shift the lookup product.
         rows.push(LogTraceRow {
             opcode: 0x00, // Nop
             branch_taken: 0,
             goal_status: 0,
             depth: d_after_real_u32,
+            ..LogTraceRow::default()
         });
         rows.push(LogTraceRow {
             opcode: 0x11, // IF #1 — branch_taken=1 at depth d (pre-GoalEnter)
             branch_taken: 1,
             goal_status: 0,
             depth: d_after_real_u32,
+            ..LogTraceRow::default()
         });
         rows.push(LogTraceRow {
             opcode: 0x01, // GoalEnter
             branch_taken: 0,
             goal_status: 0,
             depth: d_after_real_u32,
+            ..LogTraceRow::default()
         });
         rows.push(LogTraceRow {
             opcode: 0x11, // IF #2 — branch_taken=1 at depth d+1 (post-GoalEnter)
             branch_taken: 1,
             goal_status: 0,
             depth: d_after_real_plus_one_u32,
+            ..LogTraceRow::default()
         });
         rows.push(LogTraceRow {
             opcode: 0x02, // GoalExit
             branch_taken: 0,
             goal_status: 3, // Timeout — chosen to break gs column even-symmetry
             depth: d_after_real_plus_one_u32,
+            ..LogTraceRow::default()
         });
 
         let needed = rows.len().saturating_add(1).max(CFA_MIN_TRACE_LEN);
@@ -788,41 +961,84 @@ impl ControlFlowProver {
             needed.next_power_of_two()
         };
 
-        let mut trace = TraceTable::new(CFA_NUM_COLS, trace_len);
         let claim_hash = self.claim_hash;
         let pad_depth = BaseElement::new(d_after_real_u32 as u128);
 
-        let fill_state = |state: &mut [BaseElement], row_opt: Option<LogTraceRow>| {
+        // Build columns directly. We can't reuse `TraceTable::fill`
+        // anymore because the multi-segment `TraceInfo` it builds
+        // internally has aux_width=0, and `ControlFlowAir`'s context
+        // declares aux_width=1 — mismatched info shapes between trace
+        // and AIR cause the prover to panic at composition time.
+        let mut opcode_col = Vec::with_capacity(trace_len);
+        let mut branch_col = Vec::with_capacity(trace_len);
+        let mut status_col = Vec::with_capacity(trace_len);
+        let mut claim_col = Vec::with_capacity(trace_len);
+        let mut depth_col = Vec::with_capacity(trace_len);
+        let mut scope_col = Vec::with_capacity(trace_len);
+        let mut path_col = Vec::with_capacity(trace_len);
+        let mut value_col = Vec::with_capacity(trace_len);
+        let mut mroot_col = Vec::with_capacity(trace_len);
+
+        for step in 0..trace_len {
+            let row_opt = rows.get(step).copied();
             let row = row_opt.unwrap_or_default();
-            state[CFA_OPCODE_COL] = BaseElement::new(row.opcode as u128);
-            state[CFA_BRANCH_COL] = BaseElement::new(row.branch_taken as u128);
-            state[CFA_STATUS_COL] = BaseElement::new(row.goal_status as u128);
-            state[CFA_CLAIM_COL] = claim_hash;
+            opcode_col.push(BaseElement::new(row.opcode as u128));
+            branch_col.push(BaseElement::new(row.branch_taken as u128));
+            status_col.push(BaseElement::new(row.goal_status as u128));
+            claim_col.push(claim_hash);
             // Default-padding rows carry depth = d_after_real so the
             // depth recurrence holds across the Nop tail. Real and
             // anti-pad rows already encode their own depth.
-            state[CFA_DEPTH_COL] = if row_opt.is_some() {
+            depth_col.push(if row_opt.is_some() {
                 BaseElement::new(row.depth as u128)
             } else {
                 pad_depth
-            };
-        };
+            });
+            // Phase 3c-AIR memory-row witness columns. Witness only —
+            // no transition constraint reads from these in 3c/3d, so
+            // the existing main degree budget is unchanged. SET/REMEMBER/
+            // RECALL/FORGET rows carry the operand-derived values
+            // populated by `LogTrace::from*`; every other opcode (and
+            // every padding row) keeps zeros.
+            scope_col.push(BaseElement::new(row.scope as u128));
+            path_col.push(BaseElement::new(row.path));
+            value_col.push(BaseElement::new(row.value));
+            mroot_col.push(BaseElement::new(row.mroot));
+        }
 
-        trace.fill(
-            |state| fill_state(state, rows.first().copied()),
-            |step, state| {
-                let next_idx = step + 1;
-                fill_state(state, rows.get(next_idx).copied());
-            },
+        // Assemble columns by their named index so the layout invariant
+        // (`CFA_*_COL` constants vs. ColMatrix column order) is enforced
+        // at construction, not just trusted in commentary. 3e-rootcarry's
+        // `evaluate_aux_transition` reads `cur[CFA_MROOT_COL]` etc. — if
+        // this assembly ever drifts from the constants, the AIR would
+        // silently constrain the wrong column, which is exactly the
+        // class of bug worth catching at the source.
+        let mut main_columns: Vec<Vec<BaseElement>> = vec![Vec::new(); CFA_NUM_COLS];
+        main_columns[CFA_OPCODE_COL] = opcode_col;
+        main_columns[CFA_BRANCH_COL] = branch_col;
+        main_columns[CFA_STATUS_COL] = status_col;
+        main_columns[CFA_CLAIM_COL] = claim_col;
+        main_columns[CFA_DEPTH_COL] = depth_col;
+        main_columns[CFA_SCOPE_COL] = scope_col;
+        main_columns[CFA_PATH_COL] = path_col;
+        main_columns[CFA_VALUE_COL] = value_col;
+        main_columns[CFA_MROOT_COL] = mroot_col;
+        let main = ColMatrix::new(main_columns);
+        let info = TraceInfo::new_multi_segment(
+            CFA_NUM_COLS,
+            CFA_AUX_WIDTH,
+            CFA_AUX_RAND_COUNT,
+            trace_len,
+            vec![],
         );
-        trace
+        ControlFlowTrace { info, main }
     }
 }
 
 impl Prover for ControlFlowProver {
     type BaseField = BaseElement;
     type Air = ControlFlowAir;
-    type Trace = TraceTable<BaseElement>;
+    type Trace = ControlFlowTrace;
     type HashFn = Blake3_256<Self::BaseField>;
     type VC = MerkleTree<Self::HashFn>;
     type RandomCoin = DefaultRandomCoin<Self::HashFn>;
@@ -876,6 +1092,24 @@ impl Prover for ControlFlowProver {
             partition_options,
         )
     }
+
+    /// 3e-aux-shape: trivial Z column. Always 1, doesn't reference
+    /// `aux_rand_elements`. 3e-rootcarry replaces the body with the
+    /// gated mroot-carry recurrence; 3e-lookup-trace replaces it again
+    /// with the running-product recurrence keyed on α/β. The signature
+    /// (and the multi-segment trace plumbing it relies on) stays the
+    /// same across all three.
+    fn build_aux_trace<E>(
+        &self,
+        main_trace: &Self::Trace,
+        _aux_rand_elements: &AuxRandElements<E>,
+    ) -> ColMatrix<E>
+    where
+        E: FieldElement<BaseField = Self::BaseField>,
+    {
+        let n = main_trace.info().length();
+        ColMatrix::new(vec![vec![E::ONE; n]])
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -888,11 +1122,38 @@ pub struct ControlFlowProof {
 /// Builds a ControlFlowProof binding the given log's control-flow witnesses
 /// to the claim. Same claim-hash derivation as the digest AIR so a single
 /// claim string keys both proofs.
+///
+/// `mroot` column stays zero — this entry point is for callers that have
+/// no starting `MemoryCommit` to thread (hand-built fuzz/test traces and
+/// the v2 envelope path that doesn't yet attest mroot in-AIR). The
+/// production `Statement::Prove` path goes through
+/// [`generate_control_flow_proof_with_commit`] which populates `mroot`
+/// from a real running commit.
 pub fn generate_control_flow_proof(
     log: &ExecutionLog,
     claim: &str,
 ) -> anyhow::Result<ControlFlowProof> {
     let trace = LogTrace::from(log);
+    generate_control_flow_proof_from_rows(trace.rows, claim)
+}
+
+/// Sub-phase 3d: builds a ControlFlowProof whose `CFA_MROOT_COL` carries
+/// the running SMT root from `starting_commit` advanced by each memory
+/// operation in `log`. `starting_commit` should be `MemoryCommit::from_context`
+/// taken at Prove start so `rows[0].mroot` matches `memory_root_pre`.
+///
+/// Witness only — sub-phase 3e adds the boundary assertions and lookup
+/// running product that make the column verifiable. Until then, the
+/// column cells exist for the AIR's transition evaluation to read but
+/// no constraint references them, so a tampering prover gets no
+/// in-AIR rejection from `mroot` alone. Reveal-side envelope-integrity
+/// (3b) plus the runtime equality check is still the integrity gate.
+pub fn generate_control_flow_proof_with_commit(
+    log: &ExecutionLog,
+    starting_commit: MemoryCommit,
+    claim: &str,
+) -> anyhow::Result<ControlFlowProof> {
+    let trace = LogTrace::from_log_and_commit(log, starting_commit);
     generate_control_flow_proof_from_rows(trace.rows, claim)
 }
 
@@ -1008,6 +1269,38 @@ mod tests {
         }"#;
         let parsed: StarkProof = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.proof_version, 0);
+    }
+
+    #[test]
+    fn v1_proof_envelope_round_trips_through_serde() {
+        // A v1-shaped on-disk blob (pre-3b) lacks the new memory_root_*
+        // fields. `#[serde(default)]` must populate them with [0u8; 32]
+        // so legacy proofs still deserialize cleanly.
+        let json = r#"{
+            "proof_version": 1,
+            "proof": [],
+            "state_digest": 0,
+            "claim_hash": 0,
+            "num_state_bytes": 0,
+            "trace_length": 0,
+            "multiplier": 0,
+            "control_flow": null
+        }"#;
+        let parsed: StarkProof = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.proof_version, 1);
+        assert_eq!(parsed.memory_root_pre, [0u8; 32]);
+        assert_eq!(parsed.memory_root_post, [0u8; 32]);
+    }
+
+    #[test]
+    fn v1_dispatch_arm_still_verifies_legacy_proofs() {
+        // Forge a v1 envelope by downgrading a fresh v2 proof. The v1
+        // verifier must accept it (it doesn't look at memory roots) —
+        // this guards the "old proofs keep verifying after AIR evolves"
+        // contract documented at `CURRENT_PROOF_VERSION`.
+        let mut proof = generate_proof(&sample_state(), "claim").unwrap();
+        proof.proof_version = 1;
+        verify_proof(&proof, "claim").expect("v1 dispatch arm must remain alive");
     }
 
     #[test]
@@ -1206,6 +1499,7 @@ mod tests {
                 branch_taken: 0,
                 goal_status: 0,
                 depth: 0,
+                ..LogTraceRow::default()
             }],
             "claim",
         );
@@ -1220,6 +1514,7 @@ mod tests {
                 branch_taken: 2,
                 goal_status: 0,
                 depth: 0,
+                ..LogTraceRow::default()
             }],
             "claim",
         );
@@ -1237,6 +1532,7 @@ mod tests {
                 branch_taken: 0,
                 goal_status: 5,
                 depth: 1,
+                ..LogTraceRow::default()
             }],
             "claim",
         );
@@ -1318,6 +1614,7 @@ mod tests {
                 branch_taken: 1,
                 goal_status: 0,
                 depth: 0,
+                ..LogTraceRow::default()
             }],
             "claim",
         );

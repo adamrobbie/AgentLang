@@ -13,6 +13,7 @@ pub mod exec_log;
 pub mod goal;
 pub mod mcp;
 pub mod memory;
+pub mod memory_commit;
 pub mod secret;
 
 pub use audit::*;
@@ -3481,7 +3482,8 @@ mod tests {
         eval(&stmt, ctx.clone()).await.unwrap();
 
         let proofs = ctx.proofs.lock().unwrap();
-        let proof = proofs.get("p").expect("proof stored");
+        let stored = proofs.get("p").expect("proof stored");
+        let proof = &stored.proof;
         let cf = proof
             .control_flow
             .as_ref()
@@ -3502,9 +3504,9 @@ mod tests {
         eval(&stmt, ctx.clone()).await.unwrap();
 
         let proofs = ctx.proofs.lock().unwrap();
-        let proof = proofs.get("p").expect("proof stored");
+        let stored = proofs.get("p").expect("proof stored");
         assert!(
-            proof.control_flow.is_none(),
+            stored.proof.control_flow.is_none(),
             "no CF proof for empty log"
         );
     }
@@ -3585,7 +3587,8 @@ mod tests {
         // CF proof must be present and bound to the same claim.
         {
             let proofs = ctx.proofs.lock().unwrap();
-            let proof = proofs.get("p").expect("proof stored");
+            let stored = proofs.get("p").expect("proof stored");
+            let proof = &stored.proof;
             let cf = proof
                 .control_flow
                 .as_ref()
@@ -3623,8 +3626,8 @@ mod tests {
         // Tamper: flip the CF claim_hash field.
         {
             let mut proofs = ctx.proofs.lock().unwrap();
-            let proof = proofs.get_mut("p").unwrap();
-            let cf = proof.control_flow.as_mut().unwrap();
+            let stored = proofs.get_mut("p").unwrap();
+            let cf = stored.proof.control_flow.as_mut().unwrap();
             cf.claim_hash = cf.claim_hash.wrapping_add(1);
         }
 
@@ -3638,6 +3641,126 @@ mod tests {
         assert!(
             err.to_string().to_lowercase().contains("control"),
             "expected control-flow rejection, got: {err}"
+        );
+    }
+
+    // --- Phase 3b: memory-root envelope binding ---
+    //
+    // Verify that:
+    //   (a) generated proofs carry `proof_version = 2` and the memory-root
+    //       fields are populated with the (currently empty-SMT) roots the
+    //       runtime observed,
+    //   (b) Reveal succeeds when the prover-claimed roots match the
+    //       runtime-observed roots,
+    //   (c) Reveal rejects mismatches on either pre or post root —
+    //       runtime-side binding is the integrity gate until 3e moves it
+    //       into the AIR.
+
+    #[tokio::test]
+    async fn prove_emits_v2_envelope_with_set_induced_post_root() {
+        // Phase 3c-runtime + option (Y): SET writes to working_variables
+        // and is therefore visible to `MemoryCommit::from_context`.
+        // A Prove body that runs SET on a fresh Context must produce
+        //   pre  == empty *tree* root (no vars before SET runs)
+        //   post != empty *tree* root (the SET-written value lands in
+        //                              the SMT)
+        // and the StoredProof envelope must mirror the StarkProof
+        // envelope (3b's integrity check).
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Set {
+                variable: "x".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+            }],
+            claim: "claim".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        let proofs = ctx.proofs.lock().unwrap();
+        let stored = proofs.get("p").expect("proof stored");
+        assert_eq!(stored.proof.proof_version, 2);
+        let empty_root = super::memory_commit::empty_root();
+        // Empty *tree* root is the 256-deep recurrence — explicitly
+        // *not* `[0u8; 32]`. Asserting this catches the regression
+        // where eval.rs reaches for `empty_subtree_roots()[0]` (the
+        // leaf-level empty hash) instead of the helper.
+        assert_ne!(empty_root, [0u8; 32]);
+        assert_eq!(stored.proof.memory_root_pre, empty_root);
+        assert_ne!(
+            stored.proof.memory_root_post, empty_root,
+            "SET inside Prove must drive the post-root away from empty"
+        );
+        // Envelope-integrity invariant from 3b: StarkProof and
+        // StoredProof carry the same root pair regardless of value.
+        assert_eq!(stored.memory_root_pre, stored.proof.memory_root_pre);
+        assert_eq!(stored.memory_root_post, stored.proof.memory_root_post);
+    }
+
+    #[tokio::test]
+    async fn reveal_rejects_tampered_memory_root_pre() {
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Set {
+                variable: "x".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+            }],
+            claim: "claim".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        // Tamper: flip a byte of the prover-claimed pre-root inside the
+        // StarkProof envelope. The runtime-observed root in StoredProof
+        // is unchanged, so Reveal must reject the mismatch.
+        {
+            let mut proofs = ctx.proofs.lock().unwrap();
+            let stored = proofs.get_mut("p").unwrap();
+            stored.proof.memory_root_pre[0] ^= 0xff;
+        }
+
+        let reveal = Statement::Reveal {
+            proof_name: "p".to_string(),
+            claim: "claim".to_string(),
+            to_agent: None,
+            result_into: None,
+        };
+        let err = eval(&reveal, ctx.clone()).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("pre-root"),
+            "expected memory pre-root mismatch, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reveal_rejects_tampered_memory_root_post() {
+        let ctx = Context::new();
+        let stmt = Statement::Prove {
+            statements: vec![Statement::Set {
+                variable: "x".to_string(),
+                value: Expression::Literal(AnnotatedValue::from(Value::Number(1.0))),
+            }],
+            claim: "claim".to_string(),
+            proof_name: "p".to_string(),
+        };
+        eval(&stmt, ctx.clone()).await.unwrap();
+
+        {
+            let mut proofs = ctx.proofs.lock().unwrap();
+            let stored = proofs.get_mut("p").unwrap();
+            stored.proof.memory_root_post[31] ^= 0xff;
+        }
+
+        let reveal = Statement::Reveal {
+            proof_name: "p".to_string(),
+            claim: "claim".to_string(),
+            to_agent: None,
+            result_into: None,
+        };
+        let err = eval(&reveal, ctx.clone()).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("post-root"),
+            "expected memory post-root mismatch, got: {err}"
         );
     }
 
@@ -4551,7 +4674,7 @@ mod tests {
             };
             eval(&stmt, ctx.clone()).await.unwrap();
             let proofs = ctx.proofs.lock().unwrap();
-            proofs.get("p").cloned().expect("proof stored")
+            proofs.get("p").cloned().expect("proof stored").proof
         };
 
         // Path A: x := 1 then x := 2 — log has 2 Set entries.
@@ -4602,7 +4725,7 @@ mod tests {
             };
             eval(&stmt, ctx.clone()).await.unwrap();
             let proofs = ctx.proofs.lock().unwrap();
-            proofs.get("p").cloned().expect("proof stored")
+            proofs.get("p").cloned().expect("proof stored").proof
         };
 
         let with_if = mk_proof(vec![Statement::If {

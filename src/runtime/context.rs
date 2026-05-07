@@ -54,7 +54,7 @@ pub struct Context {
     pub audit_chain: Arc<Mutex<AuditChain>>,
     pub session_key: Arc<aead::LessSafeKey>,
     pub wasm_engine: Engine,
-    pub proofs: Arc<Mutex<HashMap<String, crypto::StarkProof>>>,
+    pub proofs: Arc<Mutex<HashMap<String, crypto::StoredProof>>>,
     pub exec_log: Arc<Mutex<Option<exec_log::ExecutionLog>>>,
     pub exec_logs: Arc<Mutex<HashMap<String, exec_log::ExecutionLog>>>,
     pub goals: Arc<Mutex<HashMap<String, GoalDefinition>>>,

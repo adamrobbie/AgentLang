@@ -124,6 +124,7 @@ release build, median of 5 prove runs).
 | Variant | Transition degree | Prove (N=64) | Prove (N=1024) | Prove (N=4096) | Proof size (N=1024) | Verify (N=1024) | LOC (file) |
 |---|---|---|---|---|---|---|---|
 | Winterfell running product (main segment, `f128`) | **2** | 0.88 ms | 13.16 ms | 57.93 ms | 35,955 B | 354 µs | 370 |
+| Winterfell running product (aux segment, soundness-correct) | **2** | 0.99 ms | 18.38 ms | 84.51 ms | 44,569 B | 421 µs | 425 |
 | Plonky3 running product (`p3-uni-stark`, BabyBear) | **2** | 1.44 ms | 15.95 ms | 65.82 ms | 150,306 B | 2.43 ms | 337 |
 
 **Headline degree-budget verdict.** Both variants land at transition
@@ -135,12 +136,24 @@ the same algebraic shape and would land at the same degree. **Verdict:
 viable on the current `blowup_factor = 16` setting in both systems;
 no FFT-cost doubling required.**
 
-**Performance verdict.** Winterfell wins or ties on every measured
-axis at every size we ran:
+**Performance verdict.** Both winterfell variants beat Plonky3 on
+proof size and verify time at every size we ran. The main-segment
+probe also wins on prove time; the soundness-correct aux-segment
+variant is within ~15 % of Plonky3's prove time but keeps the proof-
+size and verify-time advantages mostly intact:
 
-- Prove time: 10–20 % faster across the board.
-- Proof size: ~4× smaller (35 KB vs 150 KB at N=1024).
-- Verify time: ~7× faster (354 µs vs 2.43 ms at N=1024).
+- **Main-segment probe vs Plonky3** (running-product baseline,
+  not soundness-correct, kept for comparability with the API ergonomics
+  question): prove 10–20 % faster, proof ~4× smaller, verify ~7×
+  faster.
+- **Aux-segment variant vs Plonky3** (soundness-correct, the actual
+  Phase 3 reference): prove ~15 % slower at N=1024 / ~28 % slower at
+  N=4096, proof ~3.4× smaller (44 KB vs 150 KB), verify ~5.8× faster
+  (421 µs vs 2.43 ms).
+- **Aux-segment cost over main-segment** (the price of soundness):
+  prove ~40 % slower, proof ~24 % larger, verify ~19 % slower. This
+  is the cost of committing the Z column in a separate trace segment
+  with its own LDE / Merkle commitment. Acceptable.
 
 The proof-size gap is the surprise. Plausible cause: Plonky3's
 `MerkleTreeMmcs` packs `[F::Packing; 8]`-leaves with a Poseidon2
@@ -163,15 +176,22 @@ trait + `Prover` trait, vs. Plonky3's `BaseAir` + `Air<AB>` +
 
 Three independent reasons, any one of which would be sufficient:
 
-1. **Apples-to-apples performance favours winterfell.** On the
-   identical running-product shape, winterfell is 10–20 % faster to
-   prove, 4× smaller in proof size, and 7× faster to verify (see
-   §Results). None of those gaps are close enough to be erased by
-   parameter tuning.
+1. **Performance favours winterfell on the metrics that matter most
+   for verifier-side workloads.** The soundness-correct aux-segment
+   variant trails Plonky3 on prove time by ~15 % at N=1024 / ~28 % at
+   N=4096, but holds a ~3.4× lead on proof size and a ~5.8× lead on
+   verify time (see §Results). For agents that re-verify proofs much
+   more often than they create them — the expected runtime profile —
+   the verify-time and proof-size deltas dominate.
 2. **Lookup-argument tooling on winterfell is first-class today.**
    Auxiliary trace segments + verifier-supplied randomness are part
    of the 0.13.x trait set; the soundness-correct variant of this
-   prototype is a one-day extension of what's already there.
+   prototype landed 2026-05-05 alongside the degree probe and Plonky3
+   port (`src/winterfell_aux_lookup.rs`). Caveat for implementers:
+   the stock `TraceTable` always reports a single-segment `TraceInfo`,
+   so a custom `Trace` impl (~30 LOC, see `LookupAuxTrace` in the
+   prototype) is required to declare aux columns. Phase 3 lifts that
+   wrapper verbatim.
 3. **Plonky3 LogUp is a custom-prover effort.** `p3-lookup` ships
    the LogUp gadget but not a prover that wires it through. Building
    one (extending `p3-uni-stark` with permutation-segment support,

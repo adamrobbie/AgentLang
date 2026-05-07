@@ -97,7 +97,236 @@ forward constraint into Phase 3+:
 
 ### Phase 3 — Memory commitment + REMEMBER/RECALL lookup ⏳
 
-**Not started. Highest schedule risk in the roadmap.**
+**Sub-phases 3a + 3b + 3c-runtime + 3c-AIR + 3d + 3e-aux-shape
+shipped.** 3e-boundary, 3e-rootcarry, 3e-lookup-trace, 3e-lookup-table,
+and 3f–3h still ahead — the remaining 3e sub-pieces (the actual lookup
+argument) stay the highest schedule risk in the roadmap.
+Implementation plan drafted 2026-05-06 in
+[`phase3-implementation-plan.md`](phase3-implementation-plan.md) — that
+doc walks the work in 8 sub-phases (3a–3h) against concrete file:line
+anchors and includes the lookup-degree audit, the anti-pad extension
+argument, and the v2 wire-format dispatch.
+
+**Sub-phase 3a — memory commitment scheme ✅** (2026-05-06)
+
+`src/runtime/memory_commit.rs` implements a sparse Merkle tree at
+depth 256 over `Address = SHA-256(scope_byte || path_hash)`, with
+SHA-256 internal nodes (matches `exec_log::hash`, no Blake3 dual-stack)
+and a OnceLock-cached default-subtree root vector. Public surface:
+`MemoryCommit { new, insert, remove, get, root, prove }`,
+`InclusionProof::{verify, compute_root}`, plus
+`RememberWitness`/`ForgetWitness` builders that the AIR-side lookup
+prover (3e) will consume directly. 13 unit tests cover empty root,
+inclusion roundtrip, non-membership, scope separation, REMEMBER /
+FORGET roundtrip, tampered-witness rejection, and a 32-leaf
+inclusion-at-depth-256 case. The full library suite stays green
+(380 tests).
+
+**Sub-phase 3b — v2 wire shape + envelope-integrity check ✅** (2026-05-06)
+
+`StarkProof` grows `memory_root_pre`/`memory_root_post: [u8; 32]`
+fields (`#[serde(default)]` for v1 backcompat); `CURRENT_PROOF_VERSION`
+bumps to `2`. The verify dispatch grows a `2 => verify_proof_v2` arm
+that currently mirrors v1 — the AIR doesn't bind the memory roots
+yet, that lands in 3e. A new `StoredProof { proof, memory_root_pre,
+memory_root_post }` wrapper carries the runtime-observed roots
+alongside the StarkProof. `Statement::Prove` writes the same root
+values into both the envelope and the wrapper (the empty-SMT root
+returned by `memory_commit::empty_root()` for both pre and post,
+until 3c wires a Context-level commit). `Statement::Reveal` asserts
+the envelope's claimed roots match the wrapper's recorded roots
+before invoking `verify_proof`.
+
+What this gives us today is a stable wire shape and a guard against
+post-Prove envelope tampering — not yet a binding between prover
+claims and witness state, since both fields are written from the same
+source. The actual "prover claim ↔ trace witness" attestation is C8
+(lookup running product) inside the AIR, scheduled for 3e; 3b clears
+the path so 3e doesn't need a second version bump. Test coverage: v1
+dispatch still alive (forged-v1 envelope still verifies through the
+v1 arm), v1 on-disk envelope still deserialises cleanly, fresh proofs
+carry v2 + the empty-tree root (regression-asserted distinct from
+`[0u8; 32]`), tampering with either pre or post root inside the
+envelope causes Reveal to reject with a readable error.
+
+**Sub-phase 3c-runtime — `from_context` + real pre/post roots ✅** (2026-05-06)
+
+`MemoryCommit::from_context(&Context)` enumerates `working_variables`,
+`session_variables`, and `long_term_backend.load(...)` into the SMT.
+`Statement::Prove` now reads pre/post roots from this constructor
+instead of `memory_commit::empty_root()`, so the envelope claims real
+state. Shared scope is intentionally excluded (3a option a — RPC-
+routed, outside the SMT); the AIR-side gating in 3e will mirror this.
+
+Per option (Y, 2026-05-06), `Statement::Set` joins
+REMEMBER/RECALL/FORGET in the memory selector. SET writes to
+`working_variables` like `REMEMBER { scope: Working }`, so
+`from_context` already attests SET-written values; the trace-side
+selector in C7 (lands in 3d) counts 4 memory opcodes, not 3.
+`Operands::Set { name_hash, value_hash }` carries no scope field
+(`exec_log.rs:279-285`), so the trace builder will fill
+`CFA_SCOPE_COL` with the constant `Working = 0` for SET rows.
+
+Test coverage: 3 new `memory_commit` unit tests
+(`from_context_empty_returns_empty_root`,
+`from_context_reflects_set_and_remember_in_working`,
+`from_context_excludes_shared_scope`) plus the renamed
+`prove_emits_v2_envelope_with_set_induced_post_root` which now asserts
+`pre == empty_root` and `post != empty_root` (was: both equal). Library
+suite: 385 passing.
+
+This is still not the in-AIR binding — the `mroot` column is not yet
+emitted by the trace, and C8 doesn't exist. A malicious prover could
+still hand-craft the StarkProof envelope with arbitrary `memory_root_*`
+values; what stops that today is the runtime-side equality check in
+`Statement::Reveal` (3b) plus the fact that the runtime computes those
+values itself. The 3e lookup-running-product is what makes the claim
+checkable from the proof bytes alone.
+
+**Sub-phase 3c-AIR — memory-row witness columns ✅** (2026-05-06)
+
+`ControlFlowAir`'s main segment grows from 5 to 9 columns. The four
+new columns (`CFA_SCOPE_COL=5`, `CFA_PATH_COL=6`, `CFA_VALUE_COL=7`,
+`CFA_MROOT_COL=8`) are populated for `Set`/`Remember`/`Recall`/
+`Forget` rows by `LogTrace::from`; every other row keeps zeros.
+Encoding choices that the table-side prover (3d/3e) must mirror:
+
+- `scope` uses the 0-based `mem_scope_byte` (Working=0, Session=1,
+  LongTerm=2, Shared=3) — aligned with `memory_commit::scope_byte`,
+  *not* the 1-based `exec_log::scope_byte` used for canonical-bytes
+  digest binding. The two namespaces stay deliberately distinct.
+- `path` and `value` are the first 16 bytes of the source `Hash32`
+  folded big-endian via `exec_log::fold_to_u128`. Lossy by ~64 bits
+  vs. the source SHA-256; the 3e lookup argument's α/β randomization
+  recovers the soundness margin.
+- `Operands::Set` carries no scope field (`exec_log.rs:279-285`); the
+  `From` impl injects `scope=0` (Working) per option (Y).
+- `Operands::Forget` writes `value=0`, matching `EMPTY_LEAF` folding
+  to 0 — without this, a FORGET row's `(scope,path,value)` lookup
+  factor would miss the table side in 3e.
+
+`mroot` stays zero throughout 3c-AIR. Sub-phase 3d wires
+`MemoryCommit`'s running root through the prover into this column;
+3e adds the auxiliary segment, the gated lookup running product (C8),
+and the boundary assertions that bind `mroot[0] = memory_root_pre`
+and `mroot[last] = memory_root_post`.
+
+No constraint changes in 3c-AIR — the existing 6 transition
+constraints (Phase 2) and 3 boundary assertions are untouched, so the
+degree budget (max 11, blowup 16) is unchanged. Anti-pad memory
+columns stay at zero; an extension that drives the future memory
+selector off zero on at least one anti-pad row lands in sub-phase 3f
+once the selector exists.
+
+Test coverage: 7 new `exec_log::tests` covering `fold_to_u128`,
+SET-row population, REMEMBER scope mapping across all four scopes,
+RECALL parity with REMEMBER, FORGET zero-value invariant, and the
+non-memory-row "all zeros" defence-in-depth check. Existing `Default`
+test extended to assert all four new fields default to zero. Full
+library suite: 392 passing (up from 385 after 3c-runtime).
+
+**Sub-phase 3d — running mroot column populated by replay ✅** (2026-05-06)
+
+`LogTrace::from_log_and_commit(log, starting_commit)` replays the log
+against `starting_commit`, advancing the running SMT root for each
+memory mutation and recording the *entering* root onto each row's
+`CFA_MROOT_COL`. Boundary semantics (used by 3e):
+- `rows[0].mroot == fold_to_u128(starting_commit.root())`. With
+  `starting_commit = MemoryCommit::from_context(&ctx)` at Prove start,
+  this is the folded `memory_root_pre`.
+- After replay finishes, the running commit's root equals
+  `memory_root_post`. Padding rows (which the 3e prover will need to
+  carry the post-root) extend that value out to the trace end.
+- Non-memory rows, RECALL rows, and any Shared-scope row pass the
+  running root through unchanged — `apply_remember`/`apply_forget`
+  return None for Shared and the replay only advances on a successful
+  mutation.
+
+`crypto::generate_control_flow_proof_with_commit(log, starting_commit,
+claim)` is the new prover entry point; the original
+`generate_control_flow_proof(log, claim)` stays as a witness-only
+shim (mroot=0) for hand-built fuzz/test traces. `Statement::Prove` now
+captures `commit_pre` once via `from_context`, derives `memory_root_pre`
+from it, then moves the same commit into the proof generator — so the
+trace's `mroot[0]` and the envelope's `memory_root_pre` come from the
+same source by construction.
+
+Witness only: no AIR constraint reads from the column yet. A tampering
+prover can still build a trace whose `mroot` cells don't match the
+running SMT — what stops that today remains the runtime equality
+check in `Statement::Reveal` (3b) plus the fact that the runtime
+itself supplies `commit_pre`. Sub-phase 3e adds the boundary
+assertions binding `mroot[0]`/`mroot[last]` to the envelope and the
+gated lookup running product (C8) that ties memory rows to the
+table-side SMT mutations.
+
+Refactor note: `LogTrace::From<&ExecutionLog>` and
+`from_log_and_commit` now share `entry_witnesses` and
+`entry_depth_delta` helpers — the row-level extraction logic
+(opcode/branch/status/scope/path/value, depth delta) lives in one
+place so the two constructors only differ in their `mroot` policy.
+
+Test coverage: 7 new `exec_log::tests` for the replay
+(empty-log/empty-commit, single-SET pre-root, two-SET advance,
+RECALL no-advance, Shared no-advance, non-memory carry, From-default
+mroot=0 regression). Library suite: 399 passing (up from 392 after
+3c-AIR).
+
+**Sub-phase 3e-aux-shape — multi-segment trace plumbing ✅** (2026-05-07)
+
+`ControlFlowAir` switches from a single-segment `TraceTable<BaseElement>`
+to a multi-segment trace: 9 main columns (unchanged) plus 1 auxiliary Z
+column. The aux segment is committed *after* the main segment, so any
+verifier randomness it consumes is post-commit — the soundness property
+3e-lookup-trace will rely on. The entire lookup-running-product
+machinery from `prototypes/lookup-bench/` is now applicable to this
+AIR; what was missing was the trace-shape plumbing, and that's what
+this sub-phase delivers.
+
+Concrete shape:
+- New `ControlFlowTrace { info: TraceInfo, main: ColMatrix<BaseElement> }`
+  carries a multi-segment `TraceInfo` (`new_multi_segment(9, 1, 1, len,
+  vec![])` — 9 main, 1 aux, 1 aux-randomness, no periodic columns).
+  `TraceTable::new` always builds aux-width-0 info, which is mismatched
+  with the AIR's aux-width-1 declaration; the custom impl is the
+  minimal fix on the winterfell 0.13 trait surface.
+- `ControlFlowAir::new` calls `AirContext::new_multi_segment` with main
+  degrees `[11, 2, 4, 1, 10, 2]` (Phase 2, unchanged), aux degrees
+  `[1]`, 3 main assertions, 1 aux assertion.
+- `evaluate_aux_transition`: `result[0] = z_next - z_curr` (degree 1).
+  Trivial. With `Z[0] = 1` boundary it pins Z to the constant 1.
+- `get_aux_assertions`: `Assertion::single(0, 0, E::ONE)`.
+- `ControlFlowProver::Trace = ControlFlowTrace`; `build_trace`
+  assembles columns via `CFA_*_COL` indices into a `Vec<Vec<BaseElement>>`
+  rather than the old closure-based `TraceTable::fill`. `build_aux_trace`
+  returns `ColMatrix::new(vec![vec![E::ONE; n]])`.
+
+Witness only — Z carries no information yet. 3e-rootcarry replaces
+the aux transition with the gated mroot-carry recurrence
+`(1 - is_mem(opcode)) * (mroot_next - mroot_curr) = 0` (degree 11);
+3e-lookup-trace replaces it again with the running-product recurrence
+gated on `is_mem` (degree 12 under the blowup-16 ceiling). Both fit
+because the aux segment shape stays "one column, one transition" —
+only the constraint body changes.
+
+A subtle layout-invariant check landed alongside: `build_trace`
+populates `main_columns[CFA_*_COL] = column` rather than relying on
+the `vec![]` literal's positional ordering. If a future edit were to
+drift the constants from the assembly, that would now panic at trace
+construction (`vec![Vec::new(); CFA_NUM_COLS]` indexing) rather than
+silently misroute a column to the wrong constraint.
+
+Anti-pad rows still leave the new aux Z column at 1 (built unconditionally
+in `build_aux_trace`); the row-level anti-pad extension that drives the
+memory selector off zero on at least one row stays scheduled for 3f
+once the selector exists.
+
+Test coverage: no new tests — the existing 9 `crypto::tests`
+control-flow proofs (round-trip, balanced goal, branch-IF binding,
+opcode/branch/status/depth rejection, claim-tamper) all exercise the
+multi-segment proving + verification path. Library suite: 399 passing
+(unchanged from 3d — the trace-shape evolution carries no behavioral
+delta yet).
 
 Required work, per the deep-dive's §"Memory" and Phase 3 plan:
 
@@ -110,19 +339,28 @@ Required work, per the deep-dive's §"Memory" and Phase 3 plan:
    auxiliary segments.** The 2-day prototype lives in
    [`prototypes/lookup-bench/`](../../prototypes/lookup-bench/).
    Headline:
-   - Both variants land at transition degree 2, fitting the blowup-16
-     ceiling with 4 degrees of slack after the Phase 2 selector. The
-     degree-budget concern is closed.
-   - On the same running-product shape, winterfell wins on every
-     measured axis at every size: 10–20 % faster prove, 4× smaller
-     proof, 7× faster verify.
+   - All three variants (winterfell main-segment probe, winterfell
+     aux-segment soundness-correct, Plonky3 single-AIR running product)
+     land at transition degree 2, fitting the blowup-16 ceiling with 4
+     degrees of slack after the Phase 2 selector. The degree-budget
+     concern is closed.
+   - The soundness-correct winterfell aux-segment variant landed in
+     the same prototype iteration. Numbers at N=1024: 18.4 ms prove,
+     44 KB proof, 421 µs verify. Cost over the main-segment probe is
+     ~40 % prove, ~24 % proof size, ~19 % verify — the price of
+     putting Z behind a verifier-supplied challenge. Acceptable.
+   - vs Plonky3 at N=1024: aux-segment is ~15 % slower to prove but
+     ~3.4× smaller proof and ~5.8× faster verify. For the expected
+     "many verifications per proof" runtime profile, the verify-time
+     advantage dominates.
    - Plonky3's LogUp gadget (`p3-lookup`) requires a custom multi-AIR
      prover that doesn't ship in `p3-uni-stark` — adds 1–2 engineer-
      weeks of plumbing on top of the Phase 3 work itself.
-   The next implementation iteration is the soundness-correct
-   auxiliary-segment version of the winterfell variant (verifier-
-   supplied randomness instead of public-table-derived challenges) —
-   estimated one engineering day on top of the prototype.
+   - Implementer note: stock `TraceTable` always reports single-segment
+     `TraceInfo`; a custom `Trace` impl (~30 LOC, see `LookupAuxTrace`
+     in `prototypes/lookup-bench/src/winterfell_aux_lookup.rs`) is
+     required to declare aux columns. Phase 3 lifts that wrapper
+     verbatim.
 3. **AIR constraints.** Per-row constraint families:
    - `REMEMBER`: lookup proves `(scope, path_hash) ∉ commit_root_curr`
      (or `∈` with prior value), `commit_root_next` matches the updated

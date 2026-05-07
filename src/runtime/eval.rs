@@ -6,6 +6,7 @@ use super::call::{
 };
 use super::context::{Context, ContractInfo};
 use super::exec_log::{self, LogEntry, Operands};
+use super::memory_commit;
 use super::goal::{build_goal_result, classify_goal_failure, store_goal_result};
 use super::memory::{
     ensure_value_safe_for_irreversible_action, inherit_metadata, propagate_container_metadata,
@@ -1110,9 +1111,29 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             *ctx.exec_log.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(exec_log::ExecutionLog::new());
 
+            // Phase 3c-runtime: capture the memory commitment root from
+            // actual Context state before and after the Prove body.
+            // `from_context` enumerates Working/Session/LongTerm; Shared
+            // is intentionally excluded (3a option a — RPC-routed,
+            // outside the SMT). Per option (Y), `working_variables`
+            // covers both REMEMBER{Working} and SET writes, so both
+            // opcodes contribute to the pre/post roots without special-
+            // casing here. The AIR-side binding (C8) lands in 3e; until
+            // then this is consumed by the Reveal-side envelope-
+            // integrity check from 3b.
+            // Sub-phase 3d: capture the *commit* (not just its root) so we
+            // can replay it through `LogTrace::from_log_and_commit` to
+            // populate the trace's `mroot` column. The pre-root extracted
+            // here still lands in the StarkProof envelope and is the
+            // value the Reveal-side equality check verifies against.
+            let commit_pre = memory_commit::MemoryCommit::from_context(&ctx)?;
+            let memory_root_pre = commit_pre.root();
+
             for stmt in statements {
                 eval(stmt, ctx.clone()).await?;
             }
+
+            let memory_root_post = memory_commit::MemoryCommit::from_context(&ctx)?.root();
 
             let log = ctx
                 .exec_log
@@ -1134,13 +1155,22 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             combined.extend_from_slice(&log_bytes);
 
             let mut proof = crypto::generate_proof(&combined, claim)?;
+            proof.memory_root_pre = memory_root_pre;
+            proof.memory_root_post = memory_root_post;
 
             // Phase 2 Slice 5: also attest to control-flow validity (opcode
             // set, branch_taken bool, goal_status range) when there's any
             // recorded execution. Empty logs skip CF — the all-Nop trace
             // is degenerate for winterfell and there's nothing to attest.
             if !log.entries().is_empty() {
-                proof.control_flow = Some(crypto::generate_control_flow_proof(&log, claim)?);
+                // Phase 3d: thread the pre-execution commit through the
+                // trace builder so `CFA_MROOT_COL` carries the running
+                // SMT root entering each row. `commit_pre` is consumed
+                // by the replay; we already extracted `memory_root_pre`
+                // above for the envelope.
+                proof.control_flow = Some(crypto::generate_control_flow_proof_with_commit(
+                    &log, commit_pre, claim,
+                )?);
             }
 
             ctx.exec_logs
@@ -1150,7 +1180,14 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             ctx.proofs
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(proof_name.clone(), proof);
+                .insert(
+                    proof_name.clone(),
+                    crypto::StoredProof {
+                        proof,
+                        memory_root_pre,
+                        memory_root_post,
+                    },
+                );
             Ok(())
         }
         Statement::Reveal {
@@ -1159,7 +1196,7 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
             to_agent: _,
             result_into,
         } => {
-            let proof = {
+            let stored = {
                 let proofs = ctx.proofs.lock().unwrap_or_else(|e| e.into_inner());
                 proofs
                     .get(proof_name)
@@ -1167,7 +1204,26 @@ pub async fn eval(statement: &Statement, ctx: Context) -> Result<()> {
                     .ok_or_else(|| anyhow!("Proof '{}' not found", proof_name))?
             };
 
-            crypto::verify_proof(&proof, claim)?;
+            // Phase 3b: bind the prover-claimed memory roots to what the
+            // runtime actually observed at Prove start/end. A malicious
+            // prover could otherwise fabricate `memory_root_pre`/`post`
+            // values inside the StarkProof envelope — the AIR-side
+            // enforcement only kicks in at 3e, so until then this
+            // runtime-side equality check is the integrity gate. Once 3e
+            // lands, this stays as belt-and-suspenders against accidental
+            // envelope corruption between Prove and Reveal.
+            if stored.proof.memory_root_pre != stored.memory_root_pre {
+                return Err(anyhow!(
+                    "Memory pre-root in proof envelope does not match runtime-observed root"
+                ));
+            }
+            if stored.proof.memory_root_post != stored.memory_root_post {
+                return Err(anyhow!(
+                    "Memory post-root in proof envelope does not match runtime-observed root"
+                ));
+            }
+
+            crypto::verify_proof(&stored.proof, claim)?;
 
             if let Some(path) = result_into {
                 let reveal_val = AnnotatedValue::from(Value::Text(format!(
