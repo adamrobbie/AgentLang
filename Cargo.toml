@@ -23,7 +23,7 @@ tokio = { version = "1.51.1", features = ["macros", "process", "rt-multi-thread"
 tokio-util = { version = "0.7.18", features = ["codec"] }
 tonic = "0.14.5"
 tonic-prost = "0.14.5"
-wasmtime = "43.0.1"
+wasmtime = "43.0.2"
 winter-crypto = "0.13.1"
 winter-math = "0.13.1"
 winterfell = "0.13.1"
